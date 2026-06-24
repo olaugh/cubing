@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>Ortega Trainer · 2×2</title>
+<title>ocube · 2×2</title>
 <style>
   :root {
     --bg-0: #0a0a0f;
@@ -31,6 +31,18 @@
     -webkit-font-smoothing: antialiased;
   }
   #scene { position: fixed; inset: 0; z-index: 0; }
+  #pauseOverlay {
+    position: fixed; inset: 0; z-index: 5; pointer-events: none;
+    display: none; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+    background: rgba(9, 9, 13, 0.55); backdrop-filter: blur(3px);
+  }
+  #pauseOverlay.on { display: flex; }
+  .pause-title { font-size: 34px; font-weight: 700; letter-spacing: 1.5px; color: var(--text); }
+  .pause-sub { font-size: 13px; color: var(--text-dim); }
+  .pause-sub kbd {
+    font-family: var(--mono); background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 5px; padding: 1px 6px;
+  }
   canvas { display: block; }
 
   /* ---- Top bar ---- */
@@ -50,6 +62,16 @@
   .brand span { font-size: 12px; color: var(--text-dim); font-family: var(--mono); }
   .spacer { flex: 1; }
   .top-actions { display: flex; gap: 8px; pointer-events: auto; }
+  .puzzle-chooser {
+    display: flex; gap: 2px; margin-left: 14px; pointer-events: auto;
+    background: var(--panel); border: 1px solid var(--panel-border); border-radius: 10px; padding: 3px;
+  }
+  .puzzle-chooser .pz {
+    border: none; background: transparent; color: var(--text-dim); font: inherit; font-size: 13px;
+    padding: 5px 13px; border-radius: 7px; cursor: pointer; transition: background 0.12s, color 0.12s;
+  }
+  .puzzle-chooser .pz:hover { color: var(--text); }
+  .puzzle-chooser .pz.active { background: var(--accent); color: #fff; }
 
   button.btn {
     font-family: var(--sans);
@@ -277,6 +299,16 @@
     border-radius: 4px; background: #26262e;
     box-shadow: inset 0 0 0 1px rgba(0,0,0,0.25), inset 0 1px 1px rgba(255,255,255,0.12);
   }
+  .pyra-net {
+    position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
+    z-index: 8; padding: 13px 15px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 16px; backdrop-filter: blur(18px);
+    display: none;
+  }
+  .pyra-net.on { display: block; }
+  .pyra-net svg { display: block; width: 172px; height: 156px; overflow: visible; }
+  .pyra-net polygon { stroke: #15151b; stroke-width: 0.8; stroke-linejoin: round; }
 
   .help {
     font-size: 11.5px; color: var(--text-dim); line-height: 1.7;
@@ -300,6 +332,10 @@
 </head>
 <body>
   <div id="scene"></div>
+  <div id="pauseOverlay">
+    <div class="pause-title">Paused</div>
+    <div class="pause-sub">press <kbd>Space</kbd> to resume</div>
+  </div>
 
   <div class="hud" id="hud">
     <div class="hud-insp" id="timerInsp"></div>
@@ -316,12 +352,8 @@
   </div>
 
   <div class="solver" id="solver">
-    <div class="solver-head">First-layer solver · optimal</div>
-    <div class="solver-row">
-      <button class="sbtn" data-goal="any">Any face</button>
-      <button class="sbtn" data-goal="top">On top</button>
-      <button class="sbtn" data-goal="white">White</button>
-    </div>
+    <div class="solver-head" id="solverHead">First-layer solver · optimal</div>
+    <div class="solver-row" id="solverRow"></div>
     <div class="solver-out" id="solverOut">Scramble, then pick a target.</div>
   </div>
 
@@ -339,8 +371,12 @@
   <div class="topbar">
     <div class="brand">
       <span class="dot"></span>
-      <h1>Ortega Trainer</h1>
-      <span>2×2</span>
+      <h1>ocube</h1>
+      <span id="brandSub">2×2</span>
+    </div>
+    <div class="puzzle-chooser" id="puzzleChooser">
+      <button class="pz active" data-puz="2x2">2×2</button>
+      <button class="pz" data-puz="pyraminx">Pyraminx</button>
     </div>
     <div class="spacer"></div>
     <div class="top-actions">
@@ -381,6 +417,8 @@
       <div><kbd>Shift</kbd> + key = prime (')</div>
       <div>primes: E I G S K N</div>
       <div>x y z = cube rotations</div>
+      <div><kbd>Space</kbd> = pause / hide cube</div>
+      <div>1–4 = (re)start FLL drill</div>
       <div>Double-tap = seamless 2</div>
       <div>Drag to orbit · scroll to zoom</div>
     </div>
@@ -438,10 +476,11 @@ controls.enableDamping = true;
 controls.dampingFactor = 0.08;
 controls.enablePan = false;
 controls.minDistance = 4;
-controls.maxDistance = 12;
+controls.maxDistance = 22;
 controls.minPolarAngle = 0.12;          // keep off the exact poles (avoids back-view gimbal flip)
 controls.maxPolarAngle = Math.PI - 0.12;
 controls.target.set(0, 0, 0);
+controls.addEventListener('end', () => { if (puzzle && puzzle.resolveKey) pyraSnapView(); });   // snap Pyraminx to a canonical view on release
 
 // Environment for slick plastic reflections
 const pmrem = new THREE.PMREMGenerator(renderer);
@@ -612,7 +651,7 @@ function buildMove(face, prime, double) {
 // Bind a queued move to the actual cubies it should turn, using up-to-date
 // positions. Call this exactly when the move becomes the current animation.
 function activate(move) {
-  move.cubies = selectCubies(move.axisName, move.sign);
+  move.cubies = puzzle.selectPieces(move);
   return move;
 }
 
@@ -620,6 +659,7 @@ const TURN_DURATION = 0.13;                 // seconds per 90°
 const SPEED = (Math.PI / 2) / TURN_DURATION; // rad / sec
 const queue = [];
 let current = null;
+let puzzle = null;            // the active puzzle (assigned in the PUZZLES registry below)
 
 function enqueue(move) {
   if (!move) return;
@@ -644,9 +684,9 @@ function stepEngine(dt) {
   current.done += step;
 
   if (Math.abs(current.target - current.done) < 1e-6) {
-    for (const c of current.cubies) snapCubie(c);
-    updateNet();
-    if (current.tracked) finalizeMovePhase();   // only tracked moves consume a history entry / advance phase
+    for (const c of current.cubies) puzzle.snapPiece(c);
+    puzzle.updateNet();
+    if (current.tracked) puzzle.finalizeMovePhase();   // only tracked moves consume a history entry / advance phase
     current = null;
     if (queue.length) current = activate(queue.shift());   // seamless chaining, same frame
   }
@@ -660,23 +700,24 @@ let solvePhase = 'fll';    // Ortega phase that incoming solve moves belong to
 let settleIndex = 0;       // next history entry to stamp when its move finishes
 // Timer: 'idle' (no scramble) · 'inspecting' (armed, awaiting first move) · 'running' · 'done'
 let timerState = 'idle', timerStart = 0, phaseEnd = { fll: 0, oll: 0, pbl: 0 };
+let paused = false, pauseStart = 0;   // spacebar pause: freezes the live timer + hides the cube
 let inspectStart = 0;     // when inspection began (scramble settled), 0 until then
 let inspectMs = 0;        // frozen inspection duration, captured at the first move
 let timerEnd = 0;         // when the timer stopped (full solve = solved; drill = FLL done)
 const STORAGE_KEY = 'ortega2-solves';
 const SESSION_ID = Date.now();   // unique per page load → one "session"
 const HINT_KEYS = ['none', 'name', 'moves', 'name+moves'];
-let solves = (() => {
+function loadSolves(key) {   // per-puzzle solve history (phase keys vary by puzzle)
   try {
-    const a = JSON.parse(localStorage.getItem(STORAGE_KEY)) || [];
-    return a.map(s => ({ ...s,                                   // coerce any legacy/malformed record into a well-formed one
-      insp: +s.insp || 0, total: +s.total || 0, fll: +s.fll || 0, oll: +s.oll || 0, pbl: +s.pbl || 0,
+    const a = JSON.parse(localStorage.getItem(key)) || [];
+    return a.map(s => ({ ...s, insp: +s.insp || 0, total: +s.total || 0,
       hint: HINT_KEYS.includes(s.hint) ? s.hint : 'none' }));
   } catch (e) { return []; }
-})();
+}
+let solves = loadSolves(STORAGE_KEY);   // 2×2 by default; swapped per puzzle on switch
 let solveHint = 'none';   // hint condition captured when this solve reached the last layer
 function todayStr() { const d = new Date(); return d.getFullYear() + '-' + String(d.getMonth() + 1).padStart(2, '0') + '-' + String(d.getDate()).padStart(2, '0'); }
-function saveSolves() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(solves)); } catch (e) {} }
+function saveSolves() { try { localStorage.setItem(puzzle.storageKey, JSON.stringify(solves)); } catch (e) {} }
 
 function recordMove(tok, phase) {
   const t = performance.now();
@@ -790,7 +831,7 @@ function recognize(tokens) {
   return null;
 }
 
-const PHASE_LABEL = { scramble: 'Scramble', fll: 'FLL', oll: 'OLL', pbl: 'PBL' };
+const PHASE_LABEL = { scramble: 'Scramble', fll: 'FLL', oll: 'OLL', pbl: 'PBL', solve: 'Solve', tips: 'Tips', first: 'First-face', LL: 'L3E' };
 
 // Normalize an entry's phase for grouping: in-flight moves ride the current
 // phase; 'done' folds into the final PBL chunk.
@@ -890,7 +931,8 @@ function hintScramble() {   // gentle nudge: pulse the Scramble button when a fa
   scrambleBtnEl.classList.remove('pulse'); void scrambleBtnEl.offsetWidth; scrambleBtnEl.classList.add('pulse');
 }
 function applyMove(tok, phase = 'solve', force = false) {
-  const isRot = 'xyz'.includes(tok[0]);   // cube rotation vs face turn
+  const _d = puzzle.DEFS[tok[0]];
+  const isRot = !!(_d && _d.rot);   // cube rotation vs face turn (puzzle-defined)
   if (phase !== 'scramble') {
     // Real-timer gating. Face turns from the user only register during a live, settled attempt;
     // cube rotations stay free (for viewing) and never start the clock. `force` lets deliberate
@@ -901,18 +943,22 @@ function applyMove(tok, phase = 'solve', force = false) {
       if (!isRot && !active) { hintScramble(); return; }                      // ignore stray face turns until a scramble is shown
     }
   }
-  const face = tok[0];
-  const prime = tok.includes("'");
-  const double = tok.includes('2');
-  const move = buildMove(face, prime, double);
+  // Genuine user input (key / dock) is in screen-role space for puzzles with
+  // pose-relative keys (Pyraminx); resolve to the actual world move for the engine.
+  // Scramble + forced "demonstrate" tokens are already world moves — don't resolve.
+  const eng = (puzzle.resolveKey && phase !== 'scramble' && !force) ? puzzle.resolveKey(tok) : tok;
+  const face = eng[0];
+  const prime = eng.includes("'");
+  const double = eng.includes('2');
+  const move = puzzle.buildMove(face, prime, double);
   if (!move) return;
   // A move is "tracked" (recorded to history, phased, timed) only inside an attempt: scramble moves
   // always; anything while running; a face turn during inspection (which starts the timer). A
   // rotation used to view/orient is animated but not tracked.
   move.tracked = phase === 'scramble' || timerState === 'running' || (timerState === 'inspecting' && !isRot);
   enqueue(move);
-  if (move.tracked) recordMove(move.notation, phase);
-  flashButton(move.notation);
+  if (move.tracked) recordMove(tok, phase);   // record/flash the INPUT token (role for Pyraminx)
+  flashButton(tok);
 }
 
 /* ============================================================
@@ -1052,16 +1098,16 @@ function randomStateScramble() {
 }
 
 let drillTarget = null;   // active FLL-drill target move count, or null
-function armTimer() { timerState = 'inspecting'; timerStart = 0; timerEnd = 0; phaseEnd = { fll: 0, oll: 0, pbl: 0 }; inspectStart = 0; inspectMs = 0; }
+function armTimer() { timerState = 'inspecting'; timerStart = 0; timerEnd = 0; phaseEnd = {}; inspectStart = 0; inspectMs = 0; }
 function scramble() {
   drillTarget = null;
-  const seq = randomStateScramble();
+  const seq = puzzle.scramble();
   resetState(true);                                  // solved + fresh history
   for (const m of seq) applyMove(m, 'scramble');
   armTimer();
 }
 
-// Generate a full random scramble whose color-neutral first face is optimally `n` moves.
+// Generate a full random 2×2 scramble whose color-neutral first face is optimally `n` moves.
 function generateDrill(n) {
   ensureSolver();
   for (let t = 0; t < 600; t++) {
@@ -1072,7 +1118,7 @@ function generateDrill(n) {
   return null;
 }
 function startDrill(n) {
-  const seq = generateDrill(n);
+  const seq = puzzle.makeDrill(n);
   resetState(true);
   drillEl.querySelectorAll('.drill-n').forEach(b => b.classList.toggle('active', +b.dataset.n === n));
   if (!seq) { drillTarget = null; drillResultEl.textContent = 'couldn’t generate'; return; }
@@ -1083,14 +1129,15 @@ function startDrill(n) {
 }
 
 function resetState(rebuild = true) {
+  setPaused(false);                                  // any new puzzle un-pauses + reveals the cube
   queue.length = 0;
   current = null;
-  if (rebuild) { buildCube(); updateNet(); }
+  if (rebuild) { puzzle.build(); puzzle.updateNet(); }
   history = [];
-  solvePhase = 'fll';
+  solvePhase = puzzle.phaseConfig.order[0];
   settleIndex = 0;
   timerState = 'idle';
-  phaseEnd = { fll: 0, oll: 0, pbl: 0 };
+  phaseEnd = {};
   lastHint = null;
   shownPhase = null;
   renderHistory();
@@ -1099,14 +1146,41 @@ function resetState(rebuild = true) {
 
 document.getElementById('scrambleBtn').addEventListener('click', scramble);
 document.getElementById('resetBtn').addEventListener('click', () => { drillTarget = null; resetState(true); });
+document.getElementById('puzzleChooser').addEventListener('click', (e) => {
+  const b = e.target.closest('.pz'); if (b) switchPuzzle(b.dataset.puz);
+});
 
 const drillEl = document.getElementById('drill');
 const drillResultEl = document.getElementById('drillResult');
+const drillLabelEl = document.querySelector('.hud-drill-label');
 drillEl.addEventListener('click', (e) => { const b = e.target.closest('.drill-n'); if (b) startDrill(+b.dataset.n); });
 
 const timerInspEl = document.getElementById('timerInsp');
 const timerTimeEl = document.getElementById('timerTime');
 const timerSplitsEl = document.getElementById('timerSplits');
+const pauseOverlayEl = document.getElementById('pauseOverlay');
+
+// Spacebar pause: freeze the live timer and hide the cube (+ projections + net).
+// On resume, shift the active timer origins forward by the paused duration so the
+// break doesn't count; completed splits stay put (they shift with their origin).
+function setPaused(on) {
+  if (on === paused) return;
+  if (on) {
+    pauseStart = performance.now();
+  } else {
+    const dt = performance.now() - pauseStart;
+    if (timerState === 'inspecting' && inspectStart) inspectStart += dt;
+    if (timerState === 'running') {
+      timerStart += dt;
+      for (const ph in phaseEnd) phaseEnd[ph] += dt;
+    }
+  }
+  paused = on;
+  cubeGroup.visible = !on;
+  projGroup.visible = !on;
+  netEl.style.visibility = on ? 'hidden' : 'visible';
+  pauseOverlayEl.classList.toggle('on', on);
+}
 function fmtTime(s) {
   if (s < 0) s = 0;
   if (s < 60) return s.toFixed(2);
@@ -1114,6 +1188,7 @@ function fmtTime(s) {
   return m + ':' + (s - m * 60).toFixed(2).padStart(5, '0');
 }
 function updateTimerDisplay() {
+  const tnow = paused ? pauseStart : performance.now();   // freeze the readout while paused
   if (timerState === 'idle') {
     timerInspEl.textContent = ''; timerInspEl.className = 'hud-insp';
     timerTimeEl.textContent = '—'; timerTimeEl.className = 'hud-time idle';
@@ -1121,7 +1196,7 @@ function updateTimerDisplay() {
     return;
   }
   if (timerState === 'inspecting') {
-    const ins = inspectStart ? (performance.now() - inspectStart) / 1000 : 0;
+    const ins = inspectStart ? (tnow - inspectStart) / 1000 : 0;
     timerInspEl.innerHTML = `inspect <b>${fmtTime(ins)}</b>`; timerInspEl.className = 'hud-insp live';
     timerTimeEl.textContent = '0.00'; timerTimeEl.className = 'hud-time inspect';
     timerSplitsEl.textContent = 'your first move starts the solve timer';
@@ -1129,13 +1204,17 @@ function updateTimerDisplay() {
   }
   // running or done — inspection frozen, solve time live
   timerInspEl.innerHTML = `inspect <b>${fmtTime(inspectMs / 1000)}</b>`; timerInspEl.className = 'hud-insp';
-  const end = timerState === 'done' ? timerEnd : performance.now();
+  const end = timerState === 'done' ? timerEnd : tnow;
   timerTimeEl.textContent = fmtTime((end - timerStart) / 1000);
   timerTimeEl.className = 'hud-time ' + (timerState === 'done' ? 'done' : 'run');
   const parts = [];
-  if (phaseEnd.fll) parts.push(`<b>FLL</b> ${fmtTime((phaseEnd.fll - timerStart) / 1000)}`);
-  if (phaseEnd.oll) parts.push(`<b>OLL</b> ${phaseEnd.oll === phaseEnd.fll ? 'skip' : fmtTime((phaseEnd.oll - phaseEnd.fll) / 1000)}`);
-  if (phaseEnd.pbl) parts.push(`<b>PBL</b> ${phaseEnd.pbl === phaseEnd.oll ? 'skip' : fmtTime((phaseEnd.pbl - phaseEnd.oll) / 1000)}`);
+  let prev = timerStart;
+  for (const ph of puzzle.phaseConfig.order) {     // data-driven splits per active puzzle
+    if (!phaseEnd[ph]) break;
+    const txt = (prev !== timerStart && phaseEnd[ph] === prev) ? 'skip' : fmtTime((phaseEnd[ph] - prev) / 1000);
+    parts.push(`<b>${puzzle.phaseConfig.labels[ph]}</b> ${txt}`);
+    prev = phaseEnd[ph];
+  }
   timerSplitsEl.innerHTML = parts.join('&nbsp;&nbsp;·&nbsp;&nbsp;') || '&nbsp;';
 }
 
@@ -1368,11 +1447,11 @@ let lastHint = null, shownPhase = null;
 function renderCaseHelper() {
   if (!lastHint) { caseHelpEl.classList.add('hidden'); return; }
   caseHelpEl.classList.remove('hidden');
-  chPhaseEl.textContent = lastHint.phase === 'oll' ? 'OLL · orient last layer' : 'PBL · permute both layers';
+  chPhaseEl.textContent = lastHint.label;
   const sn = chNameCb.checked, sm = chMovesCb.checked;
   let html = '';
   if (sn) html += `<div class="ch-name">${lastHint.name}</div>`;
-  if (sm) html += `<div class="ch-moves">${lastHint.tokens.join(' ') || '(already aligned — AUF)'}</div>`;
+  if (sm) html += `<div class="ch-moves">${lastHint.display || '(already aligned — AUF)'}</div>`;
   if (sm && lastHint.tokens.length) html += `<button class="ch-apply">apply ▶</button>`;
   if (!sn && !sm) html = `<div class="ch-dim">name &amp; moves hidden</div>`;
   chBodyEl.innerHTML = html;
@@ -1381,11 +1460,10 @@ function renderCaseHelper() {
 function updateCaseHelper() {
   if (solvePhase === shownPhase) return;
   shownPhase = solvePhase;
-  // Only hint during a live solve. A drill ends at FLL (timerState 'done' while solvePhase is 'oll'),
-  // so this also stops it from offering an OLL/PBL hint the gated cube could never apply.
-  lastHint = timerState === 'running'
-    ? (solvePhase === 'oll' ? recognizeOLL() : solvePhase === 'pbl' ? recognizePBL() : null)
-    : null;
+  // Only hint during a live solve. A drill ends at first-face/FLL (timerState 'done'
+  // while solvePhase is the last-layer phase), so this also stops it from offering a
+  // last-layer hint the gated puzzle could never apply.
+  lastHint = (timerState === 'running' && puzzle.caseHelp) ? puzzle.caseHelp(solvePhase) : null;
   renderCaseHelper();
 }
 caseHelpEl.addEventListener('click', (e) => {
@@ -1401,15 +1479,10 @@ function hintKey() {
 }
 function recordSolve() {
   const sec = ms => ms / 1000;
-  solves.push({
-    t: Date.now(), session: SESSION_ID, day: todayStr(),
-    insp: sec(inspectMs),
-    total: sec(phaseEnd.pbl - timerStart),
-    fll: sec(phaseEnd.fll - timerStart),
-    oll: sec(phaseEnd.oll - phaseEnd.fll),
-    pbl: sec(phaseEnd.pbl - phaseEnd.oll),
-    hint: solveHint,
-  });
+  const rec = { t: Date.now(), session: SESSION_ID, day: todayStr(), insp: sec(inspectMs), total: sec(timerEnd - timerStart), hint: solveHint };
+  let prev = timerStart;
+  for (const ph of puzzle.phaseConfig.order) { const e = phaseEnd[ph] || prev; rec[ph] = sec(e - prev); prev = e; }
+  solves.push(rec);
   saveSolves();
   if (!statsEl.classList.contains('hidden')) renderStats();
 }
@@ -1443,25 +1516,29 @@ function rebuildScopePick() {
 }
 function renderStats() {
   const mean = a => a.reduce((x, y) => x + y, 0) / a.length;
+  const order = puzzle.phaseConfig.order, labels = puzzle.phaseConfig.labels;
   const agg = arr => {
     if (!arr.length) return null;
     const last = arr.slice(-5);
-    return { n: arr.length, best: Math.min(...arr.map(s => s.total)),
-             total: mean(last.map(s => s.total)), insp: mean(last.map(s => s.insp || 0)),
-             fll: mean(last.map(s => s.fll)), oll: mean(last.map(s => s.oll)), pbl: mean(last.map(s => s.pbl)) };
+    const r = { n: arr.length, best: Math.min(...arr.map(s => s.total)),
+             total: mean(last.map(s => s.total)), insp: mean(last.map(s => s.insp || 0)), ph: {} };
+    for (const p of order) r.ph[p] = mean(last.map(s => +s[p] || 0));
+    return r;
   };
   const f = x => (x == null ? '·' : fmtTime(x));
   const arr = scopedSolves();
   const row = (label, a, cls) => {
     const r = agg(a);
     return `<tr class="${cls || ''}"><td>${label}</td><td>${r ? r.n : 0}</td><td>${f(r && r.best)}</td>` +
-      `<td>${f(r && r.total)}</td><td>${f(r && r.insp)}</td><td>${f(r && r.fll)}</td><td>${f(r && r.oll)}</td><td>${f(r && r.pbl)}</td></tr>`;
+      `<td>${f(r && r.total)}</td><td>${f(r && r.insp)}</td>` +
+      order.map(p => `<td>${f(r && r.ph[p])}</td>`).join('') + `</tr>`;
   };
   const sessions = new Set(solves.map(s => s.session)).size, days = new Set(solves.map(s => s.day)).size;
   const foot = `<div class="stats-foot">all-time: ${solves.length} solves · ${sessions} session${sessions === 1 ? '' : 's'} · ${days} day${days === 1 ? '' : 's'}</div>`;
+  const thead = `<th>hints</th><th>n</th><th>best</th><th>mean</th><th>insp</th>` + order.map(p => `<th>${labels[p]}</th>`).join('');
   statsBodyEl.innerHTML = (!arr.length
     ? '<div class="stats-empty">No solves in this scope yet.</div>'
-    : `<table><thead><tr><th>hints</th><th>n</th><th>best</th><th>mean</th><th>insp</th><th>FLL</th><th>OLL</th><th>PBL</th></tr></thead><tbody>` +
+    : `<table><thead><tr>${thead}</tr></thead><tbody>` +
       ['none', 'name', 'moves', 'name+moves'].map(c => row(HINT_LABELS[c], arr.filter(s => s.hint === c))).join('') +
       row('All', arr, 'all') + `</tbody></table>`) + foot;
 }
@@ -1552,22 +1629,31 @@ window.__og = {
 
 const solverEl = document.getElementById('solver');
 const solverOut = document.getElementById('solverOut');
+const solverHead = document.getElementById('solverHead');
+const solverRow = document.getElementById('solverRow');
 let lastSolution = null;
+function buildSolver() {                                   // rebuild the solver panel for the active puzzle
+  solverHead.textContent = puzzle.solverLabel;
+  solverRow.innerHTML = puzzle.solverGoals
+    .map(g => `<button class="sbtn" data-goal="${g.key}">${g.label}</button>`).join('');
+  solverOut.textContent = 'Scramble, then pick a target.';
+  lastSolution = null;
+}
 solverEl.addEventListener('click', (e) => {
   const apply = e.target.closest('.applybtn');
   if (apply && lastSolution) { for (const m of lastSolution) applyMove(m, 'solve', true); return; }
   const b = e.target.closest('.sbtn');
   if (!b) return;
-  if (current || queue.length) { solverOut.textContent = 'wait for the cube to settle…'; return; }
+  if (current || queue.length) { solverOut.textContent = 'wait for the puzzle to settle…'; return; }
   solverEl.querySelectorAll('.sbtn').forEach(x => x.classList.toggle('active', x === b));
   const t0 = performance.now();
-  const sol = solveFLL(b.dataset.goal);
+  const sol = puzzle.solve(b.dataset.goal);               // { tokens (world), display } | null
   const ms = Math.round(performance.now() - t0);
   if (sol === null) { solverOut.textContent = 'no solution found'; lastSolution = null; return; }
-  if (sol.length === 0) { solverOut.innerHTML = '<span class="done">already done ✓</span>'; lastSolution = null; return; }
-  lastSolution = sol;
+  if (sol.tokens.length === 0) { solverOut.innerHTML = '<span class="done">already done ✓</span>'; lastSolution = null; return; }
+  lastSolution = sol.tokens;
   solverOut.innerHTML =
-    `<span class="seq">${sol.join(' ')}</span><span class="cnt">${sol.length} move${sol.length === 1 ? '' : 's'} · ${ms}ms</span>` +
+    `<span class="seq">${sol.display}</span><span class="cnt">${sol.tokens.length} move${sol.tokens.length === 1 ? '' : 's'} · ${ms}ms</span>` +
     `<button class="applybtn">apply ▶</button>`;
 });
 
@@ -1577,16 +1663,16 @@ solverEl.addEventListener('click', (e) => {
 const dock = document.getElementById('dock');
 const buttonMap = {};   // notation -> element
 
-function makeGroup(label, faces) {
+function makeGroup(label, moves, variants) {
   const grp = document.createElement('div');
   grp.className = 'grp';
   const gl = document.createElement('div');
   gl.className = 'glabel'; gl.textContent = label;
   grp.appendChild(gl);
-  for (const f of faces) {
+  for (const f of moves) {
     const row = document.createElement('div');
     row.className = 'row';
-    for (const variant of ['', "'", '2']) {
+    for (const variant of variants) {
       const tok = f + variant;
       const b = document.createElement('button');
       b.className = 'mbtn';
@@ -1600,9 +1686,15 @@ function makeGroup(label, faces) {
   return grp;
 }
 
-dock.appendChild(makeGroup('Faces', ['R', 'L', 'U', 'D', 'F', 'B']));
-const div = document.createElement('div'); div.className = 'divider'; dock.appendChild(div);
-dock.appendChild(makeGroup('Rotations', ['x', 'y', 'z']));
+// Rebuild the move dock for the active puzzle (each supplies its own dockGroups).
+function buildDock() {
+  dock.innerHTML = '';
+  for (const k in buttonMap) delete buttonMap[k];
+  (puzzle.dockGroups || []).forEach((gr, i) => {
+    if (i > 0) { const div = document.createElement('div'); div.className = 'divider'; dock.appendChild(div); }
+    dock.appendChild(makeGroup(gr.label, gr.moves, gr.variants));
+  });
+}
 
 function flashButton(tok) {
   const b = buttonMap[tok];
@@ -1831,10 +1923,19 @@ const ROT_KEYS = { x:'x', y:'y', z:'z' };
 // e~R'  i~U'  g~F'  s~D'  k~L'  n~B'
 const PRIME_KEYS = { e:'R', i:'U', g:'F', s:'D', k:'L', n:'B' };
 window.addEventListener('keydown', (e) => {
-  if (e.metaKey || e.ctrlKey || e.altKey) return;
+  if (e.metaKey || e.ctrlKey) return;                                          // browser/OS shortcuts (Alt is used for tips)
+  if (e.code === 'Space') { e.preventDefault(); setPaused(!paused); return; }  // pause/resume + hide cube
+  if (paused) return;                                                          // swallow everything else while paused
+  const km = puzzle.keymap;
+  if (e.altKey) {   // Option/Alt + the vertex key = the matching TIP turn (by physical code, so macOS's ® etc. doesn't matter)
+    if (km.tipCodes && km.tipCodes[e.code]) { e.preventDefault(); applyMove(km.tipCodes[e.code] + (e.shiftKey ? "'" : '')); }
+    return;         // never let other Alt combos through to the engine
+  }
   const k = e.key.toLowerCase();
-  if (PRIME_KEYS[k]) { e.preventDefault(); applyMove(PRIME_KEYS[k] + "'"); return; }
-  let face = FACE_KEYS[k] || ROT_KEYS[k];
+  if (k.length === 1 && k >= '1' && k <= '4') { e.preventDefault(); startDrill(+k); return; }  // 1–4: (re)start FLL drill
+  if (km.tipKeys && km.tipKeys[k]) { e.preventDefault(); applyMove(km.tipKeys[k] + (e.shiftKey ? "'" : '')); return; }  // fallback letter-key tips
+  if (km.primeKeys && km.primeKeys[k]) { e.preventDefault(); applyMove(km.primeKeys[k] + "'"); return; }
+  let face = (km.faceKeys && km.faceKeys[k]) || (km.rotKeys && km.rotKeys[k]);
   if (!face) return;
   e.preventDefault();
   applyMove(face + (e.shiftKey ? "'" : ''));
@@ -1858,14 +1959,2248 @@ function animate() {
   } else if (current || queue.length) {
     wasAnimating = true;
   }
+  if (pyraSnapTarget) {                                  // ease the camera to the snapped canonical view
+    camera.position.lerp(pyraSnapTarget, 0.22);
+    if (camera.position.distanceToSquared(pyraSnapTarget) < 1e-4) { camera.position.copy(pyraSnapTarget); pyraSnapTarget = null; }
+  }
   controls.update();
-  updateProjectionLayout();
+  puzzle.updateProjections();
   updateTimerDisplay();
   renderer.render(scene, camera);
 }
 let wasAnimating = false;
 
+
+/* ===== Pyraminx core logic (standalone module, node-verified: gates 1-6 pass) =====
+   Wrapped in an IIFE so its helpers (v, FACT, MOVE_PYRA, ...) do not collide with
+   the 2x2 globals; only PYRA is exposed. See SELF_TEST_PYRA() for the gates. */
+const PYRA = (function(){
+/* ============================================================================
+ * pyra-core.js  —  Standalone, dependency-free Pyraminx core logic.
+ *
+ *   No imports/exports. Everything hangs off the `PYRA` object (and a few
+ *   top-level consts). Drop-in for a single-file cubing trainer.
+ *
+ *   MODEL
+ *   -----
+ *   A Pyraminx is a regular tetrahedron with 14 movable pieces:
+ *     - 4 TIPS    (orientation only, Z3, position fixed)
+ *     - 4 AXIAL   "center" pieces (orientation only, Z3, position fixed)
+ *     - 6 EDGES   (the only permuting pieces; permute + flip Z2)
+ *   36 facelets = 4 faces x 9.
+ *
+ *   State = {
+ *     co:   Int8Array(4)  axial orientations 0..2 by vertex [U,L,R,B]
+ *     ep:   Int8Array(6)  edge permutation
+ *     eo:   Int8Array(6)  edge flip 0/1
+ *     tips: Int8Array(4)  tip orientations 0..2 by vertex [U,L,R,B]
+ *   }
+ *   Solved: co all 0, ep=[0,1,2,3,4,5], eo all 0, tips all 0.
+ *
+ *   The geometry spec (VERTS, FACE_NORMALS, FACE_COLORS, PIECES) is the SAME
+ *   data that derives the moves — so it can also drive 3D rendering and
+ *   facelet reading later. Moves are derived geometrically (Rodrigues), never
+ *   hand-tabulated.
+ * ==========================================================================*/
+
+const PYRA = {};
+
+/* ----------------------------------------------------------------------------
+ * Tiny 3D vector helpers
+ * --------------------------------------------------------------------------*/
+function v3(x, y, z) { return [x, y, z]; }
+function vadd(a, b) { return [a[0] + b[0], a[1] + b[1], a[2] + b[2]]; }
+function vscale(a, s) { return [a[0] * s, a[1] * s, a[2] * s]; }
+function vdot(a, b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+function vcross(a, b) {
+  return [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+}
+function vlen(a) { return Math.sqrt(vdot(a, a)); }
+function vnorm(a) { const L = vlen(a); return [a[0] / L, a[1] / L, a[2] / L]; }
+
+// Rodrigues rotation of vector v about unit axis k by angle theta (radians).
+function rodrigues(v, k, theta) {
+  const c = Math.cos(theta), s = Math.sin(theta);
+  const kxv = vcross(k, v);
+  const kdotv = vdot(k, v);
+  // v*c + (k x v)*s + k*(k.v)*(1-c)
+  return vadd(
+    vadd(vscale(v, c), vscale(kxv, s)),
+    vscale(k, kdotv * (1 - c))
+  );
+}
+
+// Snap a coordinate that should be one of a small set of values.
+function approxEq(a, b, eps) { return Math.abs(a - b) < (eps || 1e-6); }
+function vApproxEq(a, b, eps) {
+  return approxEq(a[0], b[0], eps) && approxEq(a[1], b[1], eps) && approxEq(a[2], b[2], eps);
+}
+
+/* ----------------------------------------------------------------------------
+ * GEOMETRY SPEC
+ *
+ * 4 vertex axes (alternate cube corners), label [U,L,R,B]:
+ *   U=(1,1,1), L=(-1,-1,1), R=(1,-1,-1), B=(-1,1,-1)   (then normalized)
+ *
+ * 4 face outward normals = negatives of the vertex dirs. The face "opposite"
+ * vertex V points away from V; assign 1 color per face.
+ * --------------------------------------------------------------------------*/
+
+// Raw (un-normalized) vertex directions, order [U, L, R, B].
+const VERT_RAW = [
+  v3( 1,  1,  1), // U
+  v3(-1, -1,  1), // L
+  v3( 1, -1, -1), // R
+  v3(-1,  1, -1), // B
+];
+const VERTS = VERT_RAW.map(vnorm);
+const VNAME = ['U', 'L', 'R', 'B'];
+
+// Face i is the face OPPOSITE vertex i: its outward normal = -VERTS[i].
+// faceOpp(U)=(-1,-1,-1), faceOpp(L)=(1,1,-1), faceOpp(R)=(-1,1,1), faceOpp(B)=(1,-1,1)
+const FACE_NORMAL_RAW = [
+  v3(-1, -1, -1), // face 0 (opposite U)
+  v3( 1,  1, -1), // face 1 (opposite L)
+  v3(-1,  1,  1), // face 2 (opposite R)
+  v3( 1, -1,  1), // face 3 (opposite B)
+];
+const FACE_NORMALS = FACE_NORMAL_RAW.map(vnorm);
+// Color assignment (documented): face 0=GREEN, 1=BLUE, 2=RED, 3=YELLOW.
+const FACE_COLORS = ['GREEN', 'BLUE', 'RED', 'YELLOW'];
+
+// The face index opposite each vertex equals the vertex index (by construction).
+// The 3 faces TOUCHING vertex V are all faces except face V.
+function facesTouchingVertex(v) {
+  const out = [];
+  for (let f = 0; f < 4; f++) if (f !== v) out.push(f);
+  return out;
+}
+
+/* 6 EDGES = the 6 unordered vertex pairs, indexed EXACTLY:
+ *   0:UL 1:UR 2:UB 3:LR 4:RB 5:LB
+ * Each edge sits at the midpoint of its tetra-edge; its 2 stickers lie on the
+ * 2 faces sharing that tetra-edge. The 2 faces sharing tetra-edge {a,b} are
+ * exactly the 2 faces that touch BOTH a and b — i.e. all faces except face a
+ * and face b (there are 4 faces; removing faces a,b leaves 2).
+ */
+const EDGE_VERTS = [
+  [0, 1], // 0 UL
+  [0, 2], // 1 UR
+  [0, 3], // 2 UB
+  [1, 2], // 3 LR
+  [2, 3], // 4 RB
+  [1, 3], // 5 LB
+];
+const EDGE_NAME = ['UL', 'UR', 'UB', 'LR', 'RB', 'LB'];
+
+// The two faces that carry an edge's stickers = the two faces NOT equal to
+// either of the edge's vertices' opposite faces. Since face f is opposite
+// vertex f, the faces touching edge {a,b} are the faces in {0,1,2,3}\{a,b}.
+function facesOfEdge(e) {
+  const [a, b] = EDGE_VERTS[e];
+  const out = [];
+  for (let f = 0; f < 4; f++) if (f !== a && f !== b) out.push(f);
+  return out; // exactly 2 faces, sorted ascending
+}
+
+// Home position of an edge piece = midpoint of its two vertices (on unit verts).
+function edgeHomePos(e) {
+  const [a, b] = EDGE_VERTS[e];
+  return vscale(vadd(VERTS[a], VERTS[b]), 0.5);
+}
+
+// A point that is "on face f, near edge e": push the edge midpoint slightly
+// toward face f's plane so we can tell which face a sticker is on. We model
+// each edge sticker as a 3D point = edgeMidpoint nudged along that face normal
+// direction's tangential offset. For deriving moves we actually track the
+// face NORMAL the sticker lies on, which is the robust invariant.
+
+/* ----------------------------------------------------------------------------
+ * Edge "primary" sticker rule:
+ *   primary face = the face with the lexicographically SMALLER face index
+ *   among the edge's two faces. secondary = the other.
+ * eo bit = 0 if the piece's primary sticker is on the slot's primary face,
+ *          1 if it landed on the slot's secondary face.
+ * --------------------------------------------------------------------------*/
+function edgePrimaryFace(e) { return facesOfEdge(e)[0]; }   // smaller index
+function edgeSecondaryFace(e) { return facesOfEdge(e)[1]; } // larger index
+
+/* ----------------------------------------------------------------------------
+ * Build a renderable PIECES table (geometry spec output).
+ *   Each piece: { kind, vertex|edge index, pos (3D home), facelets:[{normal,faceIndex}] }
+ *   - tip   at vertex v: its single axis sticker faces ... we record the 3 faces
+ *           touching v as its facelets (a tip shows on 3 faces near vertex v).
+ *   - axial at vertex v: likewise shows on the 3 faces touching v.
+ *   - edge  e: 2 facelets on the 2 faces sharing the tetra-edge.
+ * For the SOLVED state, the facelet's faceIndex is its color/home face.
+ * --------------------------------------------------------------------------*/
+function buildPieces() {
+  const pieces = [];
+  for (let v = 0; v < 4; v++) {
+    const fs = facesTouchingVertex(v);
+    pieces.push({
+      kind: 'tip', vertex: v, name: 'tip-' + VNAME[v],
+      pos: vscale(VERTS[v], 0.95),
+      facelets: fs.map(f => ({ normal: FACE_NORMALS[f].slice(), faceIndex: f })),
+    });
+  }
+  for (let v = 0; v < 4; v++) {
+    const fs = facesTouchingVertex(v);
+    pieces.push({
+      kind: 'axial', vertex: v, name: 'axial-' + VNAME[v],
+      pos: vscale(VERTS[v], 0.55),
+      facelets: fs.map(f => ({ normal: FACE_NORMALS[f].slice(), faceIndex: f })),
+    });
+  }
+  for (let e = 0; e < 6; e++) {
+    const fs = facesOfEdge(e);
+    pieces.push({
+      kind: 'edge', edge: e, name: 'edge-' + EDGE_NAME[e],
+      pos: edgeHomePos(e),
+      facelets: fs.map(f => ({ normal: FACE_NORMALS[f].slice(), faceIndex: f })),
+    });
+  }
+  return pieces;
+}
+const PIECES = buildPieces();
+
+/* ----------------------------------------------------------------------------
+ * Which edges/vertices are affected by a vertex move.
+ *   The 3 edges incident to a vertex (per spec):
+ *     U->{0,1,2}  L->{0,3,5}  R->{1,3,4}  B->{2,4,5}
+ *   (Derived: edges whose vertex pair contains V.)
+ * --------------------------------------------------------------------------*/
+function edgesIncidentToVertex(v) {
+  const out = [];
+  for (let e = 0; e < 6; e++) if (EDGE_VERTS[e][0] === v || EDGE_VERTS[e][1] === v) out.push(e);
+  return out;
+}
+
+/* ----------------------------------------------------------------------------
+ * DERIVE MOVES geometrically.
+ *
+ * For vertex V, a +120° rotation about axis VERTS[V] (sign chosen, then
+ * verified) cycles the 3 incident edges and twists the axial+tip at V.
+ *
+ * For each incident edge e (home slot e), we:
+ *   - rotate its home position -> find which slot's home position it matches (dst)
+ *   - rotate its PRIMARY face normal -> see whether it lands on dst's primary
+ *     or secondary face normal -> eo flip bit.
+ * The move is stored as a permutation in "destination" form plus flip bits, in
+ * the apply convention: ep'[k] = ep[ MOVE.ep[k] ] (MOVE.ep[k] = source slot of k).
+ *
+ * For the axial twist: rotate vertex V's axial primary face normal and read
+ * which of V's 3 touching faces it lands on -> Z3 amount.
+ * --------------------------------------------------------------------------*/
+
+const THETA = (2 * Math.PI) / 3; // 120 degrees
+
+// Find the slot index whose home position matches point p (within eps).
+function matchEdgeSlot(p) {
+  for (let e = 0; e < 6; e++) {
+    if (vApproxEq(edgeHomePos(e), p, 1e-6)) return e;
+  }
+  return -1;
+}
+// Find face index whose normal matches n.
+function matchFace(n) {
+  for (let f = 0; f < 4; f++) if (vApproxEq(FACE_NORMALS[f], n, 1e-6)) return f;
+  return -1;
+}
+
+// AXIAL/TIP TWIST CONVENTION.
+//   The co (and tip) coordinate of vertex v counts +120° steps of the rotation
+//   about axis v. A +120° rotation about VERTS[v] cyclically permutes v's 3
+//   touching faces, advancing the marked axis sticker by exactly one step in
+//   that cycle; so a +move adds +1 (mod 3) and a prime adds +2 (== -1). This is
+//   geometrically derived (verified by U^3 = identity in the self-test) rather
+//   than hand-tabulated. The exact cyclic order is irrelevant as long as it is
+//   consistent — which the BFS state-count gate (933120) confirms.
+
+// Derive a single generator (sign = +1 or -1) for vertex v.
+function deriveVertexMove(v, sign) {
+  const axis = vscale(VERTS[v], sign);
+  const inc = edgesIncidentToVertex(v); // 3 edges
+
+  // ep stored as source-array: epSrc[k] = which current slot fills slot k.
+  // First compute forward map: dst[srcSlot] = where srcSlot goes.
+  const dstOf = {};
+  const flipOfDst = {};
+  for (const e of inc) {
+    const newPos = rodrigues(edgeHomePos(e), axis, THETA);
+    const dst = matchEdgeSlot(newPos);
+    if (dst < 0) throw new Error('edge pos no match v=' + v + ' e=' + e);
+    // Rotate the primary sticker normal of source edge e.
+    const newPrim = rodrigues(FACE_NORMALS[edgePrimaryFace(e)], axis, THETA);
+    const landedFace = matchFace(newPrim);
+    if (landedFace < 0) throw new Error('edge normal no match v=' + v + ' e=' + e);
+    // flip bit: 0 if landed on dst's primary face, 1 if dst's secondary.
+    let flip;
+    if (landedFace === edgePrimaryFace(dst)) flip = 0;
+    else if (landedFace === edgeSecondaryFace(dst)) flip = 1;
+    else throw new Error('edge prim landed off-face v=' + v + ' e=' + e + ' lf=' + landedFace);
+    dstOf[e] = dst;
+    flipOfDst[dst] = flip;
+  }
+  // Build full ep source-array over all 6 slots (non-incident edges fixed).
+  const epSrc = [0, 1, 2, 3, 4, 5];
+  const eoFlip = [0, 0, 0, 0, 0, 0];
+  // dstOf maps src->dst; invert to srcOf[dst]=src.
+  const srcOf = {};
+  for (const e of inc) srcOf[dstOf[e]] = e;
+  for (const dst of inc) {
+    epSrc[dst] = srcOf[dst];
+    eoFlip[dst] = flipOfDst[dst];
+  }
+
+  // Axial + tip twist: +1 per +rotation step. sign -1 (prime) => +2 (i.e. -1 mod3).
+  const co = [0, 0, 0, 0];
+  const amt = (sign > 0) ? 1 : 2;
+  co[v] = amt;
+
+  return { co, ep: epSrc, eoFlip, tipDelta: amt, vertex: v };
+}
+
+// MOVE_PYRA order: U,U',L,L',R,R',B,B'   (index 0..7)
+const MOVE_PYRA = [];
+{
+  const order = [
+    [0, +1], [0, -1],
+    [1, +1], [1, -1],
+    [2, +1], [2, -1],
+    [3, +1], [3, -1],
+  ];
+  for (const [v, s] of order) MOVE_PYRA.push(deriveVertexMove(v, s));
+}
+
+// Token maps. Vertex moves: U U' L L' R R' B B'. Tip moves: u l r b (u' etc too).
+const MOVE_TOKENS = ['U', "U'", 'L', "L'", 'R', "R'", 'B', "B'"];
+const TIP_TOKENS = ['u', "u'", 'l', "l'", 'r', "r'", 'b', "b'"];
+const TOKEN_TO_INDEX = {};
+MOVE_TOKENS.forEach((t, i) => { TOKEN_TO_INDEX[t] = i; });
+
+// Tip move applies a Z3 twist (amount) to one tip only.
+function tipMoveInfo(token) {
+  const base = token[0]; // u l r b
+  const prime = token.length > 1 && token[1] === "'";
+  const v = { u: 0, l: 1, r: 2, b: 3 }[base];
+  const amt = prime ? 2 : 1;
+  return { v, amt };
+}
+function isTipToken(token) { return /^[ulrb]'?$/.test(token); }
+
+/* ----------------------------------------------------------------------------
+ * State construction / apply
+ * --------------------------------------------------------------------------*/
+function solvedState() {
+  return {
+    co: Int8Array.from([0, 0, 0, 0]),
+    ep: Int8Array.from([0, 1, 2, 3, 4, 5]),
+    eo: Int8Array.from([0, 0, 0, 0, 0, 0]),
+    tips: Int8Array.from([0, 0, 0, 0]),
+  };
+}
+function cloneState(s) {
+  return {
+    co: Int8Array.from(s.co),
+    ep: Int8Array.from(s.ep),
+    eo: Int8Array.from(s.eo),
+    tips: Int8Array.from(s.tips),
+  };
+}
+function statesEqual(a, b) {
+  for (let i = 0; i < 4; i++) if (a.co[i] !== b.co[i]) return false;
+  for (let i = 0; i < 6; i++) if (a.ep[i] !== b.ep[i]) return false;
+  for (let i = 0; i < 6; i++) if (a.eo[i] !== b.eo[i]) return false;
+  for (let i = 0; i < 4; i++) if (a.tips[i] !== b.tips[i]) return false;
+  return true;
+}
+
+// Apply a vertex move by index (0..7) OR a token (vertex or tip).
+function applyMovePyra(s, mOrToken) {
+  let idx, token = null;
+  if (typeof mOrToken === 'string') {
+    token = mOrToken;
+    if (isTipToken(token)) {
+      const out = cloneState(s);
+      const { v, amt } = tipMoveInfo(token);
+      out.tips[v] = (out.tips[v] + amt) % 3;
+      return out;
+    }
+    idx = TOKEN_TO_INDEX[token];
+    if (idx === undefined) throw new Error('bad token ' + token);
+  } else {
+    idx = mOrToken;
+  }
+  const M = MOVE_PYRA[idx];
+  const out = cloneState(s);
+  for (let i = 0; i < 4; i++) out.co[i] = (s.co[i] + M.co[i]) % 3;
+  for (let k = 0; k < 6; k++) {
+    const src = M.ep[k];
+    out.ep[k] = s.ep[src];
+    out.eo[k] = s.eo[src] ^ M.eoFlip[k];
+  }
+  // tip on the moved vertex also twists
+  out.tips[M.vertex] = (s.tips[M.vertex] + M.tipDelta) % 3;
+  return out;
+}
+
+function applySeq(s, tokens) {
+  let cur = s;
+  for (const t of tokens) cur = applyMovePyra(cur, t);
+  return cur;
+}
+
+// Invert a token.
+function invertToken(t) {
+  if (t.endsWith("'")) return t.slice(0, -1);
+  return t + "'";
+}
+function invertSeq(tokens) {
+  return tokens.slice().reverse().map(invertToken);
+}
+
+PYRA.VERTS = VERTS;
+PYRA.VNAME = VNAME;
+PYRA.FACE_NORMALS = FACE_NORMALS;
+PYRA.FACE_COLORS = FACE_COLORS;
+PYRA.EDGE_VERTS = EDGE_VERTS;
+PYRA.EDGE_NAME = EDGE_NAME;
+PYRA.PIECES = PIECES;
+PYRA.MOVE_PYRA = MOVE_PYRA;
+PYRA.MOVE_TOKENS = MOVE_TOKENS;
+PYRA.TIP_TOKENS = TIP_TOKENS;
+PYRA.solvedState = solvedState;
+PYRA.cloneState = cloneState;
+PYRA.statesEqual = statesEqual;
+PYRA.applyMovePyra = applyMovePyra;
+PYRA.applySeq = applySeq;
+PYRA.invertToken = invertToken;
+PYRA.invertSeq = invertSeq;
+PYRA.facesOfEdge = facesOfEdge;
+PYRA.edgesIncidentToVertex = edgesIncidentToVertex;
+
+/* ----------------------------------------------------------------------------
+ * COORDINATES for the solver / BFS (NON-TIP state space).
+ *   co index   : base-3 of co[0..3] but co is constrained? No — all 81 reachable.
+ *                Actually only co with ... we use full 81 (0..80).
+ *   ep Lehmer  : 0..719 (permutation rank of 6 elements)
+ *   eo bits    : 0..63 (6 bits)
+ * Dense key (per spec): coIndex*46080 + epLehmer*64 + eoBits,
+ *   where 46080 = 720*64.
+ * --------------------------------------------------------------------------*/
+function coIndex(co) {
+  return ((co[0] * 3 + co[1]) * 3 + co[2]) * 3 + co[3]; // 0..80
+}
+function coFromIndex(idx) {
+  const c = new Int8Array(4);
+  c[3] = idx % 3; idx = (idx / 3) | 0;
+  c[2] = idx % 3; idx = (idx / 3) | 0;
+  c[1] = idx % 3; idx = (idx / 3) | 0;
+  c[0] = idx % 3;
+  return c;
+}
+// Lehmer code rank of a permutation of length 6 (0..719).
+const FACT = [1, 1, 2, 6, 24, 120, 720];
+function permRank(p) {
+  const n = p.length;
+  let rank = 0;
+  for (let i = 0; i < n; i++) {
+    let smaller = 0;
+    for (let j = i + 1; j < n; j++) if (p[j] < p[i]) smaller++;
+    rank += smaller * FACT[n - 1 - i];
+  }
+  return rank;
+}
+function permUnrank(rank, n) {
+  const elems = [];
+  for (let i = 0; i < n; i++) elems.push(i);
+  const p = new Int8Array(n);
+  for (let i = 0; i < n; i++) {
+    const f = FACT[n - 1 - i];
+    const idx = (rank / f) | 0;
+    rank = rank % f;
+    p[i] = elems[idx];
+    elems.splice(idx, 1);
+  }
+  return p;
+}
+function eoBits(eo) {
+  let b = 0;
+  for (let i = 0; i < 6; i++) b |= (eo[i] & 1) << i;
+  return b;
+}
+function eoFromBits(b) {
+  const eo = new Int8Array(6);
+  for (let i = 0; i < 6; i++) eo[i] = (b >> i) & 1;
+  return eo;
+}
+function stateKey(s) {
+  return coIndex(s.co) * 46080 + permRank(s.ep) * 64 + eoBits(s.eo);
+}
+function stateFromKey(key) {
+  const eo = key % 64; key = (key / 64) | 0;
+  const ep = key % 720; key = (key / 720) | 0;
+  const co = key; // 0..80
+  return {
+    co: coFromIndex(co),
+    ep: permUnrank(ep, 6),
+    eo: eoFromBits(eo),
+    tips: Int8Array.from([0, 0, 0, 0]),
+  };
+}
+
+PYRA.coIndex = coIndex;
+PYRA.permRank = permRank;
+PYRA.permUnrank = permUnrank;
+PYRA.eoBits = eoBits;
+PYRA.stateKey = stateKey;
+PYRA.stateFromKey = stateFromKey;
+
+/* ----------------------------------------------------------------------------
+ * Apply a move purely on coordinates (fast path for BFS/IDA*).
+ * We precompute per-move transition on each sub-coordinate.
+ * --------------------------------------------------------------------------*/
+// Move applied to co-index -> co-index
+function moveCoIndex(coIdx, m) {
+  const co = coFromIndex(coIdx);
+  const M = MOVE_PYRA[m];
+  const nc = new Int8Array(4);
+  for (let i = 0; i < 4; i++) nc[i] = (co[i] + M.co[i]) % 3;
+  return coIndex(nc);
+}
+/* ----------------------------------------------------------------------------
+ * Parity & invariants
+ * --------------------------------------------------------------------------*/
+function permParity(p) {
+  // count inversions mod 2
+  let inv = 0;
+  for (let i = 0; i < p.length; i++)
+    for (let j = i + 1; j < p.length; j++)
+      if (p[i] > p[j]) inv++;
+  return inv & 1;
+}
+function eoSum(eo) { let s = 0; for (let i = 0; i < 6; i++) s += eo[i]; return s; }
+
+PYRA.permParity = permParity;
+PYRA.eoSum = eoSum;
+
+/* ----------------------------------------------------------------------------
+ * BFS over full non-tip space; also builds pattern databases.
+ *   coPrune[81], epPrune[720], eoPrune[64].
+ * --------------------------------------------------------------------------*/
+let TABLES = null;
+function buildPyraTables() {
+  if (TABLES) return TABLES;
+
+  // ---- co pruning (BFS over 81 states) ----
+  const coPrune = new Int8Array(81).fill(-1);
+  {
+    coPrune[coIndex(Int8Array.from([0, 0, 0, 0]))] = 0;
+    let frontier = [coIndex(Int8Array.from([0, 0, 0, 0]))];
+    let d = 0;
+    while (frontier.length) {
+      const next = [];
+      for (const c of frontier) {
+        for (let m = 0; m < 8; m++) {
+          const nc = moveCoIndex(c, m);
+          if (coPrune[nc] < 0) { coPrune[nc] = d + 1; next.push(nc); }
+        }
+      }
+      frontier = next; d++;
+    }
+  }
+
+  // ---- ep pruning (BFS over 720 perms) ----
+  const epPrune = new Int8Array(720).fill(-1);
+  {
+    const start = permRank(Int8Array.from([0, 1, 2, 3, 4, 5]));
+    epPrune[start] = 0;
+    let frontier = [start];
+    let d = 0;
+    while (frontier.length) {
+      const next = [];
+      for (const r of frontier) {
+        const ep = permUnrank(r, 6);
+        for (let m = 0; m < 8; m++) {
+          const M = MOVE_PYRA[m];
+          const nep = new Int8Array(6);
+          for (let k = 0; k < 6; k++) nep[k] = ep[M.ep[k]];
+          const nr = permRank(nep);
+          if (epPrune[nr] < 0) { epPrune[nr] = d + 1; next.push(nr); }
+        }
+      }
+      frontier = next; d++;
+    }
+  }
+
+  // ---- eo pruning (BFS over 64 flip-vectors) ----
+  const eoPrune = new Int8Array(64).fill(-1);
+  {
+    const start = 0;
+    eoPrune[start] = 0;
+    let frontier = [start];
+    let d = 0;
+    while (frontier.length) {
+      const next = [];
+      for (const b of frontier) {
+        const eo = eoFromBits(b);
+        // eo transition also depends on ep (because eo'[k]=eo[ep[k]]^flip).
+        // For a pure eo pruning DB we need eo transition independent of ep —
+        // but eo permutes by the move's ep too. To keep eoPrune admissible we
+        // BFS in the (eo) projection using identity ep at each step is WRONG.
+        // Instead: eo lives in the full space; a correct standalone eo DB uses
+        // the move's permutation. We approximate by tracking eo under the
+        // permutation as well, but project to eo only. This is still admissible
+        // because each move changes eo by exactly the same as in full space.
+        for (let m = 0; m < 8; m++) {
+          const M = MOVE_PYRA[m];
+          const neo = new Int8Array(6);
+          for (let k = 0; k < 6; k++) neo[k] = eo[M.ep[k]] ^ M.eoFlip[k];
+          const nb = eoBits(neo);
+          if (eoPrune[nb] < 0) { eoPrune[nb] = d + 1; next.push(nb); }
+        }
+      }
+      frontier = next; d++;
+    }
+  }
+
+  TABLES = { coPrune, epPrune, eoPrune };
+  return TABLES;
+}
+PYRA.buildPyraTables = buildPyraTables;
+
+/* ----------------------------------------------------------------------------
+ * Full-space BFS (gate 3): count reachable non-tip states + God's number.
+ * --------------------------------------------------------------------------*/
+function bfsFullSpace() {
+  const startKey = stateKey(solvedState());
+  const visited = new Set([startKey]);
+  let frontier = [solvedState()];
+  let dist = 0, maxDist = 0, count = 1;
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) {
+      for (let m = 0; m < 8; m++) {
+        const ns = applyMoveCoordOnly(s, m);
+        const k = stateKey(ns);
+        if (!visited.has(k)) {
+          visited.add(k);
+          next.push(ns);
+          count++;
+        }
+      }
+    }
+    if (next.length) { dist++; maxDist = dist; }
+    frontier = next;
+  }
+  return { count, maxDist };
+}
+// Apply move but only on non-tip coords (returns a light state).
+function applyMoveCoordOnly(s, m) {
+  const M = MOVE_PYRA[m];
+  const co = new Int8Array(4);
+  for (let i = 0; i < 4; i++) co[i] = (s.co[i] + M.co[i]) % 3;
+  const ep = new Int8Array(6);
+  const eo = new Int8Array(6);
+  for (let k = 0; k < 6; k++) {
+    const src = M.ep[k];
+    ep[k] = s.ep[src];
+    eo[k] = s.eo[src] ^ M.eoFlip[k];
+  }
+  return { co, ep, eo, tips: s.tips };
+}
+PYRA.bfsFullSpace = bfsFullSpace;
+PYRA.applyMoveCoordOnly = applyMoveCoordOnly;
+
+/* ----------------------------------------------------------------------------
+ * IDA* solver over the 8 vertex generators.
+ *   heuristic = max(coPrune, epPrune, eoPrune); no-consecutive-same-vertex.
+ * --------------------------------------------------------------------------*/
+function heuristic(s, T) {
+  const h1 = T.coPrune[coIndex(s.co)];
+  const h2 = T.epPrune[permRank(s.ep)];
+  const h3 = T.eoPrune[eoBits(s.eo)];
+  return Math.max(h1, h2, h3);
+}
+function isSolvedNonTip(s) {
+  return coIndex(s.co) === 0 && permRank(s.ep) === 0 && eoBits(s.eo) === 0;
+}
+function solvePyra(state) {
+  const T = buildPyraTables();
+  // normalize to coord-only state
+  const s0 = { co: Int8Array.from(state.co), ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo) };
+  if (isSolvedNonTip(s0)) return [];
+
+  const vertexOf = [0, 0, 1, 1, 2, 2, 3, 3]; // move idx -> vertex
+  let bound = heuristic(s0, T);
+  const path = [];
+
+  function dfs(s, g, bound, lastVertex) {
+    const h = heuristic(s, T);
+    const f = g + h;
+    if (f > bound) return f;
+    if (h === 0 && isSolvedNonTip(s)) return -1; // found
+    let min = Infinity;
+    for (let m = 0; m < 8; m++) {
+      if (vertexOf[m] === lastVertex) continue; // no consecutive same vertex
+      const ns = applyMoveCoordOnly(s, m);
+      path.push(m);
+      const t = dfs(ns, g + 1, bound, vertexOf[m]);
+      if (t === -1) return -1;
+      if (t < min) min = t;
+      path.pop();
+    }
+    return min;
+  }
+
+  while (true) {
+    const t = dfs(s0, 0, bound, -1);
+    if (t === -1) break;
+    if (t === Infinity) return null;
+    bound = t;
+  }
+  return path.map(m => MOVE_TOKENS[m]);
+}
+PYRA.solvePyra = solvePyra;
+
+/* ----------------------------------------------------------------------------
+ * Scramble generation.
+ * --------------------------------------------------------------------------*/
+function randInt(n) { return (Math.random() * n) | 0; }
+
+function randomReachableNonTip() {
+  // random even permutation of 6
+  let ep;
+  do {
+    ep = [0, 1, 2, 3, 4, 5];
+    for (let i = ep.length - 1; i > 0; i--) {
+      const j = randInt(i + 1);
+      [ep[i], ep[j]] = [ep[j], ep[i]];
+    }
+  } while (permParity(ep) !== 0);
+  // random eo with even sum AND coupled to perm parity (both even here).
+  let eo;
+  do {
+    eo = [];
+    for (let i = 0; i < 6; i++) eo.push(randInt(2));
+  } while ((eoSum(eo) & 1) !== 0);
+  // random co (all 81 reachable, sum unconstrained? Pyraminx axial co is free)
+  const co = [randInt(3), randInt(3), randInt(3), randInt(3)];
+  return {
+    co: Int8Array.from(co),
+    ep: Int8Array.from(ep),
+    eo: Int8Array.from(eo),
+    tips: Int8Array.from([0, 0, 0, 0]),
+  };
+}
+
+function scramblePyra() {
+  const T = buildPyraTables();
+  let sol, st;
+  for (let tries = 0; tries < 200; tries++) {
+    st = randomReachableNonTip();
+    sol = solvePyra(st);
+    if (sol && sol.length >= 6) break;
+  }
+  // scramble = inverse of solution applied to solved reaches st.
+  const scrambleTokens = invertSeq(sol);
+  // append random tip moves (<=4)
+  const tipCount = randInt(5); // 0..4
+  const tipBases = ['u', 'l', 'r', 'b'];
+  const usedTips = [];
+  const tipChoices = [...tipBases];
+  for (let i = 0; i < tipCount; i++) {
+    const b = tipChoices.splice(randInt(tipChoices.length), 1)[0];
+    if (b === undefined) break;
+    const tok = Math.random() < 0.5 ? b : b + "'";
+    usedTips.push(tok);
+  }
+  return { tokens: scrambleTokens.concat(usedTips), nonTip: scrambleTokens, tips: usedTips, optLen: sol.length };
+}
+PYRA.scramblePyra = scramblePyra;
+PYRA.randomReachableNonTip = randomReachableNonTip;
+
+/* ----------------------------------------------------------------------------
+ * AUF whole-puzzle rotation (about the U axis, 120°, CW).
+ *
+ * The "last layer" we recognize is the 3 bottom-face edges {3:LR, 4:RB, 5:LB}
+ * (the face opposite vertex U). "AUF" here is the 3-fold re-grip that cyclically
+ * relabels the bottom vertices L->R->R->B->B->L (rotation about the U axis).
+ * This is a re-grip / symmetry, NOT a generator. We derive it geometrically:
+ *
+ *   vertex relabel under +120° about U: U->U, L->R, R->B, B->L  (V_PERM).
+ *   edge slot e maps to AUF_EDGE_MAP[e]; eo may flip per AUF_EO_FLIP (geometry).
+ *
+ * Verified: rotateAUF^3 == identity and rotateAUF(solved) == solved.
+ * --------------------------------------------------------------------------*/
+const AUF_V_PERM = [0, 2, 3, 1]; // U->U, L->R, R->B, B->L (CW about U)
+function deriveAufEdgeMap() {
+  const map = [];
+  for (let e = 0; e < 6; e++) {
+    const [a, b] = EDGE_VERTS[e].map(x => AUF_V_PERM[x]);
+    let dst = -1;
+    for (let i = 0; i < 6; i++) {
+      const [x, y] = EDGE_VERTS[i];
+      if ((x === a && y === b) || (x === b && y === a)) { dst = i; break; }
+    }
+    map.push(dst);
+  }
+  return map;
+}
+const AUF_EDGE_MAP = deriveAufEdgeMap(); // [1,2,0,4,5,3]
+// eo flip per edge under one AUF rotation (geometric: does primary face stay primary?)
+function deriveAufEoFlip() {
+  const out = [];
+  const axis = VERTS[0]; // U axis, +120°
+  for (let e = 0; e < 6; e++) {
+    const dst = AUF_EDGE_MAP[e];
+    const rotated = rodrigues(FACE_NORMALS[edgePrimaryFace(e)], axis, THETA);
+    const lf = matchFace(rotated);
+    const dprim = edgePrimaryFace(dst), dsec = edgeSecondaryFace(dst);
+    out.push(lf === dprim ? 0 : (lf === dsec ? 1 : -1));
+  }
+  return out;
+}
+const AUF_EO_FLIP = deriveAufEoFlip(); // [1,1,0,0,0,0]
+
+// Apply one AUF whole-puzzle rotation (conjugation of the edge permutation/eo).
+function rotateAUF(s) {
+  const nep = new Int8Array(6), neo = new Int8Array(6);
+  for (let k = 0; k < 6; k++) {
+    const dstSlot = AUF_EDGE_MAP[k];
+    nep[dstSlot] = AUF_EDGE_MAP[s.ep[k]];
+    neo[dstSlot] = s.eo[k] ^ AUF_EO_FLIP[k] ^ AUF_EO_FLIP[s.ep[k]];
+  }
+  return { co: Int8Array.from(s.co), ep: nep, eo: neo, tips: Int8Array.from(s.tips) };
+}
+
+/* ----------------------------------------------------------------------------
+ * recognizeL3E: last-3-edges recognizer (LBL final step), 6 cases with 3-fold AUF.
+ *
+ *   Last layer = bottom-face edges {3:LR, 4:RB, 5:LB}. The 3 first-layer edges
+ *   {0:UL, 1:UR, 2:UB} (around vertex U) must already be solved.
+ *
+ *   The 6 cases and their CANONICAL solving algs (verified by self-test; algs
+ *   were found with this module's own solver):
+ *     Skip          : (none)                          sig 345/000
+ *     Sledgehammer  : R' L R L'                        sig 534/110
+ *     Hedgeslammer  : L R' L' R                        sig 453/101
+ *     Cycle_CW      : L R' U R' U' R' L'               sig 534/000 (pure 3-cycle)
+ *     Cycle_CCW     : L R  U R  U' R  L'               sig 453/000 (pure 3-cycle)
+ *     TwoFlip       : L R' L' R B' R B R'              sig 345/011 (two edges flipped)
+ *
+ *   sig = (bottom edge perm as 3 digits)/(bottom eo as 3 digits), digits being
+ *         the slot contents of slots 3,4,5 and their flip.
+ *
+ *   Each non-skip case has 3 AUF-equivalent placements; recognizeL3E finds how
+ *   many AUF rotations bring the state to the case's canonical sig and returns
+ *   tokens = [AUF re-grip is a re-grip, so we instead express the solution as
+ *   the alg applied after k AUF rotations]. Because AUF is a whole-puzzle
+ *   re-grip (no generator), the returned `tokens` are just the case alg; the
+ *   caller applies them after performing `auf` re-grips. For convenience we also
+ *   return `auf` (0..2) and `solveFromHere(state)` semantics are verified in the
+ *   self-test: applying `alg` to rotateAUF^auf(state) yields solved.
+ * --------------------------------------------------------------------------*/
+const L3E_CASES = {
+  Skip:         { sig: '345/000', alg: [] },
+  Sledgehammer: { sig: '534/110', alg: ["R'", "L", "R", "L'"] },
+  Hedgeslammer: { sig: '453/101', alg: ["L", "R'", "L'", "R"] },
+  Cycle_CW:     { sig: '534/000', alg: ["L", "R'", "U", "R'", "U'", "R'", "L'"] },
+  Cycle_CCW:    { sig: '453/000', alg: ["L", "R", "U", "R", "U'", "R", "L'"] },
+  TwoFlip:      { sig: '345/011', alg: ["L", "R'", "L'", "R", "B'", "R", "B", "R'"] },
+};
+// Back-compat alias name expected by some callers.
+const L3E_ALGS = Object.fromEntries(
+  Object.entries(L3E_CASES).map(([k, v]) => [k, v.alg])
+);
+
+function bottomSig(s) {
+  return Array.from(s.ep.slice(3)).join('') + '/' + Array.from(s.eo.slice(3)).join('');
+}
+
+// The first layer (top edges around vertex U) must be solved for an L3E case.
+function topLayerSolved(s) {
+  for (const e of [0, 1, 2]) if (s.ep[e] !== e || s.eo[e] !== 0) return false;
+  return true;
+}
+
+function recognizeL3E(state) {
+  // Precondition: the first layer (top edges {0,1,2}) must be solved.
+  if (!topLayerSolved(state)) {
+    return { name: 'Unknown', auf: 0, tokens: [], rotated: state };
+  }
+  // Build a canonical-sig -> name lookup.
+  const sigToName = {};
+  for (const [name, c] of Object.entries(L3E_CASES)) sigToName[c.sig] = name;
+  // Rotate up to 3 times to land on a canonical sig (AUF re-grip about U).
+  let s = { co: Int8Array.from(state.co), ep: Int8Array.from(state.ep),
+            eo: Int8Array.from(state.eo), tips: Int8Array.from(state.tips) };
+  for (let auf = 0; auf < 3; auf++) {
+    const sig = bottomSig(s);
+    if (sigToName[sig]) {
+      const name = sigToName[sig];
+      return { name, auf, tokens: L3E_CASES[name].alg.slice(), rotated: s };
+    }
+    s = rotateAUF(s);
+  }
+  // Top layer solved but bottom config isn't a known case (shouldn't happen
+  // for reachable states with solved top layer + zero co).
+  return { name: 'Unknown', auf: 0, tokens: [], rotated: state };
+}
+
+PYRA.rotateAUF = rotateAUF;
+PYRA.bottomSig = bottomSig;
+PYRA.recognizeL3E = recognizeL3E;
+PYRA.L3E_CASES = L3E_CASES;
+PYRA.L3E_ALGS = L3E_ALGS;
+
+/* ============================================================================
+ * SELF_TEST_PYRA() — runs correctness gates 1..6.
+ *   Returns { ok, fails:[...], log:[...] }. Mirrors a {ok, fails} style.
+ * ==========================================================================*/
+function SELF_TEST_PYRA(opts) {
+  opts = opts || {};
+  const log = [];
+  const fails = [];
+  const note = (s) => { log.push(s); if (opts.verbose) console.log(s); };
+  function gate(name, cond, detail) {
+    if (cond) note('PASS  ' + name + (detail ? '  — ' + detail : ''));
+    else { fails.push(name); note('FAIL  ' + name + (detail ? '  — ' + detail : '')); }
+  }
+
+  const SOLVED = solvedState();
+
+  // ---- Gate 1: order-3 and inverse for U,L,R,B ----
+  {
+    let order3 = true, invOk = true;
+    for (let v = 0; v < 4; v++) {
+      const tok = MOVE_TOKENS[v * 2];
+      let s = SOLVED;
+      for (let i = 0; i < 3; i++) s = applyMovePyra(s, tok);
+      if (!statesEqual(s, SOLVED)) order3 = false;
+      let s2 = applyMovePyra(SOLVED, tok);
+      s2 = applyMovePyra(s2, invertToken(tok));
+      if (!statesEqual(s2, SOLVED)) invOk = false;
+    }
+    gate('Gate1: U/L/R/B are order-3 and move*move\' = identity', order3 && invOk);
+  }
+
+  // ---- Gate 2: every generator preserves even perm parity & even eo sum ----
+  {
+    let ok = true;
+    // from solved
+    for (let m = 0; m < 8; m++) {
+      const s = applyMovePyra(SOLVED, m);
+      if (permParity(s.ep) !== 0 || (eoSum(s.eo) & 1) !== 0) ok = false;
+    }
+    // from random reachable states: invariants must be MAINTAINED (parity even).
+    for (let t = 0; t < 200; t++) {
+      const base = randomReachableNonTip();
+      // base is even/even by construction
+      if (permParity(base.ep) !== 0 || (eoSum(base.eo) & 1) !== 0) ok = false;
+      for (let m = 0; m < 8; m++) {
+        const s = applyMovePyra(base, m);
+        if (permParity(s.ep) !== permParity(base.ep)) ok = false; // generator preserves parity (here stays even)
+        if (((eoSum(s.eo) ^ eoSum(base.eo)) & 1) !== 0) ok = false; // eo-sum parity preserved
+      }
+    }
+    gate('Gate2: generators preserve even edge-perm parity and even eo sum', ok);
+  }
+
+  // ---- Gate 3: full-space BFS = exactly 933120 states, God's number 11 ----
+  {
+    const r = bfsFullSpace();
+    gate('Gate3: BFS reachable non-tip state count == 933120',
+         r.count === 933120, 'count=' + r.count);
+    gate('Gate3: BFS max distance (God\'s number) == 11',
+         r.maxDist === 11, 'maxDist=' + r.maxDist);
+    note('       BFS: ' + r.count + ' states, maxDist ' + r.maxDist);
+  }
+
+  // ---- Gate 4: IDA* solver correctness + optimality sample ----
+  {
+    buildPyraTables();
+    let solveOk = true, lenOk = true, maxLen = 0;
+    for (let i = 0; i < 200; i++) {
+      const st = randomReachableNonTip();
+      const sol = solvePyra(st);
+      if (!sol) { solveOk = false; continue; }
+      const res = applySeq(st, sol);
+      if (!(coIndex(res.co) === 0 && permRank(res.ep) === 0 && eoBits(res.eo) === 0)) solveOk = false;
+      if (sol.length > 11) lenOk = false;
+      if (sol.length > maxLen) maxLen = sol.length;
+    }
+    gate('Gate4: solver returns valid solutions, length <= 11', solveOk && lenOk,
+         'maxLen=' + maxLen);
+
+    // optimality: compare to BFS god-distance for a sample
+    const distOf = makeDistFn();
+    let optOk = true;
+    for (let i = 0; i < 30; i++) {
+      const st = randomReachableNonTip();
+      const sol = solvePyra(st);
+      const d = distOf(st);
+      if (sol.length !== d) optOk = false;
+    }
+    gate('Gate4: solver length equals BFS god-distance (optimal) on sample', optOk);
+  }
+
+  // ---- Gate 5: scramble generation ----
+  {
+    let ok = true, lenRangeOk = true, tipOk = true;
+    for (let i = 0; i < 50; i++) {
+      const sc = scramblePyra();
+      // apply scramble to solved, then solve
+      const scrambled = applySeq(SOLVED, sc.tokens);
+      const sol = solvePyra(scrambled);
+      const back = applySeq(scrambled, sol);
+      // solved means non-tip solved (solver ignores tips); also check tips can be fixed
+      if (!(coIndex(back.co) === 0 && permRank(back.ep) === 0 && eoBits(back.eo) === 0)) ok = false;
+      if (sc.optLen < 6 || sc.optLen > 11) lenRangeOk = false;
+      if (sc.tips.length > 4) tipOk = false;
+    }
+    gate('Gate5: scramble tokens applied then solved -> non-tip solved', ok);
+    gate('Gate5: non-tip optimal length lands in 6..11', lenRangeOk);
+    gate('Gate5: tip tokens <= 4', tipOk);
+  }
+
+  // ---- Gate 6: recognizeL3E for all 6 cases x 3 AUF placements ----
+  {
+    let recogOk = true, solveOk = true;
+    const expectedNames = Object.keys(L3E_CASES);
+    // For each case, build its 3 AUF placements by applying the case alg inverse
+    // to solved, then applying AUF rotations; recognizeL3E must return the name,
+    // and applying tokens after `auf` rotations must solve it.
+    for (const name of expectedNames) {
+      const alg = L3E_CASES[name].alg;
+      let base = applySeq(SOLVED, invertSeq(alg)); // a state in this case (auf 0)
+      for (let pre = 0; pre < 3; pre++) {
+        // build a state that is `base` rotated by `pre` AUFs
+        let st = base;
+        for (let k = 0; k < pre; k++) st = rotateAUF(st);
+        const rec = recognizeL3E(st);
+        if (rec.name !== name) { recogOk = false; }
+        // apply the recommended auf rotations then the alg -> must solve
+        let s2 = st;
+        for (let k = 0; k < rec.auf; k++) s2 = rotateAUF(s2);
+        const solved = applySeq(s2, rec.tokens);
+        if (!statesEqual(solved, SOLVED)) solveOk = false;
+      }
+    }
+    gate('Gate6: recognizeL3E returns correct case for all 6 cases x 3 AUF', recogOk);
+    gate('Gate6: applying recognized alg (after AUF) solves each L3E case', solveOk);
+  }
+
+  const ok = fails.length === 0;
+  note(ok ? '\nALL GATES PASS' : '\nFAILURES: ' + fails.join(', '));
+  return { ok, fails, log };
+}
+
+// Helper for gate 4 optimality: BFS distance from solved to a target (cached map).
+let _distMap = null;
+function makeDistFn() {
+  if (!_distMap) {
+    _distMap = new Map();
+    const startKey = stateKey(solvedState());
+    _distMap.set(startKey, 0);
+    let frontier = [solvedState()];
+    let d = 0;
+    while (frontier.length) {
+      const next = [];
+      for (const s of frontier) {
+        for (let m = 0; m < 8; m++) {
+          const ns = applyMoveCoordOnly(s, m);
+          const k = stateKey(ns);
+          if (!_distMap.has(k)) { _distMap.set(k, d + 1); next.push(ns); }
+        }
+      }
+      frontier = next; d++;
+    }
+  }
+  return (st) => _distMap.get(stateKey(st));
+}
+PYRA.SELF_TEST_PYRA = SELF_TEST_PYRA;
+
+/* ----------------------------------------------------------------------------
+ * Export the whole thing for node self-test.
+ * --------------------------------------------------------------------------*/
+
+return PYRA;
+})();
+
+/* ===== Pyraminx geometry + engine bindings (makePyraGeo factory; node-verified:
+   500/500 sequences readState==PYRA, zero drift). Self-contained. ===== */
+/* ============================================================================
+ * pyra-geo.js — Pyraminx 3D geometry + move-engine bindings.
+ *
+ *   Factory: makePyraGeo(THREE, PYRA, scale)  ->  geometry/binding object.
+ *
+ *   Pure factory: takes THREE (for Vector3/Quaternion math), the PYRA logical
+ *   core, and a scale. Returns renderer-agnostic piece descriptors plus the
+ *   binding functions (selectPieces, buildMove, snapPiece, readState) that keep
+ *   the visual tetrahedron PERFECTLY consistent with PYRA's state model.
+ *
+ *   Stays compatible with the shared animation engine, which per step does:
+ *     q.setFromAxisAngle(move.axis, step);
+ *     for (piece of move.cubies){ piece.position.applyQuaternion(q);
+ *                                 piece.quaternion.premultiply(q); }
+ *   and on settle calls snapPiece(piece) for each piece, then readState(...).
+ *
+ *   Pieces are THREE.Object3D-like: have .position (Vector3) and .quaternion
+ *   (Quaternion). Descriptors below are plain data; a renderer turns each
+ *   facelet `tri` into a colored mesh and parents it under a per-piece group
+ *   whose .position/.quaternion ARE the ones the engine rotates.
+ * ==========================================================================*/
+
+function makePyraGeo(THREE, PYRA, scale) {
+  scale = scale || 1;
+
+  // ----- pull model facts from PYRA -----
+  const VERTS = PYRA.VERTS;          // [U,L,R,B] unit vectors
+  const VNAME = PYRA.VNAME;          // ['U','L','R','B']
+  const FACE_NORMALS = PYRA.FACE_NORMALS;
+  const FACE_COLORS = PYRA.FACE_COLORS;
+  const EDGE_VERTS = PYRA.EDGE_VERTS;
+  const facesOfEdge = PYRA.facesOfEdge;
+  const edgesIncidentToVertex = PYRA.edgesIncidentToVertex;
+
+  const VNAME_TO_IDX = {}; VNAME.forEach((n, i) => { VNAME_TO_IDX[n] = i; });
+
+  // ----- THREE vector helpers (plain arrays <-> Vector3) -----
+  const V3 = (a) => new THREE.Vector3(a[0], a[1], a[2]);
+  const arr = (v) => [v.x, v.y, v.z];
+
+  // Scaled vertex positions.
+  const VERTS_S = VERTS.map((v) => [v[0] * scale, v[1] * scale, v[2] * scale]);
+
+  // Color hex map (named colors -> 0xRRGGBB). Matches FACE_COLORS order/names.
+  const COLOR_HEX = {
+    GREEN: 0x00a000,
+    BLUE: 0x0040d0,
+    RED: 0xd00000,
+    YELLOW: 0xf0d000,
+  };
+  const faceColorHex = (f) => {
+    const name = FACE_COLORS[f];
+    return (name in COLOR_HEX) ? COLOR_HEX[name] : 0x808080;
+  };
+
+  // --------------------------------------------------------------------------
+  // GEOMETRY: subdivide each of the 4 triangular faces into 9 small triangles
+  // and map them onto the 14 pieces.
+  //
+  //   Face f is opposite vertex f; its 3 corners are the other 3 vertices.
+  //   Barycentric grid over corners (A,B,C) with each side split in 3 gives a
+  //   triangular grid (i+j+k=3): 6 "up" triangles + 3 "down" triangles.
+  //     - 3 corner up-tris   -> the 3 TIPS at those corners
+  //     - 3 side-middle ups  -> the 3 EDGES of those sides
+  //     - 3 inner down-tris  -> the 3 AXIALS (one adjacent to each corner)
+  // --------------------------------------------------------------------------
+
+  // Centroid of a triangle [[x,y,z]*3].
+  function centroid3(t) {
+    return [
+      (t[0][0] + t[1][0] + t[2][0]) / 3,
+      (t[0][1] + t[1][1] + t[2][1]) / 3,
+      (t[0][2] + t[1][2] + t[2][2]) / 3,
+    ];
+  }
+
+  // For one face f, build the 9 small triangles tagged with their role.
+  // Returns array of { tri:[3 corners scaled-world], faceIndex:f, role, vertex|edge }.
+  function subdivideFace(f) {
+    const cornerVerts = [0, 1, 2, 3].filter((v) => v !== f); // [A,B,C] vertex indices
+    const A = VERTS_S[cornerVerts[0]];
+    const B = VERTS_S[cornerVerts[1]];
+    const C = VERTS_S[cornerVerts[2]];
+    // Barycentric grid point: i weight on A, j on B, (3-i-j) on C.
+    const P = (i, j) => {
+      const k = 3 - i - j;
+      return [
+        (A[0] * i + B[0] * j + C[0] * k) / 3,
+        (A[1] * i + B[1] * j + C[1] * k) / 3,
+        (A[2] * i + B[2] * j + C[2] * k) / 3,
+      ];
+    };
+    const out = [];
+
+    // Up triangles: cell (i,j) with i+j<=2 -> nodes (i,j),(i+1,j),(i,j+1).
+    for (let i = 0; i <= 2; i++) {
+      for (let j = 0; i + j <= 2; j++) {
+        const tri = [P(i, j), P(i + 1, j), P(i, j + 1)];
+        // Corner up-tri: one barycentric weight is 2 (touches a single corner
+        // vertex). Cells (2,0)->A, (0,2)->B, (0,0)->C. Side-middle otherwise.
+        let role, vertex, edge;
+        if ((i === 2 && j === 0) || (i === 0 && j === 2) || (i === 0 && j === 0)) {
+          role = 'tip';
+          // which corner vertex: the one with weight 2.
+          if (i === 2) vertex = cornerVerts[0];
+          else if (j === 2) vertex = cornerVerts[1];
+          else vertex = cornerVerts[2];
+        } else {
+          role = 'edge';
+          // side-middle up-tri straddles two corner verts (the two with the
+          // larger barycentric weights). Determine the two corners it touches.
+          // Cell (1,0): weights A=1,B=0?,... compute centroid weights instead.
+          // Easiest: the edge is between the two corner vertices whose weight>0
+          // at the centroid is largest pair. We derive from cell index:
+          //   (1,0): between A and C ; (0,1): between B and C ; (1,1): between A and B
+          let va, vb;
+          if (i === 1 && j === 0) { va = cornerVerts[0]; vb = cornerVerts[2]; }
+          else if (i === 0 && j === 1) { va = cornerVerts[1]; vb = cornerVerts[2]; }
+          else { va = cornerVerts[0]; vb = cornerVerts[1]; } // (1,1)
+          edge = edgeIndexOf(va, vb);
+        }
+        out.push({ tri, faceIndex: f, role, vertex, edge });
+      }
+    }
+
+    // Down triangles: cell (i,j) with i+j<=1 -> nodes (i+1,j),(i,j+1),(i+1,j+1).
+    // Each down-tri is adjacent to exactly one corner -> the AXIAL at that
+    // corner. (1,0)->A, (0,1)->B, (0,0)->C.
+    for (let i = 0; i <= 1; i++) {
+      for (let j = 0; i + j <= 1; j++) {
+        const tri = [P(i + 1, j), P(i, j + 1), P(i + 1, j + 1)];
+        let vertex;
+        if (i === 1 && j === 0) vertex = cornerVerts[0];
+        else if (i === 0 && j === 1) vertex = cornerVerts[1];
+        else vertex = cornerVerts[2]; // (0,0)
+        out.push({ tri, faceIndex: f, role: 'axial', vertex });
+      }
+    }
+
+    return out;
+  }
+
+  // Edge index for an unordered vertex pair.
+  function edgeIndexOf(a, b) {
+    for (let e = 0; e < 6; e++) {
+      const [x, y] = EDGE_VERTS[e];
+      if ((x === a && y === b) || (x === b && y === a)) return e;
+    }
+    return -1;
+  }
+
+  // --------------------------------------------------------------------------
+  // Home positions (scaled). Tips/axials sit at their fixed vertex direction
+  // (we use PYRA.PIECES[i].pos * scale so `center` is a point fixed to the
+  // piece). Edges sit at the midpoint of their two vertices.
+  // --------------------------------------------------------------------------
+  const TIP_HOME = VERTS.map((v) => [v[0] * scale, v[1] * scale, v[2] * scale]);
+  const AXIAL_HOME = TIP_HOME; // same direction; magnitude irrelevant for state
+  const EDGE_HOME = EDGE_VERTS.map(([a, b]) => [
+    ((VERTS[a][0] + VERTS[b][0]) / 2) * scale,
+    ((VERTS[a][1] + VERTS[b][1]) / 2) * scale,
+    ((VERTS[a][2] + VERTS[b][2]) / 2) * scale,
+  ]);
+
+  // Use PYRA.PIECES positions (scaled) as the rotated `center`, so that tip and
+  // axial centers differ (0.95 vs 0.55) and never collide. They lie on the
+  // vertex axis, so dot-with-axis layer selection still works.
+  function pyraPieceCenter(p) {
+    return [p.pos[0] * scale, p.pos[1] * scale, p.pos[2] * scale];
+  }
+
+  // --------------------------------------------------------------------------
+  // Build the 14 piece descriptors, in fixed order matching PYRA.PIECES:
+  //   tips U,L,R,B ; axials U,L,R,B ; edges 0..5.
+  // --------------------------------------------------------------------------
+  function buildPieceDescriptors() {
+    // Gather all 36 facelets grouped by piece key.
+    const allFacelets = [];
+    for (let f = 0; f < 4; f++) {
+      for (const ft of subdivideFace(f)) allFacelets.push(ft);
+    }
+
+    // Index facelets by piece key.
+    const byKey = {};
+    const keyOf = (ft) =>
+      ft.role === 'edge' ? ('edge:' + ft.edge) : (ft.role + ':' + ft.vertex);
+    for (const ft of allFacelets) {
+      const k = keyOf(ft);
+      (byKey[k] || (byKey[k] = [])).push(ft);
+    }
+
+    const pieces = [];
+
+    function pushFacelets(descFacelets, fts) {
+      for (const ft of fts) {
+        descFacelets.push({
+          tri: ft.tri.map((c) => [c[0], c[1], c[2]]),
+          faceIndex: ft.faceIndex,
+          colorHex: faceColorHex(ft.faceIndex),
+        });
+      }
+    }
+
+    // Tips.
+    for (let v = 0; v < 4; v++) {
+      const fts = byKey['tip:' + v];
+      const desc = {
+        id: 'tip-' + VNAME[v],
+        kind: 'tip',
+        vertex: v,
+        homeSlotKey: 'tip:' + v,
+        center: pyraPieceCenter(PYRA.PIECES[v]),
+        facelets: [],
+      };
+      pushFacelets(desc.facelets, fts);
+      pieces.push(desc);
+    }
+    // Axials.
+    for (let v = 0; v < 4; v++) {
+      const fts = byKey['axial:' + v];
+      const desc = {
+        id: 'axial-' + VNAME[v],
+        kind: 'axial',
+        vertex: v,
+        homeSlotKey: 'axial:' + v,
+        center: pyraPieceCenter(PYRA.PIECES[4 + v]),
+        facelets: [],
+      };
+      pushFacelets(desc.facelets, fts);
+      pieces.push(desc);
+    }
+    // Edges.
+    for (let e = 0; e < 6; e++) {
+      const fts = byKey['edge:' + e];
+      const desc = {
+        id: 'edge-' + e,
+        kind: 'edge',
+        edge: e,
+        homeSlotKey: 'edge:' + e,
+        center: pyraPieceCenter(PYRA.PIECES[8 + e]),
+        facelets: [],
+      };
+      pushFacelets(desc.facelets, fts);
+      pieces.push(desc);
+    }
+
+    return pieces;
+  }
+
+  const pieces = buildPieceDescriptors();
+
+  // --------------------------------------------------------------------------
+  // Per-facelet reference data needed by readState: each facelet carries a
+  // local (home) outward normal direction and its centroid direction, so after
+  // the piece is rotated we can read which face it now lies on.
+  //
+  // We attach to each runtime piece a small `_geo` record (the descriptor's
+  // home facelets in array form) the first time we see it. But to keep the
+  // engine's pieces plain, we instead recompute from the descriptor `pieces`
+  // by matching ids. The test builds runtime pieces that carry `.id`, so we
+  // map id -> descriptor.
+  // --------------------------------------------------------------------------
+  const descById = {};
+  for (const d of pieces) descById[d.id] = d;
+
+  // Precompute, per descriptor, the home facelet centroid directions (unit) and
+  // their faceIndex. These rotate rigidly with the piece's quaternion.
+  function homeFaceletDirs(desc) {
+    return desc.facelets.map((fl) => {
+      const c = centroid3(fl.tri); // scaled world centroid at home
+      const v = V3(c);
+      const len = v.length() || 1;
+      v.multiplyScalar(1 / len);
+      return { dir: v, faceIndex: fl.faceIndex };
+    });
+  }
+  const homeDirsById = {};
+  for (const d of pieces) homeDirsById[d.id] = homeFaceletDirs(d);
+
+  // Home center vectors (unit direction) per descriptor, for position snapping
+  // / nearest-slot reading.
+  const homeCenterDirById = {};
+  for (const d of pieces) {
+    const v = V3(d.center);
+    const len = v.length() || 1;
+    homeCenterDirById[d.id] = v.clone().multiplyScalar(1 / len);
+  }
+
+  // ----- Face-normal Vector3 cache -----
+  const FACE_N = FACE_NORMALS.map((n) => V3(n)); // unit
+  const VERT_V = VERTS.map((v) => V3(v));         // unit
+
+  // --------------------------------------------------------------------------
+  // selectPieces(move, pieces): subset to rotate.
+  //   Vertex turn: tip + axial at vertex + its 3 incident edges (5 pieces),
+  //   derived by MEASURING dot(piece.center, VERTS[axisName]) and finding the
+  //   threshold that cleanly separates the 5 from the other 9.
+  //   Tip turn: just that vertex's tip.
+  // --------------------------------------------------------------------------
+  function selectPieces(move, runtimePieces) {
+    const v = move.axisName ? VNAME_TO_IDX[move.axisName] : -1;
+    if (move.tipOnly) {
+      // just the tip at this vertex
+      return runtimePieces.filter(
+        (p) => (p.kind === 'tip') && p.vertex === v
+      );
+    }
+    // Vertex turn: measure projections of every piece center on VERTS[v].
+    const axis = VERT_V[v];
+    const projOf = (p) => {
+      // piece.position is the (possibly rotated) center the engine moves.
+      const c = p.position;
+      return c.x * axis.x + c.y * axis.y + c.z * axis.z;
+    };
+    const projs = runtimePieces.map((p) => ({ p, proj: projOf(p) }));
+    // Sort descending; the 5 layer pieces (tip+axial+3 edges at v) have the
+    // largest projections. Find the gap between rank 5 and rank 6.
+    const sorted = projs.slice().sort((a, b) => b.proj - a.proj);
+    const hi = sorted[4].proj;   // 5th largest (smallest of the in-layer set)
+    const lo = sorted[5].proj;   // 6th largest (largest of the out set)
+    const threshold = (hi + lo) / 2;
+    // Sanity: the gap must be clean (positive, well separated).
+    // (Assertion is performed in the test; here we just use the midpoint.)
+    return projs.filter((x) => x.proj > threshold).map((x) => x.p);
+  }
+
+  // Expose the measured threshold for a vertex (used by the test's assertion).
+  function measureLayerThreshold(v, runtimePieces) {
+    const axis = VERT_V[v];
+    const projs = runtimePieces.map((p) => {
+      const c = p.position;
+      return c.x * axis.x + c.y * axis.y + c.z * axis.z;
+    });
+    const sorted = projs.slice().sort((a, b) => b - a);
+    const hi = sorted[4], lo = sorted[5];
+    return { hi, lo, gap: hi - lo, threshold: (hi + lo) / 2, count: projs.filter((x) => x > (hi + lo) / 2).length };
+  }
+
+  // --------------------------------------------------------------------------
+  // buildMove(face, prime, double): face in {U,L,R,B,u,l,r,b}.
+  //   The unprimed turn sign (TURN_SIGN below) is chosen so the VISUAL rotation
+  //   produces the same permutation as PYRA.applyMovePyra. It is verified (and
+  //   would be flipped) by the consistency gate.
+  // --------------------------------------------------------------------------
+  // Settled sign: +1 means unprimed turn = +120 deg about VERTS[vertex].
+  const TURN_SIGN = +1;
+  const TWO_PI_3 = (2 * Math.PI) / 3;
+
+  function buildMove(face, prime, double) {
+    const tipOnly = (face === face.toLowerCase()) && /[ulrb]/.test(face);
+    const letter = face.toUpperCase();
+    const vertex = VNAME_TO_IDX[letter];
+    const axis = new THREE.Vector3(VERTS[vertex][0], VERTS[vertex][1], VERTS[vertex][2]).normalize();
+    let mag = TWO_PI_3 * TURN_SIGN;
+    if (prime) mag = -mag;
+    const notation = tipOnly
+      ? (letter.toLowerCase() + (prime ? "'" : ''))
+      : (letter + (prime ? "'" : ''));
+    return {
+      axis,
+      axisName: letter,
+      tipOnly,
+      sign: undefined,
+      target: mag,
+      done: 0,
+      notation,
+      vertex,
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Tetrahedral rotation group T (order 12) as quaternions, for snapping.
+  //   identity ; +-120 about each of the 4 VERTS ; 180 about x,y,z.
+  // --------------------------------------------------------------------------
+  function buildTetraQuats() {
+    const qs = [];
+    qs.push(new THREE.Quaternion()); // identity
+    for (let v = 0; v < 4; v++) {
+      const ax = VERT_V[v];
+      const qp = new THREE.Quaternion().setFromAxisAngle(ax, TWO_PI_3);
+      const qm = new THREE.Quaternion().setFromAxisAngle(ax, -TWO_PI_3);
+      qs.push(qp, qm);
+    }
+    const ex = new THREE.Vector3(1, 0, 0);
+    const ey = new THREE.Vector3(0, 1, 0);
+    const ez = new THREE.Vector3(0, 0, 1);
+    qs.push(new THREE.Quaternion().setFromAxisAngle(ex, Math.PI));
+    qs.push(new THREE.Quaternion().setFromAxisAngle(ey, Math.PI));
+    qs.push(new THREE.Quaternion().setFromAxisAngle(ez, Math.PI));
+    return qs; // length 12
+  }
+  const TETRA_QUATS = buildTetraQuats();
+
+  // --------------------------------------------------------------------------
+  // snapPiece(piece): kill float drift.
+  //   - position -> nearest valid home position (tips/axials to their fixed
+  //     vertex direction at the piece's home magnitude; edges to nearest of 6
+  //     edge midpoints).
+  //   - quaternion -> nearest of the 12 tetrahedral quaternions (argmax |dot|),
+  //     copying the EXACT precomputed quaternion (no residual drift).
+  // --------------------------------------------------------------------------
+  function snapQuaternion(q) {
+    let best = 0, bestAbs = -1;
+    for (let i = 0; i < TETRA_QUATS.length; i++) {
+      const t = TETRA_QUATS[i];
+      const d = Math.abs(q.x * t.x + q.y * t.y + q.z * t.z + q.w * t.w);
+      if (d > bestAbs) { bestAbs = d; best = i; }
+    }
+    return TETRA_QUATS[best];
+  }
+
+  function snapPiece(piece) {
+    const id = piece.id;
+    const desc = descById[id];
+
+    // --- position ---
+    if (desc.kind === 'edge') {
+      // nearest of 6 edge midpoints
+      let best = 0, bestD = Infinity;
+      for (let e = 0; e < 6; e++) {
+        const h = EDGE_HOME[e];
+        const dx = piece.position.x - h[0];
+        const dy = piece.position.y - h[1];
+        const dz = piece.position.z - h[2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bestD) { bestD = d; best = e; }
+      }
+      const h = EDGE_HOME[best];
+      piece.position.set(h[0], h[1], h[2]);
+    } else {
+      // tip/axial: fixed vertex direction at this piece's home magnitude.
+      // The center always stays on its vertex axis (it only rotates about that
+      // axis), so snap to the home center exactly.
+      const c = desc.center;
+      piece.position.set(c[0], c[1], c[2]);
+    }
+
+    // --- quaternion ---
+    const snapped = snapQuaternion(piece.quaternion);
+    piece.quaternion.set(snapped.x, snapped.y, snapped.z, snapped.w);
+  }
+
+  // --------------------------------------------------------------------------
+  // readState(pieces): reconstruct PYRA state {co,ep,eo,tips}.
+  //
+  //   tips/axials: twist 0..2 = how many +120 steps the piece's reference
+  //     facelet has advanced about its vertex axis. We read it by rotating the
+  //     home facelet dirs by the piece's quaternion and matching the resulting
+  //     face the PRIMARY (smallest-faceIndex) home facelet now lies on, then
+  //     mapping to the cyclic twist defined by MOVE_PYRA (which equals the
+  //     number of +120 turns applied).
+  //
+  //   edges: which slot the center is nearest (-> ep) and flip (-> eo) by
+  //     whether the primary home facelet's rotated normal landed on the slot's
+  //     primary or secondary face.
+  // --------------------------------------------------------------------------
+
+  // For tip/axial twist: define the cyclic face order under +120 about vertex v.
+  // The 3 faces touching v are facesTouchingVertex(v). A +120 rotation about
+  // VERTS[v] advances them cyclically. We precompute, per vertex, the ordered
+  // face cycle [f0 -> f1 -> f2 -> f0] such that rotating FACE_N[f0] by +120
+  // lands on FACE_N[f1].
+  function facesTouchingVertex(v) {
+    const out = [];
+    for (let f = 0; f < 4; f++) if (f !== v) out.push(f);
+    return out;
+  }
+  function nearestFace(dirVec) {
+    let best = -1, bestDot = -Infinity;
+    for (let f = 0; f < 4; f++) {
+      const d = dirVec.x * FACE_N[f].x + dirVec.y * FACE_N[f].y + dirVec.z * FACE_N[f].z;
+      if (d > bestDot) { bestDot = d; best = f; }
+    }
+    return best;
+  }
+  // Cyclic order of faces under +120 about each vertex.
+  const VERT_FACE_CYCLE = [];
+  for (let v = 0; v < 4; v++) {
+    const fs = facesTouchingVertex(v);
+    const f0 = fs[0];
+    const qp = new THREE.Quaternion().setFromAxisAngle(VERT_V[v], TWO_PI_3);
+    // f0 -> ? after +120
+    const n = FACE_N[f0].clone().applyQuaternion(qp);
+    const f1 = nearestFace(n);
+    const n2 = n.clone().applyQuaternion(qp);
+    const f2 = nearestFace(n2);
+    VERT_FACE_CYCLE[v] = [f0, f1, f2]; // index in cycle = twist step
+  }
+
+  // The twist coordinate convention: MOVE_PYRA gives co[v]=1 for a +move
+  // (TURN_SIGN=+1 unprimed). A single +120 turn advances the piece's reference
+  // facelet by one cycle step, i.e. twist increments by 1. We define the
+  // reference facelet of a tip/axial as its PRIMARY (smallest faceIndex) home
+  // facelet. At home (twist 0) it sits on its home face f0' (the smallest
+  // faceIndex among the piece's 3 faces). After k +120 turns it sits on the
+  // face at cycle position (pos0 + k) mod 3. So twist = (cyclePos(currentFace)
+  // - cyclePos(homeFace)) mod 3.
+  function vertexHomeRefFace(v) {
+    // smallest faceIndex among the 3 faces touching v
+    return Math.min.apply(null, facesTouchingVertex(v));
+  }
+  function cyclePos(v, f) {
+    return VERT_FACE_CYCLE[v].indexOf(f);
+  }
+
+  function readTwist(piece, v) {
+    // rotate the home reference facelet dir by piece.quaternion, find face.
+    const homeDirs = homeDirsById[piece.id];
+    const refHomeFace = vertexHomeRefFace(v);
+    // find the home facelet whose faceIndex === refHomeFace
+    let refDir = null;
+    for (const hd of homeDirs) if (hd.faceIndex === refHomeFace) { refDir = hd.dir; break; }
+    const cur = refDir.clone().applyQuaternion(piece.quaternion);
+    const curFace = nearestFace(cur);
+    const twist = ((cyclePos(v, curFace) - cyclePos(v, refHomeFace)) % 3 + 3) % 3;
+    return twist;
+  }
+
+  function readState(runtimePieces) {
+    const co = new Int8Array(4);
+    const ep = new Int8Array(6);
+    const eo = new Int8Array(6);
+    const tips = new Int8Array(4);
+
+    for (const piece of runtimePieces) {
+      const desc = descById[piece.id];
+      if (desc.kind === 'tip') {
+        tips[desc.vertex] = readTwist(piece, desc.vertex);
+      } else if (desc.kind === 'axial') {
+        co[desc.vertex] = readTwist(piece, desc.vertex);
+      } else {
+        // edge: which slot is the center nearest -> the slot this piece occupies
+        let slot = 0, bestD = Infinity;
+        for (let e = 0; e < 6; e++) {
+          const h = EDGE_HOME[e];
+          const dx = piece.position.x - h[0];
+          const dy = piece.position.y - h[1];
+          const dz = piece.position.z - h[2];
+          const d = dx * dx + dy * dy + dz * dz;
+          if (d < bestD) { bestD = d; slot = e; }
+        }
+        // ep[slot] = which edge piece occupies it. The piece's identity is its
+        // descriptor edge index (its solved/home edge). So ep[slot] = desc.edge.
+        ep[slot] = desc.edge;
+
+        // flip: rotate the piece's PRIMARY home facelet normal (the smaller
+        // faceIndex home face) and see if it landed on slot's primary or
+        // secondary face.
+        const slotPrim = facesOfEdge(slot)[0];
+        const slotSec = facesOfEdge(slot)[1];
+        // primary home facelet = smaller faceIndex among this piece's 2 faces.
+        const homeDirs = homeDirsById[piece.id];
+        const homePrimFace = Math.min(homeDirs[0].faceIndex, homeDirs[1].faceIndex);
+        let primDir = null;
+        for (const hd of homeDirs) if (hd.faceIndex === homePrimFace) { primDir = hd.dir; break; }
+        const cur = primDir.clone().applyQuaternion(piece.quaternion);
+        const landedFace = nearestFace(cur);
+        let flip;
+        if (landedFace === slotPrim) flip = 0;
+        else if (landedFace === slotSec) flip = 1;
+        else flip = 0; // shouldn't happen for valid arrangements
+        eo[slot] = flip;
+      }
+    }
+
+    return { co, ep, eo, tips };
+  }
+
+  // --------------------------------------------------------------------------
+  // Factory return.
+  // --------------------------------------------------------------------------
+  return {
+    pieces,
+    selectPieces,
+    buildMove,
+    snapPiece,
+    readState,
+    // extras useful for the test / renderer
+    measureLayerThreshold,
+    TETRA_QUATS,
+    EDGE_HOME,
+    TURN_SIGN,
+    VERT_FACE_CYCLE,
+  };
+}
+
+// Export for node test (and harmless in-browser since module is undefined there).
+
+
+/* ============================================================
+   Pyraminx puzzle. Build THREE meshes from the verified geometry
+   (makePyraGeo) and expose the same interface the 2×2 does. The engine
+   "piece" is a light proxy { id, position, quaternion } that SHARES the
+   mesh group's position/quaternion objects — so the engine rotates them
+   (the mesh moves) while the bindings read the string id. Canonical state
+   is read back from the meshes via pyraGeo.readState (gate-proven equal to
+   PYRA's coordinate model), so solver/recognizer/phases run off it.
+   ============================================================ */
+const PYRA_SCALE = 1.7;
+// Face palette by faceIndex [0 green, 1 blue, 2 red, 3 yellow] — reuse the 2×2's
+// vibrant colors (the geometry agent's defaults rendered a too-dark blue).
+const PYRA_FACE_HEX = [0x12a150, 0x1f7be6, 0xd91f33, 0xf6d000];
+const pyraGeo = makePyraGeo(THREE, PYRA, PYRA_SCALE);
+const pyraGroup = new THREE.Group();
+pyraGroup.visible = false;
+scene.add(pyraGroup);
+
+// One Group per piece. Each piece is a SOLID dark body — its facelets skirted down
+// to the puzzle centre (which stays fixed under a vertex turn) — with the coloured
+// stickers inset (grout) and raised on top. So a turning layer never reveals a
+// hollow interior, and DoubleSide stickers never cull to black.
+const PYRA_DARK = new THREE.MeshStandardMaterial({ color: 0x2b2b33, roughness: 0.8, metalness: 0.0, side: THREE.DoubleSide });
+const pyraPieces = pyraGeo.pieces.map(desc => {
+  const g = new THREE.Group();
+  g.position.set(desc.center[0], desc.center[1], desc.center[2]);
+  const O = [-desc.center[0], -desc.center[1], -desc.center[2]];   // puzzle centre, in piece-local coords
+  const dark = [];
+  for (const fl of desc.facelets) {
+    const n = PYRA.FACE_NORMALS[fl.faceIndex];
+    const nl = Math.hypot(n[0], n[1], n[2]) || 1;
+    const cn = [n[0] / nl, n[1] / nl, n[2] / nl];
+    // full facelet triangle (relative to piece centre), winding-corrected outward
+    let full = fl.tri.map(v => [v[0] - desc.center[0], v[1] - desc.center[1], v[2] - desc.center[2]]);
+    const e1 = [full[1][0] - full[0][0], full[1][1] - full[0][1], full[1][2] - full[0][2]];
+    const e2 = [full[2][0] - full[0][0], full[2][1] - full[0][1], full[2][2] - full[0][2]];
+    const cr = [e1[1] * e2[2] - e1[2] * e2[1], e1[2] * e2[0] - e1[0] * e2[2], e1[0] * e2[1] - e1[1] * e2[0]];
+    if (cr[0] * cn[0] + cr[1] * cn[1] + cr[2] * cn[2] < 0) { const t = full[1]; full[1] = full[2]; full[2] = t; }
+    // dark solid body: the outer face + 3 skirts down to the puzzle centre
+    dark.push(...full[0], ...full[1], ...full[2]);
+    for (let i = 0; i < 3; i++) { const a = full[i], b = full[(i + 1) % 3]; dark.push(...a, ...b, ...O); }
+    // coloured sticker: inset toward its centroid (grout) and raised off the dark base
+    const cx = (full[0][0] + full[1][0] + full[2][0]) / 3, cy = (full[0][1] + full[1][1] + full[2][1]) / 3, cz = (full[0][2] + full[1][2] + full[2][2]) / 3;
+    const INSET = 0.9, RAISE = 0.02;
+    const cpos = [];
+    for (const p of full) cpos.push(cx + (p[0] - cx) * INSET + cn[0] * RAISE, cy + (p[1] - cy) * INSET + cn[1] * RAISE, cz + (p[2] - cz) * INSET + cn[2] * RAISE);
+    const fg = new THREE.BufferGeometry();
+    fg.setAttribute('position', new THREE.Float32BufferAttribute(cpos, 3));
+    fg.setAttribute('normal', new THREE.Float32BufferAttribute([cn[0], cn[1], cn[2], cn[0], cn[1], cn[2], cn[0], cn[1], cn[2]], 3));
+    const fmesh = new THREE.Mesh(fg, new THREE.MeshStandardMaterial({ color: PYRA_FACE_HEX[fl.faceIndex], roughness: 0.4, metalness: 0.05, side: THREE.DoubleSide }));
+    fmesh.userData.lc = new THREE.Vector3(cx, cy, cz);
+    g.add(fmesh);
+  }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.Float32BufferAttribute(dark, 3));
+  dg.computeVertexNormals();
+  g.add(new THREE.Mesh(dg, PYRA_DARK));
+  pyraGroup.add(g);
+  return { id: desc.id, kind: desc.kind, vertex: desc.vertex, edge: desc.edge,
+           home: desc.center.slice(), position: g.position, quaternion: g.quaternion, group: g };
+});
+
+/* Hidden-face projections (Pyraminx analog of the 2×2's). Each face that turns
+   away from the camera casts its 9 stickers as a glowing triangle just outside the
+   silhouette, in the screen direction the face points. Colors are read back from
+   the live meshes on settle; placement/fade is per-frame. */
+const PYRA_PROJ = (() => {
+  const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
+  const byFace = [[], [], [], []];
+  for (const desc of pyraGeo.pieces) for (const fl of desc.facelets) {
+    const c = v3(fl.tri[0]).add(v3(fl.tri[1])).add(v3(fl.tri[2])).multiplyScalar(1 / 3);
+    byFace[fl.faceIndex].push({ tri: fl.tri.map(v3), centroid: c });
+  }
+  const faces = byFace.map((fls, f) => {
+    const C = new THREE.Vector3();
+    for (const x of fls) C.add(x.centroid);
+    C.multiplyScalar(1 / fls.length);
+    const n = v3(PYRA.FACE_NORMALS[f]).normalize();
+    const e1 = fls[0].centroid.clone().sub(C); e1.addScaledVector(n, -e1.dot(n)).normalize();
+    const e2 = n.clone().cross(e1).normalize();
+    const tiles = fls.map(x => ({
+      pts: x.tri.map(p => { const r = p.clone().sub(C); return [r.dot(e1), r.dot(e2)]; }),
+      centroid: x.centroid,
+    }));
+    return { f, n, C, e1, e2, tiles };
+  });
+  const slots = [];
+  faces.forEach(fc => fc.tiles.forEach((t, si) => slots.push({ face: fc.f, slot: si, centroid: t.centroid })));
+  return { faces, slots };
+})();
+const pyraProjGroup = new THREE.Group();
+pyraProjGroup.frustumCulled = false;
+pyraProjGroup.visible = false;
+scene.add(pyraProjGroup);
+const PYRA_PROJ_SCALE = 0.42;
+const pyraProjTiles = PYRA_PROJ.faces.map(fc => {
+  const grp = new THREE.Group();
+  grp.frustumCulled = false;
+  grp.matrixAutoUpdate = false;        // we set a sheared matrix from the projected face axes
+  const tiles = fc.tiles.map(t => {
+    const cx = (t.pts[0][0] + t.pts[1][0] + t.pts[2][0]) / 3;   // inset each triangle toward its
+    const cy = (t.pts[0][1] + t.pts[1][1] + t.pts[2][1]) / 3;   // centroid → dark borders/grout
+    const PIN = 0.84;                                            // between the 9 stickers, like the faces
+    const g = new THREE.BufferGeometry();
+    const pos = [];
+    for (const p of t.pts) pos.push(cx + (p[0] - cx) * PIN, cy + (p[1] - cy) * PIN, 0);
+    g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
+    const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: true, side: THREE.DoubleSide }));
+    m.renderOrder = 6; m.frustumCulled = false;
+    grp.add(m);
+    return m;
+  });
+  pyraProjGroup.add(grp);
+  return { grp, tiles };
+});
+// ---- 2D folded net: the standard "big triangle of 4 faces" Pyraminx unfolding.
+// Apex vertex U sits at all three outer corners; face 0 (opposite U) is the centre
+// triangle; the other 3 faces fold out from its edges. Slot order matches PYRA_PROJ
+// so pyraProjColors' `grid[face][slot]` indexes both the 3D tiles and these polys. ----
+const PYRA_NET_NS = 'http://www.w3.org/2000/svg';
+const pyraNetEl = document.createElement('div');
+pyraNetEl.className = 'pyra-net';
+const pyraNetSvg = document.createElementNS(PYRA_NET_NS, 'svg');
+pyraNetSvg.setAttribute('viewBox', '0 0 100 100');
+pyraNetEl.appendChild(pyraNetSvg);
+document.body.appendChild(pyraNetEl);
+const pyraNetPolys = [[], [], [], []];
+{
+  const P = { T: [50, 6], BL: [7.5, 87], BR: [92.5, 87], Mtl: [28.75, 46.5], Mtr: [71.25, 46.5], Mb: [50, 87] };
+  const faceCorners = [                       // per face: world-vertex -> net anchor
+    { 1: 'Mtl', 2: 'Mtr', 3: 'Mb' },          // face 0 (L,R,B) — centre
+    { 0: 'BR', 2: 'Mtr', 3: 'Mb' },           // face 1 (U,R,B) — bottom-right
+    { 0: 'BL', 1: 'Mtl', 3: 'Mb' },           // face 2 (U,L,B) — bottom-left
+    { 0: 'T', 1: 'Mtl', 2: 'Mtr' },           // face 3 (U,L,R) — top
+  ];
+  const v3 = a => new THREE.Vector3(a[0], a[1], a[2]);
+  const byFace = [[], [], [], []];
+  for (const desc of pyraGeo.pieces) for (const fl of desc.facelets) {
+    const c = v3(fl.tri[0]).add(v3(fl.tri[1])).add(v3(fl.tri[2])).multiplyScalar(1 / 3);
+    byFace[fl.faceIndex].push({ tri: fl.tri.map(v3), centroid3: c, kind: desc.kind, vertex: desc.vertex });
+  }
+  // 2D affine (handles rotation/scale/reflection) from 3 src corners to 3 dst anchors.
+  function affine(src, dst) {
+    const [s0, s1, s2] = src;
+    const det = (s1[0] - s0[0]) * (s2[1] - s0[1]) - (s2[0] - s0[0]) * (s1[1] - s0[1]);
+    const coef = (q0, q1, q2) => {
+      const a = ((q1 - q0) * (s2[1] - s0[1]) - (q2 - q0) * (s1[1] - s0[1])) / det;
+      const b = ((q2 - q0) * (s1[0] - s0[0]) - (q1 - q0) * (s2[0] - s0[0])) / det;
+      return [a, b, q0 - a * s0[0] - b * s0[1]];
+    };
+    const [a, b, e] = coef(dst[0][0], dst[1][0], dst[2][0]);
+    const [c, d, f] = coef(dst[0][1], dst[1][1], dst[2][1]);
+    return p => [a * p[0] + b * p[1] + e, c * p[0] + d * p[1] + f];
+  }
+  for (let f = 0; f < 4; f++) {
+    const fls = byFace[f];
+    const C = new THREE.Vector3();
+    for (const x of fls) C.add(x.centroid3);
+    C.multiplyScalar(1 / fls.length);
+    const n = v3(PYRA.FACE_NORMALS[f]).normalize();
+    const e1 = fls[0].centroid3.clone().sub(C); e1.addScaledVector(n, -e1.dot(n)).normalize();
+    const e2 = n.clone().cross(e1).normalize();
+    const to2d = p => { const r = p.clone().sub(C); return [r.dot(e1), r.dot(e2)]; };
+    const corners = faceCorners[f], src = [], dst = [];
+    for (const x of fls) {                    // each tip's outermost vertex = a true face corner
+      if (x.kind !== 'tip') continue;
+      const pts = x.tri.map(to2d);
+      let corner = pts[0], md = -1;
+      for (const pp of pts) { const dmag = pp[0] * pp[0] + pp[1] * pp[1]; if (dmag > md) { md = dmag; corner = pp; } }
+      src.push(corner); dst.push(P[corners[x.vertex]]);
+    }
+    const A = affine(src, dst);
+    fls.forEach((x, si) => {
+      const p2 = x.tri.map(to2d).map(A);
+      const cx = (p2[0][0] + p2[1][0] + p2[2][0]) / 3, cy = (p2[0][1] + p2[1][1] + p2[2][1]) / 3;
+      const PIN = 0.9;                         // inset toward centroid → dark grout between stickers
+      const poly = document.createElementNS(PYRA_NET_NS, 'polygon');
+      poly.setAttribute('points', p2.map(p => `${(cx + (p[0] - cx) * PIN).toFixed(2)},${(cy + (p[1] - cy) * PIN).toFixed(2)}`).join(' '));
+      poly.setAttribute('fill', '#' + PYRA_FACE_HEX[f].toString(16).padStart(6, '0'));
+      pyraNetSvg.appendChild(poly);
+      pyraNetPolys[f][si] = poly;
+    });
+  }
+}
+
+const _pwc = new THREE.Vector3();
+function pyraProjColors() {
+  const grid = [new Array(9), new Array(9), new Array(9), new Array(9)];
+  for (const p of pyraPieces) for (const child of p.group.children) {
+    if (!child.userData.lc) continue;
+    p.group.localToWorld(_pwc.copy(child.userData.lc));
+    let best = -1, bd = 1e9;
+    for (let i = 0; i < PYRA_PROJ.slots.length; i++) {
+      const dd = _pwc.distanceToSquared(PYRA_PROJ.slots[i].centroid);
+      if (dd < bd) { bd = dd; best = i; }
+    }
+    const s = PYRA_PROJ.slots[best];
+    grid[s.face][s.slot] = child.material.color.getHex();
+  }
+  for (let f = 0; f < 4; f++) for (let si = 0; si < 9; si++) {
+    if (grid[f][si] != null) {
+      pyraProjTiles[f].tiles[si].material.color.setHex(grid[f][si]);
+      pyraNetPolys[f][si].setAttribute('fill', '#' + grid[f][si].toString(16).padStart(6, '0'));
+    }
+  }
+}
+const _ppR = new THREE.Vector3(), _ppU = new THREE.Vector3(), _ppD = new THREE.Vector3();
+const _pe1 = new THREE.Vector3(), _pe2 = new THREE.Vector3(), _pcen = new THREE.Vector3(), _pmat = new THREE.Matrix4();
+function pyraProjLayout() {
+  camera.updateMatrixWorld();
+  _ppR.setFromMatrixColumn(camera.matrixWorld, 0).normalize();
+  _ppU.setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+  _ppD.copy(camera.position).normalize();
+  const dist = camera.position.length();
+  const halfH = dist * Math.tan(camera.fov * Math.PI / 360);
+  const reach = PYRA_SCALE * 1.5 * PYRA_PROJ_SCALE;          // ~radial reach of a cluster
+  const SIL = PYRA_SCALE * 0.95;
+  const BACK = PYRA_SCALE * 1.1;                             // push the projection behind the puzzle
+  const persp = (dist + BACK) / dist;                       // keep on-screen offset + size despite the push-back
+  const sc = PYRA_PROJ_SCALE * persp;
+  const R = Math.min(SIL + reach + 0.15, Math.max(reach, 0.94 * Math.min(halfH, halfH * camera.aspect) - reach)) * persp;
+  for (let f = 0; f < 4; f++) {
+    const fc = PYRA_PROJ.faces[f];
+    const d = fc.n.dot(_ppD);
+    const alpha = smoothstep(0.06, -0.12, d);               // fades in as the face turns away
+    const { grp, tiles } = pyraProjTiles[f];
+    if (alpha <= 0.01) { grp.visible = false; continue; }
+    grp.visible = true;
+    // offset outside the silhouette in the direction the face points, then push it BEHIND
+    // the puzzle. depthTest then occludes the overlap, so it only shows where it peeks past
+    // the edge — behind, not pasted on top.
+    const sx = fc.n.dot(_ppR), sy = fc.n.dot(_ppU);
+    const m = Math.hypot(sx, sy) || 1;
+    _pcen.copy(_ppR).multiplyScalar(R * sx / m).addScaledVector(_ppU, R * sy / m).addScaledVector(_ppD, -BACK);
+    // orient by the face's REAL in-plane axes projected onto the screen plane, so the
+    // triangle's tilt + shear match the actual hidden face (not an arbitrary billboard).
+    _pe1.copy(fc.e1).addScaledVector(_ppD, -fc.e1.dot(_ppD)).multiplyScalar(sc);
+    _pe2.copy(fc.e2).addScaledVector(_ppD, -fc.e2.dot(_ppD)).multiplyScalar(sc);
+    _pmat.makeBasis(_pe1, _pe2, _ppD).setPosition(_pcen);
+    grp.matrix.copy(_pmat); grp.matrixWorldNeedsUpdate = true;
+    for (const t of tiles) t.material.opacity = 0.9 * alpha;
+  }
+}
+
+/* Orientation: the puzzle stays model-fixed (so projections/readState keep
+   working); instead we snap the CAMERA to canonical views on drag-release and map
+   move keys to whichever world-vertex sits in each screen role — so R always turns
+   the vertex on the right, like holding a real puzzle. */
+const PYRA_TETRA_Q = (() => {
+  const qs = [new THREE.Quaternion()];
+  for (const v of PYRA.VERTS) { const a = new THREE.Vector3(v[0], v[1], v[2]).normalize();
+    qs.push(new THREE.Quaternion().setFromAxisAngle(a, 2 * Math.PI / 3));
+    qs.push(new THREE.Quaternion().setFromAxisAngle(a, -2 * Math.PI / 3)); }
+  for (const a of [[1, 0, 0], [0, 1, 0], [0, 0, 1]]) qs.push(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(...a), Math.PI));
+  return qs;
+})();
+// Canonical views = look (nearly) straight down each tip, so the three visible
+// faces are seen at ~equal, non-grazing angles. A tiny tilt off the pure vertex
+// axis gives a touch of depth and 3 azimuthal options per tip without making any
+// face thin (min visible face stays ~70°).
+const PYRA_VIEW_DIRS = (() => {
+  const d0 = new THREE.Vector3(1.0, 0.95, 1.05).normalize();   // 3 visible faces ≈ 72/70/68° (gentle gradient, none thin)
+  const dirs = [];
+  for (const q of PYRA_TETRA_Q) { const d = d0.clone().applyQuaternion(q); if (!dirs.some(e => e.dot(d) > 0.999)) dirs.push(d); }
+  return dirs;
+})();
+let pyraSnapTarget = null;
+function pyraSnapView() {
+  const cur = camera.position.clone().normalize();
+  let best = PYRA_VIEW_DIRS[0], bd = -2;
+  for (const d of PYRA_VIEW_DIRS) { const dot = d.dot(cur); if (dot > bd) { bd = dot; best = d; } }
+  pyraSnapTarget = best.clone().multiplyScalar(camera.position.length());
+}
+function pyraRoleToVertex() {
+  const pts = PYRA.VERTS.map((v, i) => {
+    const p = new THREE.Vector3(v[0], v[1], v[2]).multiplyScalar(PYRA_SCALE).project(camera);
+    return { i, x: p.x, y: p.y };
+  });
+  pts.sort((a, b) => b.y - a.y);
+  const up = pts[0];
+  const lower = pts.slice(1).sort((a, b) => b.y - a.y);
+  const back = lower[0];
+  const front = lower.slice(1).sort((a, b) => a.x - b.x);
+  const VN = ['U', 'L', 'R', 'B'];
+  return { U: VN[up.i], B: VN[back.i], L: VN[front[0].i], R: VN[front[1].i] };
+}
+function pyraResolveKey(tok) {
+  const role = tok[0], suffix = tok.slice(1);
+  const up = role.toUpperCase();
+  if (!'ULRB'.includes(up)) return tok;
+  let v = pyraRoleToVertex()[up] || up;
+  if (role === role.toLowerCase()) v = v.toLowerCase();   // tip
+  return v + suffix;
+}
+// Inverse of pyraResolveKey: express a WORLD move token in the current view's
+// screen-role letters (so a displayed alg reads in the same R/L/U/B the keys use).
+function pyraWorldToRole(tok) {
+  const face = tok[0], suffix = tok.slice(1), up = face.toUpperCase();
+  if (!'ULRB'.includes(up)) return tok;
+  const r2v = pyraRoleToVertex();                          // role -> world vertex
+  const v2r = {}; for (const r in r2v) v2r[r2v[r]] = r;    // world vertex -> role
+  let role = v2r[up] || up;
+  if (face === face.toLowerCase()) role = role.toLowerCase();
+  return role + suffix;
+}
+// Re-express a canonical L3E case alg (which solves the state after `auf` AUF
+// re-grips about U) as world moves in the FIXED frame. Verified 15/15: one CW AUF
+// relabels vertices U→U, L→B, R→L, B→R (the inverse of the state's AUF_V_PERM).
+const PYRA_AUF_LETTER = { U: 'U', L: 'B', R: 'L', B: 'R' };
+function pyraAufRelabel(tokens, auf) {
+  let out = tokens.slice();
+  for (let k = 0; k < (auf || 0); k++) out = out.map(t => PYRA_AUF_LETTER[t[0]] + t.slice(1));
+  return out;
+}
+// Live L3E case hint (world tokens for the engine + a role-letter display string).
+function pyraCaseHint() {
+  const r = PYRA.recognizeL3E(pyraReadState());
+  if (!r || r.name === 'Unknown') return null;
+  const world = pyraAufRelabel(r.tokens, r.auf);
+  return {
+    label: 'L3E · last three edges',
+    name: r.name === 'Skip' ? 'Skip — already solved' : r.name,
+    tokens: world,                                          // applied via force (world)
+    display: world.length ? world.map(pyraWorldToRole).join(' ') : '',
+  };
+}
+
+const PYRA_DEFS = { U: {}, L: {}, R: {}, B: {}, u: { tip: 1 }, l: { tip: 1 }, r: { tip: 1 }, b: { tip: 1 } };
+function pyraResetPieces() {
+  for (const p of pyraPieces) { p.position.set(p.home[0], p.home[1], p.home[2]); p.quaternion.set(0, 0, 0, 1); }
+}
+function pyraReadState() { return pyraGeo.readState(pyraPieces); }
+
+// Pyraminx LBL progress: 0 building the first face · 1 first face complete (top
+// edges {0,1,2} placed + all 4 centres oriented — ready for L3E) · 2 fully solved.
+function pyraStateLevel(s) {
+  const coOk = s.co.every(v => v === 0);
+  const firstDone = coOk && [0, 1, 2].every(e => s.ep[e] === e && s.eo[e] === 0);
+  if (!firstDone) return 0;
+  const epOk = s.ep.every((v, i) => v === i);
+  const eoOk = s.eo.every(v => v === 0);
+  const tipsOk = s.tips.every(v => v === 0);
+  return (epOk && eoOk && tipsOk) ? 2 : 1;
+}
+
+// ---- First-face subgoal: exact optimal distance + solver (for drills + the solver
+// panel). The first face depends only on co[4] and where edges {0,1,2} sit (slot +
+// flip) — a closed quotient under the 8 vertex turns, so a one-time BFS over its
+// ~78k reachable keys gives exact God-distances. Gradient-descend the table to a
+// move sequence. ----
+function pyraFFKey(s) {
+  let k = 0;
+  for (let v = 0; v < 4; v++) k = k * 3 + s.co[v];
+  for (let e = 0; e < 3; e++) {
+    let slot = 0; for (let i = 0; i < 6; i++) if (s.ep[i] === e) { slot = i; break; }
+    k = k * 6 + slot; k = k * 2 + s.eo[slot];
+  }
+  return k;
+}
+let _pyraFFTable = null;
+function pyraFFTable() {
+  if (_pyraFFTable) return _pyraFFTable;
+  const start = { co: new Int8Array(4), ep: Int8Array.from([0, 1, 2, 3, 4, 5]), eo: new Int8Array(6) };
+  const dist = new Map([[pyraFFKey(start), 0]]);
+  let frontier = [start], d = 0;
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) for (let m = 0; m < 8; m++) {
+      const ns = PYRA.applyMoveCoordOnly(s, m);
+      const k = pyraFFKey(ns);
+      if (!dist.has(k)) { dist.set(k, d + 1); next.push(ns); }
+    }
+    frontier = next; d++;
+  }
+  _pyraFFTable = dist;
+  return dist;
+}
+function pyraFirstFaceDist(state) { return pyraFFTable().get(pyraFFKey(state)) ?? 99; }
+function pyraSolveFirstFace(state) {
+  const t = pyraFFTable();
+  let s = { co: Int8Array.from(state.co), ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo) };
+  const out = [];
+  for (let guard = 0; (t.get(pyraFFKey(s)) || 0) > 0 && guard < 30; guard++) {
+    const d = t.get(pyraFFKey(s));
+    let moved = false;
+    for (let m = 0; m < 8; m++) {
+      const ns = PYRA.applyMoveCoordOnly(s, m);
+      if ((t.get(pyraFFKey(ns)) ?? 99) === d - 1) { out.push(PYRA.MOVE_TOKENS[m]); s = ns; moved = true; break; }
+    }
+    if (!moved) return null;
+  }
+  return out;
+}
+// Honest move count for a Pyraminx run: collapse consecutive same-face turns mod 3
+// (X X X → nothing, X X → X'); tips are trivial and excluded from the count.
+function pyraCompress(toks) {
+  const out = [];
+  for (const t of toks.filter(t => t === t.toUpperCase())) {     // vertex turns only
+    const face = t[0], amt = t.includes("'") ? 2 : 1;
+    if (out.length && out[out.length - 1].face === face) {
+      const net = (out[out.length - 1].amt + amt) % 3;
+      out.pop();
+      if (net) out.push({ face, amt: net, tok: net === 1 ? face : face + "'" });
+    } else out.push({ face, amt, tok: t });
+  }
+  return out.map(o => o.tok);
+}
+
+// Mirror of finalizeMovePhase for the Pyraminx phase ladder (first-face → L3E).
+function pyraFinalize() {
+  const entry = history[settleIndex++];
+  if (!entry) return;
+  if (entry.phase !== 'scramble') {
+    entry.phase = solvePhase;
+    const lvl = pyraStateLevel(pyraReadState());
+    let advancing = true;
+    while (advancing) {
+      advancing = false;
+      if (solvePhase === 'first' && lvl >= 1) { solvePhase = 'LL'; advancing = true; phaseEnd.first = entry.t; solveHint = hintKey(); }
+      else if (solvePhase === 'LL' && lvl >= 2) { solvePhase = 'done'; advancing = true; phaseEnd.LL = entry.t; if (timerState === 'running') { timerState = 'done'; timerEnd = entry.t; if (drillTarget == null) recordSolve(); } }
+    }
+    if (drillTarget != null && entry.phase === 'first' && solvePhase !== 'first') {  // first face just completed → a drill ends here
+      if (timerState === 'running') { timerState = 'done'; timerEnd = phaseEnd.first; }
+      const used = pyraCompress(history.filter(h => h.phase === 'first').map(h => h.tok)).length;
+      const recog = inspectMs ? `<span class="drill-insp"> · ${fmtTime(inspectMs / 1000)} to spot</span>` : '';
+      drillResultEl.innerHTML = (used === drillTarget
+        ? `<span class="drill-ok">✓ ${used} moves — optimal!</span>`
+        : `<span class="drill-bad">${used} moves · best is ${drillTarget}</span>`) + recog;
+      drillTarget = null;
+    }
+  }
+  renderHistory();
+  updateCaseHelper();
+}
+const puzzlePyra = {
+  id: 'pyraminx', name: 'Pyraminx',
+  group: pyraGroup,
+  DEFS: PYRA_DEFS,
+  buildMove: (f, p, d) => pyraGeo.buildMove(f, p, d),
+  selectPieces: (move) => pyraGeo.selectPieces(move, pyraPieces),
+  snapPiece: (p) => pyraGeo.snapPiece(p),
+  build: pyraResetPieces,
+  updateNet: pyraProjColors,
+  updateProjections: pyraProjLayout,
+  finalizeMovePhase: pyraFinalize,
+  readState: pyraReadState,
+  scramble: () => PYRA.scramblePyra().tokens,
+  storageKey: 'pyra-solves',
+  resolveKey: pyraResolveKey,                              // pose-relative move keys
+  keymap: {
+    faceKeys: { u: 'U', l: 'L', r: 'R', b: 'B' },          // key = U/L/R/B turn (Shift = prime)
+    tipCodes: { KeyU: 'u', KeyL: 'l', KeyR: 'r', KeyB: 'b' }, // Option/Alt + key = the matching tip
+    tipKeys: { i: 'u', o: 'l', p: 'r', ';': 'b' },         // fallback letter keys for tips
+  },
+  phaseConfig: { order: ['first', 'LL'], labels: { first: 'First face', LL: 'L3E' } },
+  caseHelp: (phase) => (phase === 'LL') ? pyraCaseHint() : null,
+  drillLabel: 'First-face drill:',
+  // A scramble whose optimal first face is exactly n turns: scramble fully, then
+  // play back all but the last n moves of its first-face solution.
+  makeDrill: (n) => {
+    for (let t = 0; t < 200; t++) {
+      const sc = PYRA.scramblePyra();
+      const st = PYRA.applySeq(PYRA.solvedState(), sc.tokens);
+      const sol = pyraSolveFirstFace(st);
+      if (!sol || sol.length < n) continue;
+      const tokens = sc.tokens.concat(sol.slice(0, sol.length - n));
+      if (pyraFirstFaceDist(PYRA.applySeq(PYRA.solvedState(), tokens)) === n) return tokens;
+    }
+    return null;
+  },
+  solverLabel: 'First-face solver · optimal',
+  solverGoals: [{ key: 'first', label: 'First face' }],
+  solve: () => {
+    const w = pyraSolveFirstFace(pyraReadState());
+    return w && w.length ? { tokens: w, display: w.map(pyraWorldToRole).join(' ') } : (w ? { tokens: [], display: '' } : null);
+  },
+  dockGroups: [
+    { label: 'Turns', moves: ['U', 'L', 'R', 'B'], variants: ['', "'"] },
+    { label: 'Tips', moves: ['u', 'l', 'r', 'b'], variants: ['', "'"] },
+  ],
+  helpHTML: `<div><b>Keys:</b> u l r b = U L R B turns</div>
+    <div><kbd>Shift</kbd> + key = prime (')</div>
+    <div><kbd>⌥</kbd>Option + key = tip turn</div>
+    <div>keys follow the view: R = right tip</div>
+    <div><kbd>Space</kbd> = pause / hide</div>
+    <div>1–4 = (re)start drill</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+
+/* ============================================================
+   Puzzle registry. The 2×2 implementation above is unchanged; it is
+   exposed here behind one interface and driven via the active `puzzle`,
+   so additional puzzles (Pyraminx) can share the engine / timer / stats /
+   UI shell. Each puzzle supplies its own engine bindings, state/method,
+   net, projections, keymap and storage key.
+   ============================================================ */
+const puzzle2x2 = {
+  id: '2x2', name: '2×2',
+  DEFS,
+  buildMove,
+  selectPieces: (move) => selectCubies(move.axisName, move.sign),
+  snapPiece: snapCubie,
+  build: buildCube,
+  updateNet,
+  updateProjections: updateProjectionLayout,
+  finalizeMovePhase,
+  scramble: randomStateScramble,
+  storageKey: STORAGE_KEY,
+  keymap: { faceKeys: FACE_KEYS, primeKeys: PRIME_KEYS, rotKeys: ROT_KEYS },
+  phaseConfig: { order: ['fll', 'oll', 'pbl'], labels: { fll: 'FLL', oll: 'OLL', pbl: 'PBL' } },
+  caseHelp: (phase) => {
+    if (phase === 'oll') { const r = recognizeOLL(); return r && { label: 'OLL · orient last layer', name: r.name, tokens: r.tokens, display: r.tokens.join(' ') }; }
+    if (phase === 'pbl') { const r = recognizePBL(); return r && { label: 'PBL · permute both layers', name: r.name, tokens: r.tokens, display: r.tokens.join(' ') }; }
+    return null;
+  },
+  drillLabel: 'FLL drill:',
+  makeDrill: (n) => generateDrill(n),
+  solverLabel: 'First-layer solver · optimal',
+  solverGoals: [{ key: 'any', label: 'Any face' }, { key: 'top', label: 'On top' }, { key: 'white', label: 'White' }],
+  solve: (goal) => { const s = solveFLL(goal); return s === null ? null : { tokens: s, display: s.join(' ') }; },
+  dockGroups: [
+    { label: 'Faces', moves: ['R', 'L', 'U', 'D', 'F', 'B'], variants: ['', "'", '2'] },
+    { label: 'Rotations', moves: ['x', 'y', 'z'], variants: ['', "'", '2'] },
+  ],
+  helpHTML: `<div><b>Keys:</b> R L U D F B turn faces</div>
+    <div><kbd>Shift</kbd> + key = prime (')</div>
+    <div>primes: E I G S K N</div>
+    <div>x y z = cube rotations</div>
+    <div><kbd>Space</kbd> = pause / hide cube</div>
+    <div>1–4 = (re)start FLL drill</div>
+    <div>Double-tap = seamless 2</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+const PUZZLES = { '2x2': puzzle2x2, 'pyraminx': puzzlePyra };
+puzzle = puzzle2x2;
+buildDock();
+buildSolver();
+
+function switchPuzzle(id) {
+  if (!PUZZLES[id] || puzzle.id === id) return;
+  setPaused(false);
+  drillTarget = null;                                       // don't carry a drill across puzzles
+  cubeGroup.visible = (id === '2x2');
+  pyraGroup.visible = (id === 'pyraminx');
+  projGroup.visible = (id === '2x2');                       // 2×2 projections
+  pyraProjGroup.visible = (id === 'pyraminx');              // Pyraminx projections
+  netEl.style.visibility = (id === '2x2') ? 'visible' : 'hidden';
+  pyraNetEl.classList.toggle('on', id === 'pyraminx');
+  puzzle = PUZZLES[id];
+  pyraSnapTarget = null;
+  if (id === 'pyraminx') {                                  // start from a balanced (near vertex-on) view, sized to fit
+    const cur = camera.position.clone().normalize();
+    let best = PYRA_VIEW_DIRS[0], bd = -2;
+    for (const d of PYRA_VIEW_DIRS) { const dot = d.dot(cur); if (dot > bd) { bd = dot; best = d; } }
+    const fit = Math.max(9.5, Math.min(21, 10.5 / Math.min(1, camera.aspect)));   // zoom out more on narrow/portrait screens
+    camera.position.copy(best).multiplyScalar(fit);
+    controls.update();
+  } else {
+    camera.position.set(4.6, 4.2, 6.5); controls.update();
+  }
+  solves = loadSolves(puzzle.storageKey);                  // per-puzzle stats — never collide
+  resetState(true);
+  buildDock();
+  buildSolver();
+  drillLabelEl.textContent = puzzle.drillLabel;
+  drillResultEl.textContent = '';
+  document.querySelector('.help').innerHTML = puzzle.helpHTML;
+  document.querySelectorAll('#puzzleChooser .pz').forEach(x => x.classList.toggle('active', x.dataset.puz === id));
+  document.getElementById('brandSub').textContent = PUZZLES[id].name;
+  document.title = 'ocube · ' + PUZZLES[id].name;
+  if (!statsEl.classList.contains('hidden')) { rebuildScopePick(); renderStats(); }
+  try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
+}
 animate();
+
+// Restore the puzzle chosen on the previous visit (2×2 stays the first-load default).
+try { const last = localStorage.getItem('cubing-last-puzzle'); if (last && PUZZLES[last] && last !== puzzle.id) switchPuzzle(last); } catch (e) {}
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;

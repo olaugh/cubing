@@ -1,23 +1,29 @@
-# cubing-trainer
+# cubing
 
-A single-file web app for practicing 2×2 (Pocket Cube) solves with the **Ortega method**.
+A single-file web app for practicing speedsolving. Pick a puzzle from the top
+chooser:
+
+- **2×2 (Pocket Cube)** — the **Ortega** method (FLL → OLL → PBL).
+- **Pyraminx** — a layer-by-layer method (first face → L3E, the last three edges).
 
 ## Features
 
-- **3D stickerless cube** (Three.js) you turn from the keyboard, with the hidden
-  faces projected as tight 2×2 clusters around the cube — the ≤3 faces pointing
-  away from the camera are cast just outside the silhouette, sheared by the
-  viewing angle, so you can always read all six sides while freely orbiting.
-- **Random-state scrambles**, an inspection + from-first-move timer, and automatic
-  **FLL / OLL / PBL** phase splits in the solve history.
-- **OLL & PBL case recognition** with optional on-demand hints — the algorithm
-  name and/or its full move sequence (named cases: H, Pi, Sune, Anti-Sune, U, T, L;
-  PBL: Adjacent, Diagonal, and their combinations). OLL algorithms start with the
-  cube rotation that orients the solved layer canonically.
-- **Optimal first-layer (FLL) solver** (fastest face / fastest face on top /
-  fastest white) and an **N-move FLL drill** mode.
-- **Session & per-day stats** persisted to `localStorage`, bucketed by which hint
-  information was used (none / name / moves / name + moves).
+- **3D stickerless puzzle** (Three.js) you turn from the keyboard, with the
+  faces that point away from the camera **projected** just outside the
+  silhouette so you can read every side while orbiting.
+- A **2D net** of the whole puzzle (cube cross / folded Pyraminx triangle) that
+  tracks the live state.
+- **Random-state scrambles**, an inspection + from-first-move timer, and
+  automatic **phase splits** in the solve history (FLL/OLL/PBL · first-face/L3E).
+- **Last-layer case recognition** with optional name/move hints —
+  OLL & PBL for the 2×2; the 6 **L3E** cases (Sledgehammer, Hedgeslammer,
+  the two 3-cycles, two-flip, skip) for the Pyraminx. Pyraminx algs are shown
+  in the screen-relative letters the keys use, so they read off as you hold the
+  puzzle.
+- An **optimal first-layer / first-face solver** and an **N-move drill** mode
+  (the `1`–`4` keys) for both puzzles.
+- **Session & per-day stats** persisted to `localStorage`, kept **separate per
+  puzzle** and bucketed by which hint information was used.
 
 ## Run
 
@@ -28,18 +34,24 @@ python3 -m http.server 8124
 # then open http://localhost:8124/index.html
 ```
 
+It's also deployed via GitHub Pages: <https://olaugh.github.io/cubing/>.
+
 ## Controls
 
-| Action | Keys |
-| --- | --- |
-| Face turns | `R` `L` `U` `D` `F` `B` (hold **Shift** for primes) |
-| Prime hotkeys (key adjacent to each face) | `E` `I` `G` `S` `K` `N` → `R'` `U'` `F'` `D'` `L'` `B'` |
-| Cube rotations | `x` `y` `z` |
-| Seamless double turn | double-tap a face |
-| Orbit / zoom | drag / scroll |
+| Action | 2×2 | Pyraminx |
+| --- | --- | --- |
+| Turns | `R` `L` `U` `D` `F` `B` | `u` `l` `r` `b` → U L R B |
+| Prime (`'`) | hold **Shift** (or `E I G S K N`) | hold **Shift** |
+| Tips / rotations | `x` `y` `z` rotate the cube | **⌥ Option** + key turns a tip |
+| Seamless double | double-tap a face | — (Pyraminx has no doubles) |
+| Pause / hide | `Space` | `Space` |
+| (Re)start drill | `1`–`4` | `1`–`4` |
+| Orbit / zoom | drag / scroll | drag / scroll (snaps to a canonical view) |
+
+Pyraminx move keys follow the view — `R` always turns the tip on the right,
+like holding a real puzzle.
 
 ## Color scheme
 
-White U · Yellow D · Green F · Blue B · Red R · Orange L. The 2D net uses the
-standard cube-state layout (Front at the center of the cross, equatorial band
-L-F-R-B, U above and D below F).
+- **2×2:** White U · Yellow D · Green F · Blue B · Red R · Orange L.
+- **Pyraminx:** Green · Blue · Red · Yellow on the four faces.
