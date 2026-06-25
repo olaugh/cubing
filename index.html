@@ -374,7 +374,9 @@
     </div>
     <div class="puzzle-chooser" id="puzzleChooser">
       <button class="pz active" data-puz="2x2">2×2</button>
+      <button class="pz" data-puz="3x3">3×3</button>
       <button class="pz" data-puz="pyraminx">Pyraminx</button>
+      <button class="pz" data-puz="megaminx">Megaminx</button>
     </div>
     <div class="spacer"></div>
     <div class="top-actions">
@@ -3653,13 +3655,14 @@ const PYRA_DARK = new THREE.MeshStandardMaterial({ color: 0x2b2b33, roughness: 0
 // the corner at a face centre (where six stickers meet) leaves the hexagon star; a
 // small cut on the outer tip/edge corners just softens them.
 function pyraRoundedOutline(V, cut, seg) {
-  const cuts = Array.isArray(cut) ? cut : [cut, cut, cut];
+  const n = V.length;
+  const cuts = Array.isArray(cut) ? cut : new Array(n).fill(cut);
   const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
   const qbez = (a, c, b, t) => { const u = 1 - t, w0 = u * u, w1 = 2 * u * t, w2 = t * t;
     return [w0 * a[0] + w1 * c[0] + w2 * b[0], w0 * a[1] + w1 * c[1] + w2 * b[1], w0 * a[2] + w1 * c[2] + w2 * b[2]]; };
   const out = [];
-  for (let i = 0; i < 3; i++) {
-    const Vc = V[i], prev = V[(i + 2) % 3], next = V[(i + 1) % 3], ci = cuts[i];
+  for (let i = 0; i < n; i++) {
+    const Vc = V[i], prev = V[(i + n - 1) % n], next = V[(i + 1) % n], ci = cuts[i];
     const A = lerp(Vc, prev, ci), B = lerp(Vc, next, ci);
     out.push(A);
     for (let s = 1; s < seg; s++) out.push(qbez(A, Vc, B, s / seg));
@@ -4226,7 +4229,846 @@ const puzzle2x2 = {
     <div>Double-tap = seamless 2</div>
     <div>Drag to orbit · scroll to zoom</div>`,
 };
-const PUZZLES = { '2x2': puzzle2x2, 'pyraminx': puzzlePyra };
+/* ===== Megaminx geometry + engine — makeMegaGeo factory. Node-verified gates:
+ *   62 pieces, 11/face, every face turn order-5, inverse, 2000-turn round-trip
+ *   (zero drift), corner/edge orientation laws. Wrapped in an IIFE so its many
+ *   helpers (PHI, vDot, buildDodeca, buildRotationGroup, ...) stay encapsulated. */
+const makeMegaGeo = (function () {
+// mega-geo.js
+// Self-contained Megaminx geometry + engine module.
+//
+// Exposes a single factory `makeMegaGeo(THREE, scale = 1)` returning the
+// geometry (pieces, faces) plus the engine helpers (selectPieces, buildMove,
+// snapPiece, readState) used to drive a Three.js twisty-puzzle animation.
+//
+// Coordinate system: the standard regular dodecahedron with vertices at
+// (+-1,+-1,+-1) and the cyclic (0, +-1/phi, +-phi) permutations. All geometry
+// is computed in those raw units and multiplied by `scale` on output. The
+// "home position" of a piece (its solved-state centroid) is what we snap to.
+//
+// Rendering note: each of the 12 pentagonal faces is subdivided into 11
+// facelets (1 center + 5 edge + 5 corner). Facelet polygons wind CCW as seen
+// from outside the puzzle (looking down the +normal direction), because the
+// face vertices P0..P4 are sorted CCW about the outward normal.
+
+// ---------------------------------------------------------------------------
+// Tunable subdivision constants (kept near the top so they can be retuned).
+// ---------------------------------------------------------------------------
+const FACELET_S = 0.42; // central-pentagon shrink factor toward centroid
+const FACELET_T = 0.32; // outer-edge division fraction (Ai = Pi + t*(P(i+1)-Pi))
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+const IP = 1 / PHI;
+
+// ---------------------------------------------------------------------------
+// Tiny pure-array vector helpers (independent of THREE, used to build geometry)
+// ---------------------------------------------------------------------------
+const vSub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vAdd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vScale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const vDot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vCross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const vLen = (a) => Math.sqrt(vDot(a, a));
+const vNorm = (a) => {
+  const l = vLen(a);
+  return [a[0] / l, a[1] / l, a[2] / l];
+};
+const vDist = (a, b) => vLen(vSub(a, b));
+
+// ---------------------------------------------------------------------------
+// Build the dodecahedron foundation (12 normals, 20 vertices, 30 edges, faces)
+// ---------------------------------------------------------------------------
+function buildDodeca() {
+  // --- 12 face normals (icosahedron vertices) -----------------------------
+  // even permutations of (0, +-phi, +-1)
+  let rawFN = [];
+  for (const a of [PHI, -PHI])
+    for (const b of [1, -1]) {
+      rawFN.push([0, a, b]);
+      rawFN.push([b, 0, a]);
+      rawFN.push([a, b, 0]);
+    }
+  // dedup + normalize -> 12 unit normals
+  const FN = dedup(rawFN).map(vNorm);
+  if (FN.length !== 12) throw new Error(`expected 12 normals, got ${FN.length}`);
+
+  // --- 20 dodecahedron vertices -------------------------------------------
+  let rawV = [];
+  for (const a of [1, -1])
+    for (const b of [1, -1])
+      for (const c of [1, -1]) rawV.push([a, b, c]);
+  for (const b of [1, -1])
+    for (const c of [1, -1]) {
+      rawV.push([0, b * IP, c * PHI]);
+      rawV.push([b * IP, c * PHI, 0]);
+      rawV.push([c * PHI, 0, b * IP]);
+    }
+  const V = dedup(rawV);
+  if (V.length !== 20) throw new Error(`expected 20 vertices, got ${V.length}`);
+
+  // --- faces: the 5 vertices with the largest dot(V, FN[f]) ---------------
+  const faceVerts = FN.map((n) => {
+    const order = V.map((v, i) => ({ i, d: vDot(v, n) })).sort((a, b) => b.d - a.d);
+    return order.slice(0, 5).map((o) => o.i);
+  });
+
+  // --- edges: the 30 vertex pairs at minimum pairwise distance ------------
+  let minD = Infinity;
+  for (let i = 0; i < V.length; i++)
+    for (let j = i + 1; j < V.length; j++) {
+      const d = vDist(V[i], V[j]);
+      if (d < minD) minD = d;
+    }
+  const eps = minD * 1e-6;
+  const edges = []; // [vi, vj]
+  for (let i = 0; i < V.length; i++)
+    for (let j = i + 1; j < V.length; j++) {
+      if (Math.abs(vDist(V[i], V[j]) - minD) < eps) edges.push([i, j]);
+    }
+  if (edges.length !== 30) throw new Error(`expected 30 edges, got ${edges.length}`);
+
+  // --- incidence: which faces touch each vertex / each edge ---------------
+  const vertexFaces = V.map((v, vi) => {
+    const fs = [];
+    for (let f = 0; f < 12; f++) if (faceVerts[f].includes(vi)) fs.push(f);
+    return fs; // exactly 3
+  });
+  const edgeFaces = edges.map(([a, b]) => {
+    const fs = [];
+    for (let f = 0; f < 12; f++)
+      if (faceVerts[f].includes(a) && faceVerts[f].includes(b)) fs.push(f);
+    return fs; // exactly 2
+  });
+
+  return { FN, V, faceVerts, edges, vertexFaces, edgeFaces, edgeLen: minD };
+}
+
+// Deduplicate an array of [x,y,z] within a tolerance.
+function dedup(arr, tol = 1e-9) {
+  const out = [];
+  for (const p of arr) {
+    if (!out.some((q) => vDist(p, q) < tol)) out.push(p);
+  }
+  return out;
+}
+
+// Order a face's vertices CCW about its outward normal, starting anywhere.
+// CCW means: looking from the +normal side (outside), increasing angle.
+function orderCCW(vertexIndices, V, normal, centroid) {
+  // build an in-plane orthonormal basis (u, w) with w = u x normal so that
+  // angle measured by atan2(dot(.,w), dot(.,u)) increases CCW about +normal.
+  const ref = vSub(V[vertexIndices[0]], centroid);
+  const u = vNorm(vSub(ref, vScale(normal, vDot(ref, normal)))); // ref projected into plane
+  const w = vCross(normal, u); // right-handed: angle CCW about +normal
+  const withAngle = vertexIndices.map((vi) => {
+    const r = vSub(V[vi], centroid);
+    const ang = Math.atan2(vDot(r, w), vDot(r, u));
+    return { vi, ang };
+  });
+  withAngle.sort((a, b) => a.ang - b.ang);
+  return withAngle.map((o) => o.vi);
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+function makeMegaGeo(THREE, scale = 1) {
+  const { FN, V, faceVerts, edges, vertexFaces, edgeFaces, edgeLen } = buildDodeca();
+
+  // ---- faces -------------------------------------------------------------
+  const faces = FN.map((normal, index) => ({
+    index,
+    normal: normal.slice(),
+    name: `F${index}`,
+  }));
+  const faceByName = new Map(faces.map((f) => [f.name, f]));
+
+  // face centroids + CCW-ordered vertices (used for both pieces and facelets)
+  const faceCentroid = faceVerts.map((vis) => {
+    let c = [0, 0, 0];
+    for (const vi of vis) c = vAdd(c, V[vi]);
+    return vScale(c, 1 / vis.length);
+  });
+  const faceCCW = faceVerts.map((vis, f) =>
+    orderCCW(vis, V, FN[f], faceCentroid[f])
+  );
+
+  // face inradius = dot of any face vertex with unit normal (centroid dist too)
+  const faceInradius = vDot(faceCentroid[0], FN[0]); // ~1.3764
+
+  // ---- home positions ----------------------------------------------------
+  // centers: face centroid; corners: vertex; edges: edge midpoint.
+  const centerHome = faceCentroid.map((c) => c.slice());
+  const cornerHome = V.map((v) => v.slice());
+  const edgeHome = edges.map(([a, b]) => vScale(vAdd(V[a], V[b]), 0.5));
+
+  // ---- per-face facelet geometry -----------------------------------------
+  // For each face we compute the 11 facelet polygons and tag them to the
+  // owning piece (centerIndex / cornerVertexIndex / edgeIndex).
+  // Returns { center:[poly], corners:{vi->poly}, edges:{edgeIndex->poly} }.
+  function faceFacelets(f) {
+    const O = faceCentroid[f];
+    const P = faceCCW[f].map((vi) => V[vi]); // P0..P4 positions (CCW)
+    const Pidx = faceCCW[f]; // the vertex indices, same order
+    const C = P.map((Pi) => vAdd(O, vScale(vSub(Pi, O), FACELET_S))); // central pentagon
+    // division points on each outer edge Pi -> P(i+1)
+    const A = [], B = [];
+    for (let i = 0; i < 5; i++) {
+      const Pi = P[i], Pn = P[(i + 1) % 5];
+      A[i] = vAdd(Pi, vScale(vSub(Pn, Pi), FACELET_T)); // near Pi
+      B[i] = vAdd(Pi, vScale(vSub(Pn, Pi), 1 - FACELET_T)); // near P(i+1)
+    }
+
+    const center = [C[0], C[1], C[2], C[3], C[4]];
+
+    // edge facelet for outer edge (Pi,P(i+1)): quad [Ai, Bi, C(i+1), Ci]
+    const edgeFacelets = {}; // edgeIndex -> poly
+    for (let i = 0; i < 5; i++) {
+      const ni = (i + 1) % 5;
+      const va = Pidx[i], vb = Pidx[ni];
+      const ei = edgeIndexOf(va, vb);
+      edgeFacelets[ei] = [A[i], B[i], C[ni], C[i]];
+    }
+
+    // corner facelet at Pi: quad [Pi, Ai, Ci, B(i-1)]
+    const cornerFacelets = {}; // vertexIndex -> poly
+    for (let i = 0; i < 5; i++) {
+      const pi = (i + 4) % 5; // i-1
+      cornerFacelets[Pidx[i]] = [P[i], A[i], C[i], B[pi]];
+    }
+
+    return { center, corners: cornerFacelets, edges: edgeFacelets };
+  }
+
+  // map an undirected vertex pair to its edge index
+  const edgeKey = (a, b) => (a < b ? `${a},${b}` : `${b},${a}`);
+  const edgeIndexMap = new Map(edges.map(([a, b], i) => [edgeKey(a, b), i]));
+  function edgeIndexOf(a, b) {
+    const k = edgeIndexMap.get(edgeKey(a, b));
+    if (k === undefined) throw new Error(`no edge for (${a},${b})`);
+    return k;
+  }
+
+  // precompute facelets per face once
+  const faceletsByFace = FN.map((_, f) => faceFacelets(f));
+
+  // ---- assemble the 62 piece descriptors ---------------------------------
+  const sc = (p) => [p[0] * scale, p[1] * scale, p[2] * scale];
+  const scPoly = (poly) => poly.map(sc);
+
+  const pieces = [];
+
+  // 12 centers
+  for (let f = 0; f < 12; f++) {
+    pieces.push({
+      id: `center-${f}`,
+      kind: "center",
+      homeIndex: f,
+      center: sc(centerHome[f]),
+      faces: [f],
+      facelets: [{ faceIndex: f, poly: scPoly(faceletsByFace[f].center) }],
+    });
+  }
+
+  // 20 corners
+  for (let vi = 0; vi < 20; vi++) {
+    const fs = vertexFaces[vi]; // 3 faces
+    const facelets = fs.map((f) => ({
+      faceIndex: f,
+      poly: scPoly(faceletsByFace[f].corners[vi]),
+    }));
+    pieces.push({
+      id: `corner-${vi}`,
+      kind: "corner",
+      homeIndex: vi,
+      center: sc(cornerHome[vi]),
+      faces: fs.slice(),
+      facelets,
+    });
+  }
+
+  // 30 edges
+  for (let ei = 0; ei < 30; ei++) {
+    const fs = edgeFaces[ei]; // 2 faces
+    const facelets = fs.map((f) => ({
+      faceIndex: f,
+      poly: scPoly(faceletsByFace[f].edges[ei]),
+    }));
+    pieces.push({
+      id: `edge-${ei}`,
+      kind: "edge",
+      homeIndex: ei,
+      center: sc(edgeHome[ei]),
+      faces: fs.slice(),
+      facelets,
+    });
+  }
+
+  // ---- home-position lookup tables (scaled) for snapping/readState -------
+  const cornerHomeScaled = cornerHome.map(sc);
+  const edgeHomeScaled = edgeHome.map(sc);
+  const centerHomeScaled = centerHome.map(sc);
+  const allHomeByKind = {
+    corner: cornerHomeScaled,
+    edge: edgeHomeScaled,
+    center: centerHomeScaled,
+  };
+
+  // unit normals as THREE vectors (cached)
+  const normalVecs = FN.map((n) => new THREE.Vector3(n[0], n[1], n[2]));
+
+  // ---- consistent-chirality incidence (for orientation reading) ----------
+  // The Megaminx orientation laws (corners sum ≡0 mod3, edges sum ≡0 mod2)
+  // only hold if orientation is measured against face triples/pairs of a
+  // CONSISTENT chirality. We order each corner's 3 incident faces CCW around
+  // the vertex's outward direction, and each edge's 2 faces in a fixed
+  // (deterministic) order. Because every face turn is a proper (chirality-
+  // preserving) rotation, a piece's CCW face-triple always maps onto the
+  // destination slot's CCW face-triple by a pure cyclic rotation, whose offset
+  // is the twist; cyclic offsets sum to 0 mod 3 over any permutation cycle.
+  //
+  // cornerFacesCCW[v] = [f0,f1,f2] ordered CCW about the vertex direction V[v].
+  function orderFacesCCWAroundVertex(faceList, vertexPos) {
+    const axis = vNorm(vertexPos); // outward radial direction at the vertex
+    // reference in-plane direction from the first face normal
+    const n0 = FN[faceList[0]];
+    const u = vNorm(vSub(n0, vScale(axis, vDot(n0, axis))));
+    const w = vCross(axis, u); // right-handed about +axis -> CCW
+    return faceList
+      .map((f) => {
+        const n = FN[f];
+        const proj = vSub(n, vScale(axis, vDot(n, axis)));
+        const ang = Math.atan2(vDot(proj, w), vDot(proj, u));
+        return { f, ang };
+      })
+      .sort((a, b) => a.ang - b.ang)
+      .map((o) => o.f);
+  }
+  const cornerFacesCCW = V.map((v, vi) =>
+    orderFacesCCWAroundVertex(vertexFaces[vi], v)
+  );
+  // edges: order the 2 faces deterministically but consistently. We pick the
+  // ordering [fa, fb] such that (n_fa x n_fb) points along +edgeMidpoint
+  // (outward), giving a globally consistent chirality for the binary flip.
+  const edgeFacesOrdered = edgeFaces.map((fs, ei) => {
+    const [a, b] = fs;
+    const cr = vCross(FN[a], FN[b]);
+    const out = edgeHome[ei]; // outward direction at edge midpoint
+    return vDot(cr, out) >= 0 ? [a, b] : [b, a];
+  });
+
+  // ---- the 60 chiral-icosahedral rotation quaternions --------------------
+  const rotationQuats = buildRotationGroup(THREE, FN, V, edges);
+
+  // =========================================================================
+  // selectPieces(move, runtimePieces)
+  // -------------------------------------------------------------------------
+  // Return the subset of runtimePieces on the move's face: those whose live
+  // position has dot(position, faceNormal) within epsilon of the maximum such
+  // dot over all pieces. The outer layer at a face is exactly its 11 pieces.
+  // =========================================================================
+  function selectPieces(move, runtimePieces) {
+    const n = move.axis; // THREE.Vector3 unit normal
+    let maxDot = -Infinity;
+    const dots = new Array(runtimePieces.length);
+    for (let i = 0; i < runtimePieces.length; i++) {
+      const d = runtimePieces[i].position.dot(n);
+      dots[i] = d;
+      if (d > maxDot) maxDot = d;
+    }
+    // epsilon scaled to geometry: the gap between on-face and next layer is
+    // large (~0.5*scale at inradius). Use a fraction of the inradius.
+    const epsilon = 1e-3 * scale * Math.max(1, faceInradius);
+    const out = [];
+    for (let i = 0; i < runtimePieces.length; i++) {
+      if (maxDot - dots[i] < epsilon) out.push(runtimePieces[i]);
+    }
+    return out;
+  }
+
+  // =========================================================================
+  // buildMove(faceName, prime, double)
+  // -------------------------------------------------------------------------
+  // Convention for "clockwise looking at the face from outside":
+  //   A viewer outside the puzzle on the +normal side looks toward the origin,
+  //   i.e. along -n. For that viewer, set up a right-handed screen frame
+  //   (right=u, up=v, toward-viewer=+n, so u x v = n). On screen, increasing
+  //   atan2(up,right) is COUNTER-clockwise. A right-handed rotation by +theta
+  //   about +n moves a point CCW *on that screen* (verified empirically:
+  //   +theta gave +72deg screen delta). Therefore CLOCKWISE-from-outside is a
+  //   NEGATIVE rotation about +n, so the unprimed turn uses sign = -1.
+  //   (prime flips it to +theta; double scales to 144deg.)
+  // =========================================================================
+  function buildMove(faceName, prime = false, double = false) {
+    const face = faceByName.get(faceName);
+    if (!face) throw new Error(`unknown face ${faceName}`);
+    const axis = new THREE.Vector3(face.normal[0], face.normal[1], face.normal[2]);
+    const base = (2 * Math.PI) / 5; // 72 degrees
+    const sign = -1; // unprimed = clockwise viewed from outside = -theta about +n
+    let angle = (double ? 2 * base : base) * sign;
+    if (prime) angle = -angle;
+    const notation =
+      faceName + (double ? "2" : "") + (prime ? "'" : "");
+    return {
+      axis,
+      axisName: faceName,
+      target: angle,
+      done: 0,
+      notation,
+    };
+  }
+
+  // =========================================================================
+  // snapPiece(piece) — kill floating-point drift.
+  //   position -> nearest home position (scaled) of the piece's kind.
+  //   quaternion -> nearest of the 60 valid orientations.
+  // =========================================================================
+  function snapPiece(piece) {
+    const kind = kindOfId(piece.id);
+    const homes = allHomeByKind[kind];
+    // nearest home position
+    let bestI = 0, bestD = Infinity;
+    for (let i = 0; i < homes.length; i++) {
+      const h = homes[i];
+      const dx = piece.position.x - h[0];
+      const dy = piece.position.y - h[1];
+      const dz = piece.position.z - h[2];
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < bestD) { bestD = d; bestI = i; }
+    }
+    piece.position.set(homes[bestI][0], homes[bestI][1], homes[bestI][2]);
+
+    // nearest orientation quaternion (max |dot| == min angle)
+    let bestQ = rotationQuats[0], bestAbs = -1;
+    const q = piece.quaternion;
+    for (let i = 0; i < rotationQuats.length; i++) {
+      const r = rotationQuats[i];
+      const dot = Math.abs(q.x * r.x + q.y * r.y + q.z * r.z + q.w * r.w);
+      if (dot > bestAbs) { bestAbs = dot; bestQ = r; }
+    }
+    piece.quaternion.copy(bestQ);
+    return piece;
+  }
+
+  // =========================================================================
+  // readState(runtimePieces) — canonical logical state.
+  //   cp[slot]   = which corner-home index currently occupies slot
+  //   co[slot]   = corner orientation 0..2
+  //   ep[slot]   = which edge-home index currently occupies slot
+  //   eo[slot]   = edge orientation 0..1
+  // Permutation: nearest-home matching of live positions.
+  // Orientation: rotate the piece's reference sticker direction by its live
+  //   quaternion; see which incident face normal it points along. The twist is
+  //   the index (mod 3 / mod 2) of that face within the slot's ordered faces.
+  // =========================================================================
+  function readState(runtimePieces) {
+    const cp = new Array(20).fill(-1);
+    const co = new Array(20).fill(0);
+    const ep = new Array(30).fill(-1);
+    const eo = new Array(30).fill(0);
+
+    // For each home SLOT, find which piece sits there (nearest home position
+    // matching, but we already know each piece reports a home via kind+id, so
+    // instead we go piece -> slot via nearest home, which is a bijection).
+    for (const p of runtimePieces) {
+      const kind = kindOfId(p.id);
+      if (kind === "center") continue;
+      const homeIndex = idIndex(p.id); // the piece's identity (home it belongs to)
+      const homes = allHomeByKind[kind];
+      // nearest slot for this piece's current position
+      let slot = 0, bestD = Infinity;
+      for (let i = 0; i < homes.length; i++) {
+        const h = homes[i];
+        const dx = p.position.x - h[0];
+        const dy = p.position.y - h[1];
+        const dz = p.position.z - h[2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bestD) { bestD = d; slot = i; }
+      }
+      if (kind === "corner") {
+        cp[slot] = homeIndex;
+        co[slot] = cornerOrientation(p, slot);
+      } else {
+        ep[slot] = homeIndex;
+        eo[slot] = edgeOrientation(p, slot);
+      }
+    }
+    return { cp, co, ep, eo };
+  }
+
+  // --- orientation reading helpers ----------------------------------------
+  // The "marked sticker" of a piece is its first CCW-ordered home face. After
+  // the piece's live quaternion is applied to that home face normal, the result
+  // points along one of the destination slot's incident face normals.
+  // Orientation = the index of that face within the slot's CCW-ordered face
+  // list. Because both piece and slot triples share the CCW chirality and face
+  // turns are proper rotations, this is the standard Megaminx twist and its sum
+  // is conserved (mod 3 for corners, mod 2 for edges).
+
+  function cornerOrientation(p, slot) {
+    const homeIndex = idIndex(p.id);
+    const refFace = cornerFacesCCW[homeIndex][0]; // piece's marked face
+    const refDir = normalVecs[refFace].clone().applyQuaternion(p.quaternion);
+    return nearestFaceIndexInList(refDir, cornerFacesCCW[slot]); // 0..2
+  }
+
+  function edgeOrientation(p, slot) {
+    const homeIndex = idIndex(p.id);
+    const refFace = edgeFacesOrdered[homeIndex][0]; // piece's marked face
+    const refDir = normalVecs[refFace].clone().applyQuaternion(p.quaternion);
+    return nearestFaceIndexInList(refDir, edgeFacesOrdered[slot]); // 0..1
+  }
+
+  // Given a direction and a list of face indices, return the position (0..n-1)
+  // in the list whose face normal is closest (max dot) to the direction.
+  function nearestFaceIndexInList(dir, faceList) {
+    let best = 0, bestDot = -Infinity;
+    for (let i = 0; i < faceList.length; i++) {
+      const d = dir.dot(normalVecs[faceList[i]]);
+      if (d > bestDot) { bestDot = d; best = i; }
+    }
+    return best;
+  }
+
+  // ---- helpers ------------------------------------------------------------
+  function kindOfId(id) {
+    if (id.startsWith("corner")) return "corner";
+    if (id.startsWith("edge")) return "edge";
+    return "center";
+  }
+  function idIndex(id) {
+    return parseInt(id.slice(id.indexOf("-") + 1), 10);
+  }
+
+  return {
+    pieces,
+    faces,
+    selectPieces,
+    buildMove,
+    snapPiece,
+    readState,
+    // extras useful for the integrator / tests:
+    rotationQuats,
+    faceInradius,
+    edgeLen,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Build the 60-element chiral icosahedral rotation group as THREE quaternions.
+// We seed with a few generators (face 72-degree turns) and BFS-close the set
+// under multiplication, deduping by quaternion (q ~ -q identified). The closure
+// of any two suitable rotations of the icosahedral group yields all 60.
+// ---------------------------------------------------------------------------
+function buildRotationGroup(THREE, FN, V, edges) {
+  const gens = [];
+  // generator 1: 72 deg about face axis 0
+  const g1 = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(FN[0][0], FN[0][1], FN[0][2]),
+    (2 * Math.PI) / 5
+  );
+  // generator 2: 72 deg about a *different, non-parallel* face axis.
+  // pick the face axis least parallel to FN[0] to ensure they generate the
+  // whole group (two non-coaxial rotations generate icosahedral group).
+  let pick = 1, bestAbs = Infinity;
+  for (let f = 1; f < FN.length; f++) {
+    const a = Math.abs(
+      FN[f][0] * FN[0][0] + FN[f][1] * FN[0][1] + FN[f][2] * FN[0][2]
+    );
+    if (a < bestAbs) { bestAbs = a; pick = f; }
+  }
+  const g2 = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(FN[pick][0], FN[pick][1], FN[pick][2]),
+    (2 * Math.PI) / 5
+  );
+  gens.push(g1, g2);
+
+  const elems = [];
+  const keyOf = (q) => {
+    // identify q and -q: canonicalize sign by first significant component.
+    let x = q.x, y = q.y, z = q.z, w = q.w;
+    const arr = [x, y, z, w];
+    let s = 1;
+    for (const c of arr) {
+      if (Math.abs(c) > 1e-6) { s = c < 0 ? -1 : 1; break; }
+    }
+    const r = (v) => Math.round((v * s) * 1e5) / 1e5;
+    return `${r(x)},${r(y)},${r(z)},${r(w)}`;
+  };
+
+  const seen = new Set();
+  const push = (q) => {
+    const qn = q.clone().normalize();
+    const k = keyOf(qn);
+    if (!seen.has(k)) { seen.add(k); elems.push(qn); return true; }
+    return false;
+  };
+
+  // start from identity
+  push(new THREE.Quaternion(0, 0, 0, 1));
+  // BFS closure
+  let frontier = elems.slice();
+  // also ensure generators are in
+  for (const g of gens) push(g);
+  frontier = elems.slice();
+
+  let guard = 0;
+  while (frontier.length && guard++ < 1000) {
+    const next = [];
+    for (const a of frontier) {
+      for (const g of gens) {
+        const prod = a.clone().multiply(g);
+        if (push(prod)) next.push(prod);
+        const prod2 = a.clone().multiply(g.clone().invert());
+        if (push(prod2)) next.push(prod2);
+      }
+    }
+    frontier = next;
+  }
+
+  if (elems.length !== 60) {
+    throw new Error(`rotation group closure gave ${elems.length}, expected 60`);
+  }
+  return elems;
+}
+
+return makeMegaGeo;
+})();
+
+
+/* ===== Megaminx instance + meshes + registry ===== */
+const MEGA_SCALE = 1.0;
+const megaGeo = makeMegaGeo(THREE, MEGA_SCALE);
+const megaFaceNormals = megaGeo.faces.map(f => f.normal);
+// 12 distinct face colours; opposite faces get a contrasting pair.
+const MEGA_FACE_HEX = [0xf4f4f4, 0x2244cc, 0xd91f33, 0x12a150, 0x8e44ad, 0xf6d000,
+                       0xff66aa, 0xa6e22e, 0xe8dca0, 0x9aa0a6, 0xf07b1d, 0x33c4e8];
+const MEGA_DARK = new THREE.MeshStandardMaterial({ color: 0x18181d, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide });
+const megaGroup = new THREE.Group();
+megaGroup.visible = false;
+scene.add(megaGroup);
+// single-char face tokens a..l  <->  geo face index 0..11 (so the token parser's tok[0] works)
+const MEGA_KEYS = ['a','b','c','d','e','f','g','h','i','j','k','l'];
+const megaKeyToFace = k => 'F' + MEGA_KEYS.indexOf(k);
+
+// Per-corner sticker rounding (QiYi style, reusing pyraRoundedOutline). A facelet
+// corner near the FACE CENTRE (the central pentagon's vertices + the inner corners
+// of the surrounding edge/corner facelets) gets a BIG radius — so the central
+// pentagons read as rounded and bubble-gap at their vertices; the OUTER face-edge /
+// face-corner corners on the perimeter get a SMALL radius.
+const MEGA_INRADIUS = megaGeo.faceInradius * MEGA_SCALE;
+const megaFaceCenter = megaFaceNormals.map(n => [n[0] * MEGA_INRADIUS, n[1] * MEGA_INRADIUS, n[2] * MEGA_INRADIUS]);
+const _md = (a, b) => Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+const MEGA_CIRCUM = (() => { let mx = 0; for (const d of megaGeo.pieces) for (const fl of d.facelets) if (fl.faceIndex === 0) for (const p of fl.poly) mx = Math.max(mx, _md(p, megaFaceCenter[0])); return mx; })();
+const MEGA_ROUND_THR = 0.6 * MEGA_CIRCUM;   // inner (Ci ring) ≈0.44R vs outer ≥0.8R — clean split
+const MEGA_CUT_BIG = 0.36, MEGA_CUT_SMALL = 0.09;
+
+const megaPieces = megaGeo.pieces.map(desc => {
+  const g = new THREE.Group();
+  g.position.set(desc.center[0], desc.center[1], desc.center[2]);
+  const O = [-desc.center[0], -desc.center[1], -desc.center[2]];      // puzzle centre, piece-local
+  const dark = [];
+  for (const fl of desc.facelets) {
+    const cn = megaFaceNormals[fl.faceIndex];                          // already unit
+    const poly = fl.poly.map(v => [v[0] - desc.center[0], v[1] - desc.center[1], v[2] - desc.center[2]]);
+    const pc = poly.reduce((a, p) => [a[0]+p[0], a[1]+p[1], a[2]+p[2]], [0,0,0]).map(x => x / poly.length);
+    // dark solid body: the outer polygon (fan from its centroid) + skirts down to the puzzle centre
+    for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i+1) % poly.length]; dark.push(...pc, ...a, ...b); }
+    for (let i = 0; i < poly.length; i++) { const a = poly[i], b = poly[(i+1) % poly.length]; dark.push(...a, ...b, ...O); }
+    // coloured facelet: inset for grout, corners filleted per-corner (big toward the
+    // face centre, small on the perimeter), then raised + fan-triangulated.
+    const INSET = 0.9, RAISE = 0.015, SEG = 5;
+    const r = [cn[0]*RAISE, cn[1]*RAISE, cn[2]*RAISE];
+    const cuts = fl.poly.map(p => (_md(p, megaFaceCenter[fl.faceIndex]) < MEGA_ROUND_THR) ? MEGA_CUT_BIG : MEGA_CUT_SMALL);
+    const ip = poly.map(p => [pc[0]+(p[0]-pc[0])*INSET, pc[1]+(p[1]-pc[1])*INSET, pc[2]+(p[2]-pc[2])*INSET]);
+    const outline = pyraRoundedOutline(ip, cuts, SEG).map(q => [q[0]+r[0], q[1]+r[1], q[2]+r[2]]);
+    const Cr = [pc[0]+r[0], pc[1]+r[1], pc[2]+r[2]];
+    const cpos = [], cnrm = [];
+    for (let i = 0; i < outline.length; i++) { const a = outline[i], b = outline[(i+1) % outline.length]; cpos.push(...Cr, ...a, ...b); for (let k=0;k<3;k++) cnrm.push(cn[0],cn[1],cn[2]); }
+    const fg = new THREE.BufferGeometry();
+    fg.setAttribute('position', new THREE.Float32BufferAttribute(cpos, 3));
+    fg.setAttribute('normal', new THREE.Float32BufferAttribute(cnrm, 3));
+    const fmesh = new THREE.Mesh(fg, new THREE.MeshStandardMaterial({ color: MEGA_FACE_HEX[fl.faceIndex], roughness: 0.45, metalness: 0.05, side: THREE.DoubleSide }));
+    fmesh.userData.faceIndex = fl.faceIndex;                           // for click-to-turn raycast
+    g.add(fmesh);
+  }
+  const dg = new THREE.BufferGeometry();
+  dg.setAttribute('position', new THREE.Float32BufferAttribute(dark, 3));
+  dg.computeVertexNormals();
+  g.add(new THREE.Mesh(dg, MEGA_DARK));
+  megaGroup.add(g);
+  return { id: desc.id, kind: desc.kind, faces: desc.faces, home: desc.center.slice(),
+           position: g.position, quaternion: g.quaternion, group: g };
+});
+
+function megaReset() { for (const p of megaPieces) { p.position.set(p.home[0], p.home[1], p.home[2]); p.quaternion.set(0, 0, 0, 1); } }
+function megaReadState() { return megaGeo.readState(megaPieces); }
+function megaSolved() { const s = megaReadState(); return s.cp.every((v,i)=>v===i) && s.co.every(v=>v===0) && s.ep.every((v,i)=>v===i) && s.eo.every(v=>v===0); }
+function megaScramble() {
+  const toks = []; let last = -1;
+  for (let i = 0; i < 40; i++) { let f; do { f = Math.floor(Math.random()*12); } while (f === last); last = f; toks.push(MEGA_KEYS[f] + (Math.random() < 0.5 ? "'" : '')); }
+  return toks;
+}
+// Minimal phase finalize: stamp the move, stop the clock + record when solved.
+function megaFinalize() {
+  const entry = history[settleIndex++];
+  if (!entry) return;
+  if (entry.phase !== 'scramble') {
+    entry.phase = 'solve';
+    if (timerState === 'running' && megaSolved()) { timerState = 'done'; timerEnd = entry.t; if (drillTarget == null) recordSolve(); }
+  }
+  renderHistory();
+}
+
+const puzzleMega = {
+  id: 'megaminx', name: 'Megaminx',
+  group: megaGroup,
+  DEFS: Object.fromEntries(MEGA_KEYS.map(c => [c, {}])),                // tok[0] lookup -> isRot false
+  buildMove: (f, p, d) => megaGeo.buildMove(megaKeyToFace(f), p, d),
+  selectPieces: (move) => megaGeo.selectPieces(move, megaPieces),
+  snapPiece: (p) => megaGeo.snapPiece(p),
+  build: megaReset,
+  updateNet: () => {},
+  updateProjections: () => {},
+  finalizeMovePhase: megaFinalize,
+  readState: megaReadState,
+  scramble: megaScramble,
+  storageKey: 'mega-solves',
+  keymap: { faceKeys: Object.fromEntries(MEGA_KEYS.map(c => [c, c])) },  // a..l turn faces (Shift = prime)
+  phaseConfig: { order: ['solve'], labels: { solve: 'Solve' } },
+  drillLabel: '', makeDrill: () => null, solverLabel: '', solverGoals: [], solve: () => null,
+  dockGroups: [],
+  helpHTML: `<div><b>Click a face</b> to turn it</div>
+    <div><kbd>Shift</kbd> + click = prime (')</div>
+    <div>keys <kbd>a</kbd>–<kbd>l</kbd> = the 12 faces</div>
+    <div><kbd>Space</kbd> = pause / hide</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+
+/* ===== Megaminx click-to-turn: a click (not a drag) on a face turns it; Shift = prime. ===== */
+const megaRaycaster = new THREE.Raycaster();
+const _megaPtr = new THREE.Vector2();
+let _megaDown = null;
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  _megaDown = (puzzle.id === 'megaminx' && e.button === 0) ? { x: e.clientX, y: e.clientY } : null;
+});
+renderer.domElement.addEventListener('pointerup', (e) => {
+  if (puzzle.id !== 'megaminx' || !_megaDown || paused) { _megaDown = null; return; }
+  const moved = Math.hypot(e.clientX - _megaDown.x, e.clientY - _megaDown.y);
+  _megaDown = null;
+  if (moved > 5) return;                                     // it was an orbit drag, not a click
+  const rect = renderer.domElement.getBoundingClientRect();
+  _megaPtr.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  _megaPtr.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  megaRaycaster.setFromCamera(_megaPtr, camera);
+  const hit = megaRaycaster.intersectObjects(megaGroup.children, true)
+    .find(h => h.object.userData && h.object.userData.faceIndex !== undefined);
+  if (hit) applyMove(MEGA_KEYS[hit.object.userData.faceIndex] + (e.shiftKey ? "'" : ''), 'solve');
+});
+
+
+/* ===== 3×3 (Rubik's Cube) — reuses the 2×2 cubie engine (buildMove / snapCubie /
+   selectCubies-by-axis-sign), with 26 cubies and the middle layers present.
+   cube3Group is scaled so the 3×3 frames like the 2×2 (same camera). ===== */
+const cube3Group = new THREE.Group();
+cube3Group.visible = false;
+cube3Group.scale.setScalar(0.64);
+scene.add(cube3Group);
+let cubies3 = [];
+function buildCube3() {
+  for (const c of cubies3) cube3Group.remove(c);
+  cubies3 = [];
+  for (let x = -1; x <= 1; x++) for (let y = -1; y <= 1; y++) for (let z = -1; z <= 1; z++) {
+    if (x === 0 && y === 0 && z === 0) continue;                 // no visible core cubie
+    const cubie = new THREE.Group();
+    cubie.position.set(x, y, z);
+    cubie.add(new THREE.Mesh(bodyGeo, bodyMat));
+    const outward = { '+x': x > 0, '-x': x < 0, '+y': y > 0, '-y': y < 0, '+z': z > 0, '-z': z < 0 };
+    for (const face in outward) {
+      if (!outward[face]) continue;
+      const t = new THREE.Mesh(tileGeo, makeTileMaterial(COLORS[face]));
+      const ft = FACE_TRANSFORMS[face];
+      t.rotation.set(...ft.rot); t.position.set(...ft.pos);
+      const s = face[0] === '+' ? 1 : -1;
+      const nrm = { x: [s, 0, 0], y: [0, s, 0], z: [0, 0, s] }[face[1]];
+      t.userData = { isTile: true, color: COLORS[face], normal: new THREE.Vector3(...nrm) };
+      cubie.add(t);
+    }
+    cube3Group.add(cubie);
+    cubies3.push(cubie);
+  }
+}
+buildCube3();
+function selectCubies3(axis, sign) {
+  if (sign === undefined) return cubies3.slice();                // whole-cube rotation
+  return cubies3.filter(c => Math.sign(c.position[axis]) === sign);
+}
+const _c3n = new THREE.Vector3();
+function cube3Solved() {                                          // every face a single colour
+  const faces = {};
+  for (const c of cubies3) for (const t of c.children) {
+    if (!t.userData || !t.userData.isTile) continue;
+    _c3n.copy(t.userData.normal).applyQuaternion(c.quaternion);
+    const ax = Math.abs(_c3n.x) >= Math.abs(_c3n.y) && Math.abs(_c3n.x) >= Math.abs(_c3n.z) ? 'x'
+             : Math.abs(_c3n.y) >= Math.abs(_c3n.z) ? 'y' : 'z';
+    const key = ax + (_c3n[ax] > 0 ? '+' : '-');
+    (faces[key] || (faces[key] = new Set())).add(t.userData.color);
+  }
+  return Object.values(faces).every(s => s.size === 1);
+}
+function cube3Finalize() {
+  const entry = history[settleIndex++];
+  if (!entry) return;
+  if (entry.phase !== 'scramble') {
+    entry.phase = 'solve';
+    if (timerState === 'running' && cube3Solved()) { timerState = 'done'; timerEnd = entry.t; if (drillTarget == null) recordSolve(); }
+  }
+  renderHistory();
+}
+function cube3Scramble() {                                        // random-move scramble (no consecutive same axis)
+  const faces = ['R', 'L', 'U', 'D', 'F', 'B'], axisOf = { R: 'x', L: 'x', U: 'y', D: 'y', F: 'z', B: 'z' };
+  const toks = []; let lastAxis = '';
+  for (let i = 0; i < 25; i++) {
+    let f; do { f = faces[Math.floor(Math.random() * 6)]; } while (axisOf[f] === lastAxis);
+    lastAxis = axisOf[f];
+    const r = Math.random(); toks.push(f + (r < 0.34 ? '' : r < 0.67 ? "'" : '2'));
+  }
+  return toks;
+}
+const puzzleCube3 = {
+  id: '3x3', name: '3×3',
+  group: cube3Group,
+  DEFS,                                                          // reuse R L U D F B + x y z
+  buildMove,
+  selectPieces: (m) => selectCubies3(m.axisName, m.sign),
+  snapPiece: snapCubie,
+  build: buildCube3,
+  updateNet: () => {},
+  updateProjections: () => {},
+  finalizeMovePhase: cube3Finalize,
+  readState: () => null,
+  scramble: cube3Scramble,
+  storageKey: '3x3-solves',
+  keymap: { faceKeys: FACE_KEYS, primeKeys: PRIME_KEYS, rotKeys: ROT_KEYS },
+  phaseConfig: { order: ['solve'], labels: { solve: 'Solve' } },
+  drillLabel: '', makeDrill: () => null, solverLabel: '', solverGoals: [], solve: () => null,
+  dockGroups: [
+    { label: 'Faces', moves: ['R', 'L', 'U', 'D', 'F', 'B'], variants: ['', "'", '2'] },
+    { label: 'Rotations', moves: ['x', 'y', 'z'], variants: ['', "'", '2'] },
+  ],
+  helpHTML: `<div><b>Keys:</b> R L U D F B turn faces</div>
+    <div><kbd>Shift</kbd> + key = prime (')</div>
+    <div>primes: E I G S K N</div>
+    <div>x y z = cube rotations</div>
+    <div><kbd>Space</kbd> = pause / hide</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+
+const PUZZLES = { '2x2': puzzle2x2, '3x3': puzzleCube3, 'pyraminx': puzzlePyra, 'megaminx': puzzleMega };
 puzzle = puzzle2x2;
 buildDock();
 buildSolver();
@@ -4236,7 +5078,9 @@ function switchPuzzle(id) {
   setPaused(false);
   drillTarget = null;                                       // don't carry a drill across puzzles
   cubeGroup.visible = (id === '2x2');
+  cube3Group.visible = (id === '3x3');
   pyraGroup.visible = (id === 'pyraminx');
+  megaGroup.visible = (id === 'megaminx');
   projGroup.visible = (id === '2x2');                       // 2×2 projections
   pyraProjGroup.visible = (id === 'pyraminx');              // Pyraminx projections
   netEl.style.visibility = (id === '2x2') ? 'visible' : 'hidden';
@@ -4250,6 +5094,10 @@ function switchPuzzle(id) {
     const fit = Math.max(9.5, Math.min(21, 10.5 / Math.min(1, camera.aspect)));   // zoom out more on narrow/portrait screens
     camera.position.copy(best).multiplyScalar(fit);
     controls.update();
+  } else if (id === 'megaminx') {                           // dodecahedron ~1.7× the 2×2's size
+    const fit = Math.max(8, Math.min(18, 9 / Math.min(1, camera.aspect)));
+    camera.position.set(0.46, 0.42, 0.78).normalize().multiplyScalar(fit);
+    controls.update();
   } else {
     camera.position.set(4.6, 4.2, 6.5); controls.update();
   }
@@ -4257,6 +5105,8 @@ function switchPuzzle(id) {
   resetState(true);
   buildDock();
   buildSolver();
+  solverEl.style.display = (puzzle.solverGoals && puzzle.solverGoals.length) ? '' : 'none';   // no first-layer solver yet for Megaminx
+  drillEl.style.display = puzzle.drillLabel ? '' : 'none';                                     // no drills yet for Megaminx
   drillLabelEl.textContent = puzzle.drillLabel;
   drillResultEl.textContent = '';
   document.querySelector('.help').innerHTML = puzzle.helpHTML;
