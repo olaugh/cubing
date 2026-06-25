@@ -89,8 +89,6 @@
   button.btn:active { transform: translateY(1px); }
   button.btn.primary { background: var(--accent); border-color: transparent; color: #fff; }
   button.btn.primary:hover { background: #7d8cff; }
-  @keyframes btnpulse { 0% { box-shadow: 0 0 0 0 rgba(108,124,255,0.55); } 100% { box-shadow: 0 0 0 11px rgba(108,124,255,0); } }
-  button.btn.pulse { animation: btnpulse 0.5s ease-out; }
 
   /* ---- Session stats panel (toggled) ---- */
   .stats {
@@ -308,7 +306,7 @@
   }
   .pyra-net.on { display: block; }
   .pyra-net svg { display: block; width: 172px; height: 156px; overflow: visible; }
-  .pyra-net polygon { stroke: #15151b; stroke-width: 0.8; stroke-linejoin: round; }
+  .pyra-net path { stroke: #15151b; stroke-width: 0.8; stroke-linejoin: round; }
 
   .help {
     font-size: 11.5px; color: var(--text-dim); line-height: 1.7;
@@ -883,8 +881,9 @@ function compressMoves(toks) {
 function renderHistory() {
   if (history.length === 0) {
     moveCountEl.textContent = '0 moves';
+    const phaseStr = puzzle.phaseConfig.order.map(p => puzzle.phaseConfig.labels[p]).join(' → ');
     historyScroll.innerHTML =
-      '<div class="empty-hint">Turn a face to begin. Moves are grouped by phase: FLL → OLL → PBL.</div>';
+      `<div class="empty-hint">Turn a face to begin. Moves are grouped by phase: ${phaseStr}.</div>`;
     return;
   }
 
@@ -922,26 +921,14 @@ function renderHistory() {
 /* ============================================================
    Input — apply a move from notation
    ============================================================ */
-const scrambleBtnEl = document.getElementById('scrambleBtn');
-let scrambleHintT = 0;
-function hintScramble() {   // gentle nudge: pulse the Scramble button when a face turn is ignored
-  const now = performance.now();
-  if (now - scrambleHintT < 600) return;
-  scrambleHintT = now;
-  scrambleBtnEl.classList.remove('pulse'); void scrambleBtnEl.offsetWidth; scrambleBtnEl.classList.add('pulse');
-}
 function applyMove(tok, phase = 'solve', force = false) {
   const _d = puzzle.DEFS[tok[0]];
   const isRot = !!(_d && _d.rot);   // cube rotation vs face turn (puzzle-defined)
   if (phase !== 'scramble') {
-    // Real-timer gating. Face turns from the user only register during a live, settled attempt;
-    // cube rotations stay free (for viewing) and never start the clock. `force` lets deliberate
-    // "demonstrate" actions (FLL solver / case-helper apply) run regardless of timer state.
+    // The puzzle is always free to play — face turns and rotations apply whenever the user
+    // wants. A move only becomes a *tracked* attempt (recorded / phased / timed) once a
+    // scramble is shown, so turning a solved puzzle just messes around, harmlessly.
     if (timerState === 'inspecting' && inspectStart === 0) return;            // scramble still settling
-    if (!force) {
-      const active = (timerState === 'inspecting' && inspectStart > 0) || timerState === 'running';
-      if (!isRot && !active) { hintScramble(); return; }                      // ignore stray face turns until a scramble is shown
-    }
   }
   // Genuine user input (key / dock) is in screen-role space for puzzles with
   // pose-relative keys (Pyraminx); resolve to the actual world move for the engine.
@@ -2268,11 +2255,13 @@ function deriveVertexMove(v, sign) {
 // MOVE_PYRA order: U,U',L,L',R,R',B,B'   (index 0..7)
 const MOVE_PYRA = [];
 {
+  // Unprimed = -1 sign (clockwise looking at the tip = standard Pyraminx). The
+  // engine's TURN_SIGN matches this; the consistency gate verifies readState == model.
   const order = [
-    [0, +1], [0, -1],
-    [1, +1], [1, -1],
-    [2, +1], [2, -1],
-    [3, +1], [3, -1],
+    [0, -1], [0, +1],
+    [1, -1], [1, +1],
+    [2, -1], [2, +1],
+    [3, -1], [3, +1],
   ];
   for (const [v, s] of order) MOVE_PYRA.push(deriveVertexMove(v, s));
 }
@@ -2288,7 +2277,7 @@ function tipMoveInfo(token) {
   const base = token[0]; // u l r b
   const prime = token.length > 1 && token[1] === "'";
   const v = { u: 0, l: 1, r: 2, b: 3 }[base];
-  const amt = prime ? 2 : 1;
+  const amt = prime ? 1 : 2;   // unprimed tip = clockwise (matches the vertex-move flip)
   return { v, amt };
 }
 function isTipToken(token) { return /^[ulrb]'?$/.test(token); }
@@ -2806,13 +2795,16 @@ function rotateAUF(s) {
  *   return `auf` (0..2) and `solveFromHere(state)` semantics are verified in the
  *   self-test: applying `alg` to rotateAUF^auf(state) yields solved.
  * --------------------------------------------------------------------------*/
+// Algs are prime-toggled from the original CCW-convention solutions so they remain
+// valid last-3-edges solutions under the corrected clockwise generators (toggling
+// each move's prime preserves a sequence's physical effect across the chirality flip).
 const L3E_CASES = {
-  Skip:         { sig: '345/000', alg: [] },
-  Sledgehammer: { sig: '534/110', alg: ["R'", "L", "R", "L'"] },
-  Hedgeslammer: { sig: '453/101', alg: ["L", "R'", "L'", "R"] },
-  Cycle_CW:     { sig: '534/000', alg: ["L", "R'", "U", "R'", "U'", "R'", "L'"] },
-  Cycle_CCW:    { sig: '453/000', alg: ["L", "R", "U", "R", "U'", "R", "L'"] },
-  TwoFlip:      { sig: '345/011', alg: ["L", "R'", "L'", "R", "B'", "R", "B", "R'"] },
+  Skip:         { alg: [] },
+  Sledgehammer: { alg: ["R", "L'", "R'", "L"] },
+  Hedgeslammer: { alg: ["L'", "R", "L", "R'"] },
+  Cycle_CW:     { alg: ["L'", "R", "U'", "R", "U", "R", "L"] },
+  Cycle_CCW:    { alg: ["L'", "R'", "U'", "R'", "U", "R'", "L"] },
+  TwoFlip:      { alg: ["L'", "R", "L", "R'", "B", "R'", "B'", "R"] },
 };
 // Back-compat alias name expected by some callers.
 const L3E_ALGS = Object.fromEntries(
@@ -2821,6 +2813,11 @@ const L3E_ALGS = Object.fromEntries(
 
 function bottomSig(s) {
   return Array.from(s.ep.slice(3)).join('') + '/' + Array.from(s.eo.slice(3)).join('');
+}
+// Derive each L3E case signature from the model so it tracks the move chirality
+// (no hand-tabulated sigs to fall out of sync when the turn convention changes).
+for (const name in L3E_CASES) {
+  L3E_CASES[name].sig = bottomSig(applySeq(solvedState(), invertSeq(L3E_CASES[name].alg)));
 }
 
 // The first layer (top edges around vertex U) must be solved for an L3E case.
@@ -3379,8 +3376,10 @@ function makePyraGeo(THREE, PYRA, scale) {
   //   produces the same permutation as PYRA.applyMovePyra. It is verified (and
   //   would be flipped) by the consistency gate.
   // --------------------------------------------------------------------------
-  // Settled sign: +1 means unprimed turn = +120 deg about VERTS[vertex].
-  const TURN_SIGN = +1;
+  // Settled sign: -1 means unprimed turn = -120 deg about VERTS[vertex], i.e.
+  // CLOCKWISE looking at the tip — the standard Pyraminx convention. (Must stay in
+  // sync with the PYRA model's generator order; the consistency gate verifies it.)
+  const TURN_SIGN = -1;
   const TWO_PI_3 = (2 * Math.PI) / 3;
 
   function buildMove(face, prime, double) {
@@ -3647,6 +3646,45 @@ scene.add(pyraGroup);
 // stickers inset (grout) and raised on top. So a turning layer never reveals a
 // hollow interior, and DoubleSide stickers never cull to black.
 const PYRA_DARK = new THREE.MeshStandardMaterial({ color: 0x2b2b33, roughness: 0.8, metalness: 0.0, side: THREE.DoubleSide });
+// Fillet the 3 corners of a (coplanar) triangle into a smooth rounded-triangle loop
+// — the QiYi sticker look. `cut` = fraction of each edge pulled back from a corner
+// (a number for all 3, or a per-corner [c0,c1,c2]); `seg` = arc resolution. Each
+// corner becomes a quadratic Bézier fillet through the original corner. A big cut on
+// the corner at a face centre (where six stickers meet) leaves the hexagon star; a
+// small cut on the outer tip/edge corners just softens them.
+function pyraRoundedOutline(V, cut, seg) {
+  const cuts = Array.isArray(cut) ? cut : [cut, cut, cut];
+  const lerp = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+  const qbez = (a, c, b, t) => { const u = 1 - t, w0 = u * u, w1 = 2 * u * t, w2 = t * t;
+    return [w0 * a[0] + w1 * c[0] + w2 * b[0], w0 * a[1] + w1 * c[1] + w2 * b[1], w0 * a[2] + w1 * c[2] + w2 * b[2]]; };
+  const out = [];
+  for (let i = 0; i < 3; i++) {
+    const Vc = V[i], prev = V[(i + 2) % 3], next = V[(i + 1) % 3], ci = cuts[i];
+    const A = lerp(Vc, prev, ci), B = lerp(Vc, next, ci);
+    out.push(A);
+    for (let s = 1; s < seg; s++) out.push(qbez(A, Vc, B, s / seg));
+    out.push(B);
+  }
+  return out;
+}
+// Face centres in model coords (the lone interior subdivision vertex per face, where
+// six stickers meet) + per-corner cuts: big radius only on the centre corner.
+const PYRA_FACE_CENTER3 = [0, 1, 2, 3].map(f => {
+  const a = [0, 0, 0]; let n = 0;
+  for (const d of pyraGeo.pieces) for (const fl of d.facelets) if (fl.faceIndex === f)
+    for (const v of fl.tri) { a[0] += v[0]; a[1] += v[1]; a[2] += v[2]; n++; }
+  return [a[0] / n, a[1] / n, a[2] / n];
+});
+const PYRA_CUT_HEX = 0.32, PYRA_CUT_TIP = 0.09;   // inner (hexagon-star) vs outer (tip/edge) corner radius
+// Given a facelet's 3 corners (model coords) on face f, return [cut0,cut1,cut2].
+function pyraCornerCuts(cornersModel, f) {
+  const C = PYRA_FACE_CENTER3[f];
+  let edge2 = Infinity;                                 // squared length of a small-triangle edge
+  for (let i = 0; i < 3; i++) { const a = cornersModel[i], b = cornersModel[(i + 1) % 3];
+    const e = (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2 + (a[2] - b[2]) ** 2; if (e < edge2) edge2 = e; }
+  const thr = 0.4 * 0.4 * edge2;
+  return cornersModel.map(p => ((p[0] - C[0]) ** 2 + (p[1] - C[1]) ** 2 + (p[2] - C[2]) ** 2 < thr) ? PYRA_CUT_HEX : PYRA_CUT_TIP);
+}
 const pyraPieces = pyraGeo.pieces.map(desc => {
   const g = new THREE.Group();
   g.position.set(desc.center[0], desc.center[1], desc.center[2]);
@@ -3665,14 +3703,26 @@ const pyraPieces = pyraGeo.pieces.map(desc => {
     // dark solid body: the outer face + 3 skirts down to the puzzle centre
     dark.push(...full[0], ...full[1], ...full[2]);
     for (let i = 0; i < 3; i++) { const a = full[i], b = full[(i + 1) % 3]; dark.push(...a, ...b, ...O); }
-    // coloured sticker: inset toward its centroid (grout) and raised off the dark base
+    // coloured sticker: a rounded-corner triangle (QiYi style). Inset for grout, the
+    // three corners filleted so the six meeting at each face centre leave a hexagonal
+    // gap, then raised off the dark base and fan-triangulated from the centroid.
     const cx = (full[0][0] + full[1][0] + full[2][0]) / 3, cy = (full[0][1] + full[1][1] + full[2][1]) / 3, cz = (full[0][2] + full[1][2] + full[2][2]) / 3;
-    const INSET = 0.9, RAISE = 0.02;
-    const cpos = [];
-    for (const p of full) cpos.push(cx + (p[0] - cx) * INSET + cn[0] * RAISE, cy + (p[1] - cy) * INSET + cn[1] * RAISE, cz + (p[2] - cz) * INSET + cn[2] * RAISE);
+    const INSET = 0.95, RAISE = 0.02, SEG = 6;
+    const r = [cn[0] * RAISE, cn[1] * RAISE, cn[2] * RAISE];
+    const modelCorners = full.map(p => [p[0] + desc.center[0], p[1] + desc.center[1], p[2] + desc.center[2]]);
+    const cuts = pyraCornerCuts(modelCorners, fl.faceIndex);
+    const insetV = full.map(p => [cx + (p[0] - cx) * INSET + r[0], cy + (p[1] - cy) * INSET + r[1], cz + (p[2] - cz) * INSET + r[2]]);
+    const outline = pyraRoundedOutline(insetV, cuts, SEG);
+    const Cr = [cx + r[0], cy + r[1], cz + r[2]];
+    const cpos = [], cnrm = [];
+    for (let j = 0; j < outline.length; j++) {
+      const a = outline[j], b = outline[(j + 1) % outline.length];
+      cpos.push(Cr[0], Cr[1], Cr[2], a[0], a[1], a[2], b[0], b[1], b[2]);
+      cnrm.push(cn[0], cn[1], cn[2], cn[0], cn[1], cn[2], cn[0], cn[1], cn[2]);
+    }
     const fg = new THREE.BufferGeometry();
     fg.setAttribute('position', new THREE.Float32BufferAttribute(cpos, 3));
-    fg.setAttribute('normal', new THREE.Float32BufferAttribute([cn[0], cn[1], cn[2], cn[0], cn[1], cn[2], cn[0], cn[1], cn[2]], 3));
+    fg.setAttribute('normal', new THREE.Float32BufferAttribute(cnrm, 3));
     const fmesh = new THREE.Mesh(fg, new THREE.MeshStandardMaterial({ color: PYRA_FACE_HEX[fl.faceIndex], roughness: 0.4, metalness: 0.05, side: THREE.DoubleSide }));
     fmesh.userData.lc = new THREE.Vector3(cx, cy, cz);
     g.add(fmesh);
@@ -3726,10 +3776,18 @@ const pyraProjTiles = PYRA_PROJ.faces.map(fc => {
   const tiles = fc.tiles.map(t => {
     const cx = (t.pts[0][0] + t.pts[1][0] + t.pts[2][0]) / 3;   // inset each triangle toward its
     const cy = (t.pts[0][1] + t.pts[1][1] + t.pts[2][1]) / 3;   // centroid → dark borders/grout
-    const PIN = 0.84;                                            // between the 9 stickers, like the faces
+    const PIN = 0.86;                                            // between the 9 stickers, like the faces
+    let pedge2 = Infinity;                                       // t.pts are relative to the face centre → centre corner ≈ origin
+    for (let i = 0; i < 3; i++) { const a = t.pts[i], b = t.pts[(i + 1) % 3]; const e = (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2; if (e < pedge2) pedge2 = e; }
+    const pcuts = t.pts.map(p => (p[0] * p[0] + p[1] * p[1] < 0.16 * pedge2) ? PYRA_CUT_HEX : PYRA_CUT_TIP);
+    const insetV = t.pts.map(p => [cx + (p[0] - cx) * PIN, cy + (p[1] - cy) * PIN, 0]);
+    const outline = pyraRoundedOutline(insetV, pcuts, 6);       // rounded-triangle (QiYi) to match the body
     const g = new THREE.BufferGeometry();
     const pos = [];
-    for (const p of t.pts) pos.push(cx + (p[0] - cx) * PIN, cy + (p[1] - cy) * PIN, 0);
+    for (let j = 0; j < outline.length; j++) {
+      const a = outline[j], b = outline[(j + 1) % outline.length];
+      pos.push(cx, cy, 0, a[0], a[1], 0, b[0], b[1], 0);
+    }
     g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3));
     const m = new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.0, blending: THREE.AdditiveBlending, depthWrite: false, depthTest: true, side: THREE.DoubleSide }));
     m.renderOrder = 6; m.frustumCulled = false;
@@ -3797,14 +3855,25 @@ const pyraNetPolys = [[], [], [], []];
     }
     const A = affine(src, dst);
     fls.forEach((x, si) => {
-      const p2 = x.tri.map(to2d).map(A);
+      const pre = x.tri.map(to2d);             // face-plane coords (relative to centre C) → centre corner ≈ origin
+      const p2 = pre.map(A);
       const cx = (p2[0][0] + p2[1][0] + p2[2][0]) / 3, cy = (p2[0][1] + p2[1][1] + p2[2][1]) / 3;
-      const PIN = 0.9;                         // inset toward centroid → dark grout between stickers
-      const poly = document.createElementNS(PYRA_NET_NS, 'polygon');
-      poly.setAttribute('points', p2.map(p => `${(cx + (p[0] - cx) * PIN).toFixed(2)},${(cy + (p[1] - cy) * PIN).toFixed(2)}`).join(' '));
-      poly.setAttribute('fill', '#' + PYRA_FACE_HEX[f].toString(16).padStart(6, '0'));
-      pyraNetSvg.appendChild(poly);
-      pyraNetPolys[f][si] = poly;
+      const PIN = 0.9;                          // inset → dark grout; corners filleted (QiYi look)
+      let nedge2 = Infinity;
+      for (let i = 0; i < 3; i++) { const a = pre[i], b = pre[(i + 1) % 3]; const e = (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2; if (e < nedge2) nedge2 = e; }
+      const ncuts = pre.map(p => (p[0] * p[0] + p[1] * p[1] < 0.16 * nedge2) ? PYRA_CUT_HEX : PYRA_CUT_TIP);
+      const iv = p2.map(p => [cx + (p[0] - cx) * PIN, cy + (p[1] - cy) * PIN]);
+      const lerp2 = (a, b, t) => `${(a[0] + (b[0] - a[0]) * t).toFixed(2)} ${(a[1] + (b[1] - a[1]) * t).toFixed(2)}`;
+      let d = '';
+      for (let i = 0; i < 3; i++) {
+        const V = iv[i], prev = iv[(i + 2) % 3], next = iv[(i + 1) % 3];
+        d += (i === 0 ? 'M ' : 'L ') + lerp2(V, prev, ncuts[i]) + ` Q ${V[0].toFixed(2)} ${V[1].toFixed(2)} ` + lerp2(V, next, ncuts[i]) + ' ';
+      }
+      const path = document.createElementNS(PYRA_NET_NS, 'path');
+      path.setAttribute('d', d + 'Z');
+      path.setAttribute('fill', '#' + PYRA_FACE_HEX[f].toString(16).padStart(6, '0'));
+      pyraNetSvg.appendChild(path);
+      pyraNetPolys[f][si] = path;
     });
   }
 }
