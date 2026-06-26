@@ -660,7 +660,8 @@ function activate(move) {
 
 const TURN_DURATION = 0.13;                 // seconds per 90°
 const SPEED = (Math.PI / 2) / TURN_DURATION; // rad / sec
-let engineSpeedMul = 1;                      // >1 fast-forwards playback (long Solve solutions); reset to 1 when idle
+const SOLVE_TPS = 10;                        // Solve playback is capped at this many turns/sec (so long solutions stay watchable)
+let solvePlaying = false;                    // true while a Solve solution is animating
 const queue = [];
 let current = null;
 let puzzle = null;            // the active puzzle (assigned in the PUZZLES registry below)
@@ -671,11 +672,39 @@ function enqueue(move) {
 }
 
 const _q = new THREE.Quaternion();
+function _applyStep(angle) {
+  _q.setFromAxisAngle(current.axis, angle);
+  for (const c of current.cubies) { c.position.applyQuaternion(_q); c.quaternion.premultiply(_q); }
+}
+function _finishMove() {
+  for (const c of current.cubies) puzzle.snapPiece(c);
+  puzzle.updateNet();
+  if (current.tracked) puzzle.finalizeMovePhase();       // only tracked moves consume a history entry / advance phase
+  current = null;
+}
 function stepEngine(dt) {
-  // Consume an angular budget for this frame; a high engineSpeedMul lets several
-  // queued moves complete in one frame so a long Solve solution (e.g. Megaminx's
-  // ~1700 moves) still ANIMATES but plays out in a few seconds instead of minutes.
-  let budget = SPEED * engineSpeedMul * dt;
+  if (solvePlaying) {
+    // Solve playback: pace each turn by wall-clock so the rate never exceeds
+    // SOLVE_TPS turns/sec (big turns keep their normal sweep; fast ones are slowed
+    // to the cap). Carry leftover frame time across turns so there's no stutter.
+    let rem = dt;
+    while (rem > 1e-9) {
+      if (!current) {
+        if (!queue.length) { solvePlaying = false; return; }
+        current = activate(queue.shift()); current._t = 0;
+      }
+      const dur = Math.max(Math.abs(current.target) / SPEED, 1 / SOLVE_TPS);
+      const use = Math.min(rem, dur - current._t);
+      current._t += use; rem -= use;
+      const want = current.target * Math.min(1, current._t / dur);
+      _applyStep(want - current.done);
+      current.done = want;
+      if (current._t >= dur - 1e-9) _finishMove();
+    }
+    return;
+  }
+  // normal play — sweep at the engine's turn speed, chaining queued moves seamlessly
+  let budget = SPEED * dt;
   while (budget > 1e-9) {
     if (!current) {
       if (!queue.length) break;
@@ -683,22 +712,11 @@ function stepEngine(dt) {
     }
     const remaining = current.target - current.done;
     const stepMag = Math.min(Math.abs(remaining), budget);
-    const step = Math.sign(remaining) * stepMag;
-    _q.setFromAxisAngle(current.axis, step);
-    for (const c of current.cubies) {
-      c.position.applyQuaternion(_q);
-      c.quaternion.premultiply(_q);
-    }
-    current.done += step;
+    _applyStep(Math.sign(remaining) * stepMag);
+    current.done += Math.sign(remaining) * stepMag;
     budget -= stepMag;
-    if (Math.abs(current.target - current.done) < 1e-6) {
-      for (const c of current.cubies) puzzle.snapPiece(c);
-      puzzle.updateNet();
-      if (current.tracked) puzzle.finalizeMovePhase();   // only tracked moves consume a history entry / advance phase
-      current = null;
-    }
+    if (Math.abs(current.target - current.done) < 1e-6) _finishMove();
   }
-  if (!current && !queue.length) engineSpeedMul = 1;     // queue drained → back to normal speed
 }
 
 /* ============================================================
@@ -1156,18 +1174,13 @@ solveBtnEl.addEventListener('click', async () => {
   if (!sol || !sol.length) return;
   if (current || queue.length) return;                             // user started turning during the async solve
   timerState = 'idle';                                             // Solve is a demonstration, not a timed attempt
-  let totalAngle = 0;
   for (const tok of sol) {                                         // enqueue every move (untracked → no history/timer)
     const move = puzzle.buildMove(tok[0], tok.includes("'"), tok.includes('2'), tok);
     if (!move) continue;
     move.tracked = false;
     enqueue(move);
-    totalAngle += Math.abs(move.target);
   }
-  // Animate, but fast-forward so the whole solution plays in ~SOLVE_PLAYBACK seconds.
-  // Short solutions (2×2 / Pyraminx / Skewb) keep normal speed (mul clamps to 1).
-  const SOLVE_PLAYBACK = 3.5;
-  engineSpeedMul = Math.max(1, totalAngle / (SPEED * SOLVE_PLAYBACK));
+  solvePlaying = true;                                             // play back at ≤ SOLVE_TPS turns/sec
 });
 document.getElementById('puzzleChooser').addEventListener('click', (e) => {
   const b = e.target.closest('.pz'); if (b) switchPuzzle(b.dataset.puz);
