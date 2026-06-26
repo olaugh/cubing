@@ -337,6 +337,16 @@
   .palette .sw { width: 28px; height: 28px; border-radius: 7px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35); transition: transform .08s; }
   .palette .sw:hover { transform: scale(1.12); }
   .palette .sw.active { outline: 3px solid #fff; outline-offset: 1px; }
+  .net3 .cell.bad { box-shadow: inset 0 0 0 2.5px #ff3b3b, 0 0 7px rgba(255,59,59,0.65); animation: badpulse 1.1s ease-in-out infinite; }
+  @keyframes badpulse { 0%,100% { box-shadow: inset 0 0 0 2.5px #ff3b3b, 0 0 6px rgba(255,59,59,0.55); } 50% { box-shadow: inset 0 0 0 2.5px #ff8080, 0 0 12px rgba(255,59,59,0.95); } }
+  .edit-status {
+    position: fixed; left: 50%; transform: translateX(-50%); bottom: 64px; z-index: 9; display: none;
+    font-size: 12px; padding: 5px 13px; border-radius: 10px; white-space: nowrap;
+    background: var(--panel); border: 1px solid var(--panel-border); backdrop-filter: blur(18px);
+  }
+  .edit-status.on { display: block; }
+  .edit-status.ok { color: #4ade80; }
+  .edit-status.warn { color: #ff8080; }
 
   .help {
     font-size: 11.5px; color: var(--text-dim); line-height: 1.7;
@@ -2868,8 +2878,19 @@ document.getElementById('puzzleChooser').addEventListener('click', (e) => {
 const paletteEl = document.createElement('div');
 paletteEl.className = 'palette';
 document.body.appendChild(paletteEl);
+const editStatusEl = document.createElement('div');             // validity readout while editing
+editStatusEl.className = 'edit-status';
+document.body.appendChild(editStatusEl);
 const editBtnEl = document.getElementById('editBtn');
 let editMode = false, editColor = null;
+function editValidate() {                                       // flag impossible / duplicate cubies on the net
+  if (!editMode || !puzzle || !puzzle.validate || !puzzle.netEl) return;
+  puzzle.netEl.querySelectorAll('.cell.bad').forEach(c => c.classList.remove('bad'));
+  const { bad, ok, message } = puzzle.validate();
+  bad.forEach(idx => { const c = puzzle.netEl.querySelector('.cell[data-idx="' + idx + '"]'); if (c) c.classList.add('bad'); });
+  editStatusEl.textContent = message;
+  editStatusEl.className = 'edit-status on ' + (ok ? 'ok' : 'warn');
+}
 function buildPalette(colors) {
   paletteEl.innerHTML = '<span class="phint">paint</span>';
   editColor = colors[0];
@@ -2888,8 +2909,12 @@ function setEditMode(on) {
   editMode = on && !!(puzzle && puzzle.editable);
   editBtnEl.classList.toggle('active', editMode);
   paletteEl.classList.toggle('on', editMode);
-  if (puzzle && puzzle.netEl) puzzle.netEl.classList.toggle('editing', editMode);
-  if (editMode) buildPalette(puzzle.paletteColors);
+  editStatusEl.classList.toggle('on', editMode);
+  if (puzzle && puzzle.netEl) {
+    puzzle.netEl.classList.toggle('editing', editMode);
+    if (!editMode) puzzle.netEl.querySelectorAll('.cell.bad').forEach(c => c.classList.remove('bad'));
+  }
+  if (editMode) { buildPalette(puzzle.paletteColors); editValidate(); }
 }
 editBtnEl.addEventListener('click', () => { if (puzzle && puzzle.editable) setEditMode(!editMode); });
 document.addEventListener('click', (e) => {                       // click-to-paint a net cell while editing
@@ -2897,7 +2922,7 @@ document.addEventListener('click', (e) => {                       // click-to-pa
   const cell = e.target.closest && e.target.closest('.cell');
   if (!cell || !puzzle.netEl || !puzzle.netEl.contains(cell)) return;
   const idx = +cell.dataset.idx;
-  if (Number.isInteger(idx)) puzzle.paintCell(idx, editColor);
+  if (Number.isInteger(idx)) { puzzle.paintCell(idx, editColor); editValidate(); }
 });
 
 const drillEl = document.getElementById('drill');
@@ -7529,6 +7554,37 @@ function cube3PaintCell(idx, color) {
   cube3NetCells[idx].style.background = '#' + color.toString(16).padStart(6, '0');
 }
 const CUBE3_PALETTE = ['+y', '+x', '+z', '-y', '-x', '-z'].map(k => COLORS[k]);   // the 6 face colours
+// Cubie → facelet-index groupings (verified against the Kociemba solver) for validation.
+const C3_CORNERS = [[8,9,20],[6,18,38],[0,36,47],[2,45,11],[29,26,15],[27,44,24],[33,53,42],[35,17,51]];
+const C3_EDGES = [[5,10],[7,19],[3,37],[1,46],[32,16],[28,25],[30,43],[34,52],[23,12],[21,41],[50,39],[48,14]];
+const C3_CENTERS = [4,13,22,31,40,49];                          // U R F D L B
+// Flag impossible / duplicate cubies and bad colour counts on the painted state.
+function cube3Validate() {
+  const col = i => cube3CellSticker[i] ? cube3CellSticker[i].material.color.getHex() : 0;
+  const bad = new Set(), issues = [];
+  const centers = C3_CENTERS.map(col);
+  if (new Set(centers).size !== 6) { issues.push('centres not distinct'); C3_CENTERS.forEach(i => bad.add(i)); }
+  const cnt = new Map(); for (let i = 0; i < 54; i++) { const c = col(i); cnt.set(c, (cnt.get(c) || 0) + 1); }
+  if (cnt.size !== 6 || [...cnt.values()].some(n => n !== 9)) issues.push('colour counts ≠ 9');
+  const axisOf = new Map();                                     // colour -> opposite-pair axis (from centres)
+  [[0,3],[1,4],[2,5]].forEach(([a,b], ax) => { axisOf.set(centers[a], ax); axisOf.set(centers[b], ax); });
+  let nImp = 0;                                                 // impossible: two facelets share an axis (repeat / opposite colour)
+  for (const fs of [...C3_CORNERS, ...C3_EDGES]) {
+    const ax = fs.map(i => axisOf.get(col(i)));
+    if (ax.includes(undefined) || new Set(ax).size !== fs.length) { fs.forEach(i => bad.add(i)); nImp++; }
+  }
+  if (nImp) issues.push(nImp + ' impossible');
+  const dupCount = (sets) => {                                  // duplicate: same colour-set appears more than once
+    const seen = new Map(); let n = 0;
+    for (const fs of sets) { const k = fs.map(col).sort((a, b) => a - b).join(','); if (!seen.has(k)) seen.set(k, []); seen.get(k).push(fs); }
+    for (const list of seen.values()) if (list.length > 1) { for (const fs of list) for (const i of fs) bad.add(i); n += list.length; }
+    return n;
+  };
+  const nDup = dupCount(C3_CORNERS) + dupCount(C3_EDGES);
+  if (nDup) issues.push(nDup + ' duplicate');
+  const ok = issues.length === 0;
+  return { bad, ok, message: ok ? '✓ valid cube' : '⚠ ' + issues.join(' · ') };
+}
 
 const puzzleCube3 = {
   id: '3x3', name: '3×3',
@@ -7539,7 +7595,7 @@ const puzzleCube3 = {
   snapPiece: snapCubie,
   build: buildCube3,
   updateNet: cube3UpdateNet,
-  netEl: cube3NetEl, paletteColors: CUBE3_PALETTE, paintCell: cube3PaintCell, editable: true,
+  netEl: cube3NetEl, paletteColors: CUBE3_PALETTE, paintCell: cube3PaintCell, validate: cube3Validate, editable: true,
   updateProjections: () => {},
   finalizeMovePhase: cube3Finalize,
   readState: () => null,
@@ -9807,6 +9863,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 
 
