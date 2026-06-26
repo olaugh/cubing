@@ -8158,67 +8158,27 @@ function sq1MovesToToks(moves){
   }
   return toks;
 }
-function sq1Scramble(){ return sq1MovesToToks(sq1Solver.scramble(Math.random)); }
+function sq1Scramble(){ return sq1MovesToToks(sq1Mod.scramble(Math.random)); }
 function sq1Finalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&sq1Solved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
-/* ===== Square-1 solver — reduction/DB (node-verified 200/200, avg ~74 moves,
-   non-optimal but always-solves). No imports; reads the live proxy pieces.
-   The 3 pattern DBs (~20s) build LAZILY via ensureDB() on the first Solve. ===== */
-const sq1Solver = (function () {
-// solver.js
+/* ===== Square-1 solver — DBs loaded from a precomputed static asset
+   (sq1-tables.bin, ~7.7 MB: shape-ranked came-from arrays + corner/edge DBs).
+   createSolver DECODES it (~2ms, zero-copy typed-array views) instead of the old
+   ~24s in-browser BFS build. Fetched + decoded when Square-1 is opened. The
+   scramble uses only the abstract engine, so it works before the asset loads. ===== */
+const sq1Mod = (function () {
+// sq1-core.js
 // =============================================================================
-// Node-verified Square-1 (Cube 21) solver.  Always solves; non-optimal.
-// =============================================================================
-//
-// PUBLIC API
-//   import { solve } from './solver.js';
-//   const moves = solve(input);
-//
-// INPUT FORMAT for solve(input) — auto-detected:
-//   (a) The runtime "proxy" array used by the geo engine: an Array whose elements are
-//       { id:string, position:{x,y,z}, quaternion:{x,y,z,w} } (THREE Vector3 /
-//       Quaternion work directly). solve() reads the logical state from geometry.
-//   (b) { pieces: <that array> }
-//   (c) { abstract: <abstractState> }   (an abstract state object; see below)
-//   (d) a raw abstract state object (object whose keys include 'tc-0', etc.)
-//
-// OUTPUT FORMAT — an Array of typed moves, applied left-to-right:
-//   { type:'U', amount:n }   // top layer turn by n*30deg; n a nonzero int in [-6..6]
-//   { type:'D', amount:n }   // bottom layer turn
-//   { type:'slice' }         // flip right half 180deg (only emitted where legal)
-//   solve(<solved>) === [].
-//
-// SLICE LEGALITY: every emitted 'slice' is legal at the moment it is applied. The
-//   solver simulates with an abstract canSlice predicate proven equivalent to the
-//   engine's canSlice (see verify_canslice4.mjs).  Apply the moves IN ORDER.
-//
-// MIDDLE PARITY: the two middle halves (mid-L/mid-R) can be flipped/swapped by slices.
-//   This parity is part of the edge coordinate and is solved together with the edges
-//   in Phase 2b (the macro set spans both middle parities).  No caller handling needed.
-//
-// ABSTRACT STATE (the {abstract:...}/raw form):
-//   { 'tc-0':{kind:'corner',layer:'T'|'B',slot:0..11,flip:0|1}, ... 16 corner/edge keys ...,
-//     'mid-L':{kind:'middle',side:'L'|'R',flip:0|1}, 'mid-R':{...} }
-//   solvedAbstractState() and abstractFromProxies(proxies) produce this form.
-//
-// METHOD (reduction; guaranteed to terminate at solved):
-//   Phase 1  : reach cube shape                      (shape DB, 1,351,350 anonymized
-//              shape states, max depth 18 -- BFS lookup + inverse)
-//   align    : rotate U/D so corners land on home grid cells
-//   Phase 2a : solve all 8 corners (perm+flip)       (corner DB, 40,320 states)
-//   Phase 2b : solve 8 edges + middle parity         (edge+mid DB, 80,640 states; 2 cosets
-//              of a 40,320 subgroup joined by a parity macro -- see PARITY_MACRO)
-//   final    : tiny alignment cleanup
-//   All three DBs are built once, lazily, on first solve() and cached (~15-20 s one-time;
-//   subsequent solves are sub-millisecond).
+// Shared, browser-safe core for the Square-1 solver: the fast abstract engine
+// (lifted verbatim from solver.js) PLUS the three perfect-hash ranking schemes
+// used by the offline builder (build-sq1-asset.mjs) and the runtime loader
+// (solver-asset.js). No node/fs/three dependencies.
 // =============================================================================
 
 // ---- piece order (index 0..15): corners first within each layer block ----
-// indices: 0..3 top corners, 4..7 top edges, 8..11 bottom corners, 12..15 bottom edges
 const IDS = ['tc-0', 'tc-1', 'tc-2', 'tc-3', 'te-0', 'te-1', 'te-2', 'te-3',
   'bc-0', 'bc-1', 'bc-2', 'bc-3', 'be-0', 'be-1', 'be-2', 'be-3'];
 const IDX = {}; IDS.forEach((id, i) => IDX[id] = i);
-const IS_CORNER = IDS.map(id => id.includes('c-') ? 1 : 0); // 1 corner, 0 edge
-// position code = layer(0=T,1=B)*12 + slot(0..11)  in [0..23]
+const IS_CORNER = IDS.map(id => id.includes('c-') ? 1 : 0);
 const HOME_POS = {
   'tc-0': 1, 'tc-1': 4, 'tc-2': 7, 'tc-3': 10, 'te-0': 2, 'te-1': 5, 'te-2': 8, 'te-3': 11,
   'bc-0': 13, 'bc-1': 16, 'bc-2': 19, 'bc-3': 22, 'be-0': 14, 'be-1': 17, 'be-2': 20, 'be-3': 23,
@@ -8227,14 +8187,11 @@ const HOMEP = new Int8Array(16); IDS.forEach((id, i) => HOMEP[i] = HOME_POS[id])
 const RIGHT = [false, false, false, false, false, false, false, false, false, false, false, false];
 for (const s of [0, 1, 2, 9, 10, 11]) RIGHT[s] = true;
 
-// ---- fast state: { p:Int8Array(16) pos-codes, f:Int8Array(16) flips, m:Int8Array(4) middle } ----
-// middle m = [Lside,Lflip,Rside,Rflip], side 0=L 1=R.
 function fastSolved() {
   const p = Int8Array.from(HOMEP), f = new Int8Array(16), m = Int8Array.from([0, 0, 1, 0]);
   return { p, f, m };
 }
 function fastClone(s) { return { p: Int8Array.from(s.p), f: Int8Array.from(s.f), m: Int8Array.from(s.m) }; }
-
 function fU(s, n) {
   n = ((n % 12) + 12) % 12; if (!n) return fastClone(s);
   const o = fastClone(s);
@@ -8253,8 +8210,8 @@ function fSlice(s) {
     const layer = o.p[i] >= 12 ? 1 : 0, slot = o.p[i] % 12;
     if (RIGHT[slot]) { o.p[i] = (layer ^ 1) * 12 + (11 - slot); o.f[i] ^= 1; }
   }
-  if (o.m[0] === 1) o.m[1] ^= 1; // mid-L if on right
-  if (o.m[2] === 1) o.m[3] ^= 1; // mid-R if on right
+  if (o.m[0] === 1) o.m[1] ^= 1;
+  if (o.m[2] === 1) o.m[3] ^= 1;
   return o;
 }
 function fCanSlice(s) {
@@ -8273,7 +8230,6 @@ function fApply(s, mv) {
 }
 function fApplySeq(s, seq) { let t = s; for (const mv of seq) t = fApply(t, mv); return t; }
 
-// grid string of a layer (for cube-shape + alignment)
 function fLayerGrid(s, layer) {
   const a = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
   for (let i = 0; i < 16; i++) {
@@ -8285,21 +8241,16 @@ function fLayerGrid(s, layer) {
   }
   return a.join('');
 }
-const SOLVED_GRID = fLayerGrid(fastSolved(), 0); // '112112112112' (corner,corner,edge repeating)
-// A valid cube-shape layer's grid is a cyclic rotation of SOLVED_GRID.  Precompute the set.
+const SOLVED_GRID = fLayerGrid(fastSolved(), 0);
 const CUBE_LAYER_GRIDS = (() => {
   const set = new Set();
   const arr = SOLVED_GRID.split('');
-  for (let r = 0; r < 12; r++) {
-    set.add(arr.join(''));
-    arr.unshift(arr.pop()); // rotate by 1
-  }
+  for (let r = 0; r < 12; r++) { set.add(arr.join('')); arr.unshift(arr.pop()); }
   return set;
 })();
 function fIsCube(s) {
   return CUBE_LAYER_GRIDS.has(fLayerGrid(s, 0)) && CUBE_LAYER_GRIDS.has(fLayerGrid(s, 1));
 }
-// align: rotate top & bottom so each layer grid == SOLVED_GRID. returns {state, moves} or null
 function fAlign(s) {
   const moves = [];
   let st = s, okT = false;
@@ -8317,11 +8268,263 @@ function fSolved(s) {
 }
 function fCornerKey(s) { let k = ''; for (let i = 0; i < 16; i++) if (IS_CORNER[i]) k += s.p[i] + '.' + s.f[i] + ','; return k; }
 function fEdgeKey(s) { let k = ''; for (let i = 0; i < 16; i++) if (!IS_CORNER[i]) k += s.p[i] + '.' + s.f[i] + ','; k += s.m.join(''); return k; }
-function fGridKey(s) { return fLayerGrid(s, 0) + '|' + fLayerGrid(s, 1); }
+
+function fShapeKey(s) {
+  let tcM = 0, bcM = 0, teM = 0, beM = 0;
+  for (let i = 0; i < 16; i++) {
+    const layer = s.p[i] >= 12 ? 1 : 0, slot = s.p[i] % 12;
+    if (IS_CORNER[i]) { if (layer) bcM |= 1 << (slot * 2 + s.f[i]); else tcM |= 1 << (slot * 2 + s.f[i]); }
+    else { if (layer) beM |= 1 << slot; else teM |= 1 << slot; }
+  }
+  return tcM + ',' + teM + ',' + bcM + ',' + beM;
+}
+
+function shapeMoves(s) {
+  const out = [];
+  for (let n = 1; n <= 11; n++) out.push({ type: 'U', amount: n });
+  for (let n = 1; n <= 11; n++) out.push({ type: 'D', amount: n });
+  if (fCanSlice(s)) out.push({ type: 'slice' });
+  return out;
+}
+
+function moveSeqInverse(seq) {
+  const out = [];
+  for (let i = seq.length - 1; i >= 0; i--) {
+    const m = seq[i];
+    if (m.type === 'slice') out.push({ type: 'slice' });
+    else out.push({ type: m.type, amount: ((-m.amount) % 12 + 12) % 12 });
+  }
+  return out;
+}
+function fApplySeqLegal(s, seq) {
+  let t = s;
+  for (const mv of seq) {
+    if (mv.type === 'slice') { if (!fCanSlice(t)) return false; t = fSlice(t); }
+    else t = fApply(t, mv);
+  }
+  return true;
+}
 
 // =============================================================================
-// boundary: proxies / abstract <-> fast state
+// Move encodings (binary byte form)
+//   shape single move:  U n -> n (1..11), D n -> 11+n (12..22), slice -> 23, root -> 0
 // =============================================================================
+function encodeShapeMove(mv) {
+  if (mv.type === 'slice') return 23;
+  if (mv.type === 'U') return mv.amount;
+  return 11 + mv.amount;
+}
+function decodeShapeMove(byte) {
+  if (byte === 0) return null;
+  if (byte === 23) return { type: 'slice' };
+  if (byte <= 11) return { type: 'U', amount: byte };
+  return { type: 'D', amount: byte - 11 };
+}
+function decodeMoveByte(byte) {
+  if (byte === 23) return { type: 'slice' };
+  if (byte <= 11) return { type: 'U', amount: byte };
+  return { type: 'D', amount: byte - 11 };
+}
+
+// =============================================================================
+// CORNER rank — Lehmer code of the 8-corner permutation.
+//   Each corner covers two adjacent grid cells; its "logical location" is the
+//   lower covered cell (global code layer*12 + lowerSlot). The 8 corners occupy
+//   8 distinct logical locations; sorting them and reading which corner-piece is
+//   at each gives a permutation in S8, ranked via factorial (Lehmer) code.
+// =============================================================================
+const CORNER_IDX = []; for (let i = 0; i < 16; i++) if (IS_CORNER[i]) CORNER_IDX.push(i);
+const EDGE_IDX = []; for (let i = 0; i < 16; i++) if (!IS_CORNER[i]) EDGE_IDX.push(i);
+const FACT = [1, 1, 2, 6, 24, 120, 720, 5040, 40320];
+
+function permRank8(perm) {
+  let r = 0; const used = new Uint8Array(8);
+  for (let i = 0; i < 8; i++) {
+    let smaller = 0;
+    for (let j = 0; j < perm[i]; j++) if (!used[j]) smaller++;
+    r += smaller * FACT[7 - i];
+    used[perm[i]] = 1;
+  }
+  return r;
+}
+function cornerLoc(posCode, flip) {
+  const layer = posCode >= 12 ? 1 : 0;
+  const slot = posCode % 12;
+  const c0 = flip === 0 ? (slot - 1 + 12) % 12 : slot;
+  return layer * 12 + c0;
+}
+function cornerRank(s) {
+  const locs = new Array(8);
+  for (let k = 0; k < 8; k++) locs[k] = cornerLoc(s.p[CORNER_IDX[k]], s.f[CORNER_IDX[k]]);
+  // map distinct locs (ascending) -> 0..7
+  const sorted = [...locs].sort((a, b) => a - b);
+  const rankOf = new Map(); sorted.forEach((v, i) => rankOf.set(v, i));
+  const perm = locs.map(v => rankOf.get(v));
+  return permRank8(perm);
+}
+
+// =============================================================================
+// EDGE rank — Lehmer of the 8-edge permutation * 2 + middle-parity bit.
+//   Edges always sit at the 8 home edge cells {2,5,8,11,14,17,20,23}; their
+//   permutation ranks via Lehmer. The remaining bit of freedom (the flip vector
+//   is forced by perm+middle) is captured by the mid-R flip bit (m[3]).
+// =============================================================================
+const EDGE_CELLS = [2, 5, 8, 11, 14, 17, 20, 23];
+function edgeRank(s) {
+  const perm = new Array(8);
+  for (let ci = 0; ci < 8; ci++) {
+    const cell = EDGE_CELLS[ci];
+    for (let k = 0; k < 8; k++) { if (s.p[EDGE_IDX[k]] === cell) { perm[ci] = k; break; } }
+  }
+  const midBit = s.m[3] === 1 ? 1 : 0;
+  return permRank8(perm) * 2 + midBit;
+}
+
+// =============================================================================
+// SHAPE rank — injective sparse rank via per-layer config groups.
+//   buildShapeRankTables() enumerates the 3,972 distinct per-layer
+//   (cornerMask24, edgeMask12) configs (sorted), groups them by corner-count nc,
+//   and precomputes group offsets. shapeSparseRank(state, ST) -> [0, sparseMax).
+//   These tables can be REBUILT from the binary's stored config list (loader)
+//   instead of re-enumerating; buildShapeRankTables here re-derives them by a
+//   short BFS for the offline builder.
+// =============================================================================
+function popcountInt(x) { let c = 0; while (x) { c += x & 1; x >>>= 1; } return c; }
+
+// Compute the per-layer (cornerMask, edgeMask) pair for a layer (0 top / 1 bot).
+function layerMasks(s, layer) {
+  let cM = 0, eM = 0;
+  for (let i = 0; i < 16; i++) {
+    const lay = s.p[i] >= 12 ? 1 : 0;
+    if (lay !== layer) continue;
+    const slot = s.p[i] % 12;
+    if (IS_CORNER[i]) cM |= 1 << (slot * 2 + s.f[i]);
+    else eM |= 1 << slot;
+  }
+  return { cM, eM };
+}
+
+// Construct the ranking tables from an explicit list of configs (used by loader).
+// configs: array of {cornerMask, edgeMask} ALREADY SORTED ascending by (cornerMask,edgeMask).
+function makeShapeRankTables(configs) {
+  // assign localIdx within corner-count group, in the given sorted order.
+  const groups = new Map(); // nc -> {start, len}
+  const pairIndex = new Map(); // "cM:eM" -> {nc, localIdx}
+  // first pass: contiguous groups require configs sorted by nc; but stored order is by mask.
+  // We compute localIdx as position-within-nc-group in the SAME canonical order used at build:
+  // canonical order = sort by (cornerMask, edgeMask); localIdx = running count within that nc.
+  const ncCounters = new Map();
+  for (let i = 0; i < configs.length; i++) {
+    const c = configs[i];
+    const nc = popcountInt(c.cornerMask);
+    const li = ncCounters.get(nc) || 0;
+    pairIndex.set(c.cornerMask + ':' + c.edgeMask, { nc, localIdx: li });
+    ncCounters.set(nc, li + 1);
+  }
+  const ncList = [...ncCounters.keys()].sort((a, b) => a - b);
+  for (const nc of ncList) groups.set(nc, { start: 0, len: ncCounters.get(nc) });
+  // sparse offsets: state with topNc=a contributes |group[a]|*|group[8-a]|.
+  const offset = new Map(); let acc = 0;
+  for (const nc of ncList) {
+    offset.set(nc, acc);
+    const ga = groups.get(nc).len;
+    const gb = groups.get(8 - nc) ? groups.get(8 - nc).len : 0;
+    acc += ga * gb;
+  }
+  return { configs, pairIndex, groups, offset, ncList, sparseMax: acc };
+}
+
+// Offline build of the ranking tables via a self-contained shape BFS to gather configs.
+function buildShapeRankTables() {
+  const start = fastSolved();
+  const seen = new Set([fShapeKey(start)]);
+  let frontier = [start];
+  const pairSet = new Set();
+  function addLayers(s) {
+    for (const layer of [0, 1]) { const { cM, eM } = layerMasks(s, layer); pairSet.add(cM + ':' + eM); }
+  }
+  addLayers(start);
+  while (frontier.length) {
+    const nf = [];
+    for (const s of frontier) for (const mv of shapeMoves(s)) {
+      const ns = fApply(s, mv); const k = fShapeKey(ns); if (seen.has(k)) continue; seen.add(k);
+      addLayers(ns); nf.push(ns);
+    }
+    frontier = nf;
+  }
+  const configs = [...pairSet].map(p => { const [cM, eM] = p.split(':').map(Number); return { cornerMask: cM, edgeMask: eM }; })
+    .sort((a, b) => a.cornerMask - b.cornerMask || a.edgeMask - b.edgeMask);
+  return makeShapeRankTables(configs);
+}
+
+function shapeSparseRank(s, ST) {
+  const top = layerMasks(s, 0), bot = layerMasks(s, 1);
+  const tp = ST.pairIndex.get(top.cM + ':' + top.eM);
+  const bp = ST.pairIndex.get(bot.cM + ':' + bot.eM);
+  const a = tp.nc;
+  const gb = ST.groups.get(8 - a).len;
+  return ST.offset.get(a) + tp.localIdx * gb + bp.localIdx;
+}
+
+// =============================================================================
+// The PARITY_MACRO (verbatim from solver.js) — needed by the edge-DB builder.
+// =============================================================================
+const PARITY_MACRO = [
+  { type: 'U', amount: 1 }, { type: 'D', amount: 7 }, { type: 'U', amount: 7 }, { type: 'D', amount: 4 }, { type: 'slice' },
+  { type: 'U', amount: 4 }, { type: 'D', amount: 6 }, { type: 'U', amount: 1 }, { type: 'D', amount: 2 }, { type: 'U', amount: 10 },
+  { type: 'D', amount: 5 }, { type: 'U', amount: 5 }, { type: 'D', amount: 1 }, { type: 'U', amount: 10 }, { type: 'D', amount: 8 },
+  { type: 'U', amount: 9 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 8 }, { type: 'D', amount: 1 },
+  { type: 'U', amount: 9 }, { type: 'D', amount: 10 }, { type: 'U', amount: 6 }, { type: 'D', amount: 9 }, { type: 'slice' },
+  { type: 'U', amount: 11 }, { type: 'D', amount: 4 }, { type: 'U', amount: 7 }, { type: 'D', amount: 10 }, { type: 'slice' },
+  { type: 'U', amount: 2 }, { type: 'D', amount: 11 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 4 },
+  { type: 'slice' }, { type: 'U', amount: 1 }, { type: 'D', amount: 4 }, { type: 'slice' }, { type: 'U', amount: 3 },
+  { type: 'D', amount: 9 }, { type: 'slice' }, { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 7 },
+  { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'U', amount: 11 }, { type: 'slice' },
+  { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 4 },
+  { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 },
+  { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 },
+];
+
+// solver-asset.js
+// =============================================================================
+// Runtime Square-1 solver that LOADS its three pattern databases from a compact
+// binary asset (sq1-tables.bin, produced by build-sq1-asset.mjs) instead of
+// rebuilding them. Browser-safe: no fs/three/node APIs — it receives an
+// ArrayBuffer and decodes typed arrays.
+//
+// PUBLIC API
+//   import { createSolver } from './solver-asset.js';
+//   const { solve } = createSolver(arrayBuffer);   // decode once
+//   const moves = solve(input);                     // many fast solves
+//
+// `createSolver(arrayBuffer)` returns an object { solve, solvedAbstractState,
+//   abstractFromProxies, fastToAbstract, applyAbstract, canSliceState,
+//   isSolvedState }.  solve()'s input/output forms are IDENTICAL to solver.js.
+//
+// INPUT to solve(input) — auto-detected (same as solver.js):
+//   (a) proxy array [{id, position:{x,y,z}, quaternion:{x,y,z,w}}]
+//   (b) { pieces: <that array> }
+//   (c) { abstract: <abstractState> }
+//   (d) raw abstract state (object with 'tc-0', ...)
+// OUTPUT — Array of { type:'U'|'D', amount:n } / { type:'slice' }, applied L→R.
+//
+// ----- BINARY FORMAT (must mirror build-sq1-asset.mjs writeAsset()) -----
+//   All multi-byte ints little-endian.
+//   HEADER (64 bytes, 16 u32): magic 'SQ1B', version, shapeN, sparseN,
+//     shapeRootDense, bitWords, nBlocks, cornerN, cornerRootRank, cornerSeqCount,
+//     edgeN, edgeRootRank, edgeGenCount, reserved*3.
+//   SHAPE-RANK SUPPORT: u32 configCount; configCount*(u32 cornerMask,u32 edgeMask);
+//     u32 ncMin,u32 ncMax; per nc (u32 groupStart,u32 groupLen); per nc (u32 offset).
+//   SHAPE BODY: Uint32[shapeN] parent; Uint8[shapeN] mv; Uint32[bitWords] bitmap;
+//     Uint32[nBlocks] blockPrefix.
+//   CORNER BODY: u32 seqTableBytes; cornerSeqCount*(u8 len, len bytes);
+//     Uint32[cornerN] parent; Uint16[cornerN] seqId (0xFFFF=root).
+//   EDGE BODY: u32 seqTableBytes; edgeGenCount*(u8 len, len bytes);
+//     Uint32[edgeN] parent; Uint8[edgeN] gen (0xFF=root).
+// =============================================================================
+
+
+// ---------- boundary: proxies / abstract <-> fast state ----------
 function abstractToFast(state) {
   const p = new Int8Array(16), f = new Int8Array(16), m = new Int8Array(4);
   for (const id of IDS) {
@@ -8355,346 +8558,24 @@ function abstractFromProxies(proxies) {
   }
   return s;
 }
-
-// =============================================================================
-// Phase 1: cube shape  (BFS over grid signature)
-// =============================================================================
-function shapeMoves(s) {
-  const out = [];
-  for (let n = 1; n <= 11; n++) out.push({ type: 'U', amount: n });
-  for (let n = 1; n <= 11; n++) out.push({ type: 'D', amount: n });
-  if (fCanSlice(s)) out.push({ type: 'slice' });
-  return out;
-}
-// Shape-search dedup key.  The shape sub-problem and slice legality do NOT depend on which
-// specific corner/edge is where -- only on the SET of corner (slot,flip) pairs and the set
-// of edge slots in each layer (slice legality = no corner straddles, fully determined by
-// corner (slot,flip); shape = the C/E occupancy).  We therefore key on the ANONYMIZED state
-// (sorted corner (slot,flip) + sorted edge slots per layer), which collapses the corner/edge
-// permutation freedom and keeps the reachable shape set small (a few thousand states) while
-// remaining exact for both shape progress and slice legality.
-function fShapeKey(s) {
-  // bitmask form (fast, sort-free): per layer, a corner sets bit (slot*2+flip) in its
-  // corner-mask; an edge sets bit (slot) in its edge-mask.  Pieces never overlap, so the
-  // mask is an exact set representation.  4 masks -> one string key.
-  let tcM = 0, bcM = 0, teM = 0, beM = 0;
+function fastToAbstract(f) {
+  const s = {};
   for (let i = 0; i < 16; i++) {
-    const layer = s.p[i] >= 12 ? 1 : 0, slot = s.p[i] % 12;
-    if (IS_CORNER[i]) { if (layer) bcM |= 1 << (slot * 2 + s.f[i]); else tcM |= 1 << (slot * 2 + s.f[i]); }
-    else { if (layer) beM |= 1 << slot; else teM |= 1 << slot; }
+    const id = IDS[i];
+    s[id] = { kind: IS_CORNER[i] ? 'corner' : 'edge', layer: f.p[i] >= 12 ? 'B' : 'T', slot: f.p[i] % 12, flip: f.f[i] };
   }
-  return tcM + ',' + teM + ',' + bcM + ',' + beM;
-}
-// Shape DB: BFS once from a cube-shape solved state over the anonymized shape space
-// (1,351,350 states, max depth 18), storing predecessor links.  solveShape() looks up the
-// start's shape-key and inverts the stored cube->start path.  Every move on the inverted
-// path is legal: it retraces real shape states and slice legality is a pure function of the
-// anonymized shape state, which the keys capture exactly.
-let SHAPE_DB = null;
-function buildShapeDB() {
-  const start = fastSolved();
-  const came = new Map(); // shapeKey -> {prevKey, mv}
-  came.set(fShapeKey(start), null);
-  let frontier = [start];
-  while (frontier.length) {
-    const next = [];
-    for (const s of frontier) {
-      const ck = fShapeKey(s);
-      for (const mv of shapeMoves(s)) {
-        const ns = fApply(s, mv);
-        const k = fShapeKey(ns);
-        if (came.has(k)) continue;
-        came.set(k, { prevKey: ck, mv });
-        next.push(ns);
-      }
-    }
-    frontier = next;
-  }
-  return came;
-}
-function solveShape(start) {
-  if (fIsCube(start)) return [];
-  if (!SHAPE_DB) SHAPE_DB = buildShapeDB();
-  const key = fShapeKey(start);
-  if (!SHAPE_DB.has(key)) return null; // not a legally reachable shape
-  // Collect edges from `key` back to cube (each edge: prev --mv--> this), giving the
-  // cube->start move list in reverse; reverse it, then invert to get start->cube.
-  const rev = [];
-  let k = key;
-  while (SHAPE_DB.get(k) !== null) { const e = SHAPE_DB.get(k); rev.push(e.mv); k = e.prevKey; }
-  rev.reverse();
-  return moveSeqInverse(rev);
+  s['mid-L'] = { kind: 'middle', side: f.m[0] === 1 ? 'R' : 'L', flip: f.m[1] };
+  s['mid-R'] = { kind: 'middle', side: f.m[2] === 1 ? 'R' : 'L', flip: f.m[3] };
+  return s;
 }
 
-// =============================================================================
-// Pattern DBs (built once)
-// =============================================================================
-let DB = null;
-
-function buildCornerDB() {
-  const start = fAlign(fastSolved()).state;
-  const came = new Map(); // cornerKey -> {prevKey, moves} (moves: prevState->thisState)
-  const reps = new Map(); // cornerKey -> state
-  const sk = fCornerKey(start);
-  came.set(sk, null); reps.set(sk, start);
-  let frontier = [start];
-  while (frontier.length) {
-    const next = [];
-    for (const s of frontier) {
-      const ck = fCornerKey(s);
-      for (let a = 0; a < 12; a++) {
-        const su = fU(s, a);
-        for (let b = 0; b < 12; b++) {
-          const adj = fD(su, b);
-          if (!fCanSlice(adj)) continue;
-          const sl = fSlice(adj);
-          if (!fIsCube(sl)) continue;
-          const al = fAlign(sl);
-          if (!al) continue;
-          const nk = fCornerKey(al.state);
-          if (came.has(nk)) continue;
-          const fwd = [];
-          if (a) fwd.push({ type: 'U', amount: a });
-          if (b) fwd.push({ type: 'D', amount: b });
-          fwd.push({ type: 'slice' });
-          for (const mm of al.moves) fwd.push(mm);
-          came.set(nk, { prevKey: ck, moves: fwd });
-          next.push(al.state);
-        }
-      }
-    }
-    frontier = next;
-  }
-  return { came, startKey: sk };
+function popcount32(x) {
+  x = x - ((x >>> 1) & 0x55555555);
+  x = (x & 0x33333333) + ((x >>> 2) & 0x33333333);
+  x = (x + (x >>> 4)) & 0x0f0f0f0f;
+  return (x * 0x01010101) >>> 24;
 }
 
-function moveSeqInverse(seq) {
-  const out = [];
-  for (let i = seq.length - 1; i >= 0; i--) {
-    const m = seq[i];
-    if (m.type === 'slice') out.push({ type: 'slice' });
-    else out.push({ type: m.type, amount: ((-m.amount) % 12 + 12) % 12 });
-  }
-  return out;
-}
-// Build a SMALL but COMPLETE corner-preserving generating set.
-//   1. Discover "base" macros by a bounded DFS over (U a)(D b)(slice) steps (<=4 slices)
-//      that return to corner-solved cube shape.  (Pruned by canSlice/cube so it's cheap.)
-//   2. Candidate generators = base macros + their (U a)(D b) conjugates (still corner-
-//      preserving).  3. Greedily pick the smallest subset whose closure reaches the full
-//      40,320-state edge+middle group.  (Verified: 7 generators suffice.)
-function discoverBaseMacros() {
-  const start = fAlign(fastSolved()).state;
-  const sk = fEdgeKey(start);
-  const base = new Map(); // edgeKey -> moves
-  function dfs(s, path, slicesLeft) {
-    for (let a = 0; a < 12; a++) {
-      const su = fU(s, a);
-      for (let b = 0; b < 12; b++) {
-        const adj = fD(su, b);
-        if (!fCanSlice(adj)) continue;
-        const sl = fSlice(adj);
-        if (!fIsCube(sl)) continue;
-        const al = fAlign(sl);
-        if (!al) continue;
-        const fwd = [];
-        if (a) fwd.push({ type: 'U', amount: a });
-        if (b) fwd.push({ type: 'D', amount: b });
-        fwd.push({ type: 'slice' });
-        for (const mm of al.moves) fwd.push(mm);
-        const np = path.concat(fwd);
-        if (fCornersSolved(al.state)) {
-          const k = fEdgeKey(al.state);
-          if (k !== sk && !base.has(k)) base.set(k, np);
-        }
-        if (slicesLeft > 1) dfs(al.state, np, slicesLeft - 1);
-      }
-    }
-  }
-  dfs(start, [], 4);
-  return base;
-}
-function closureSize(start, sk, gens, cap) {
-  const seen = new Set([sk]);
-  let fr = [start];
-  while (fr.length) {
-    const nf = [];
-    for (const s of fr) for (const g of gens) {
-      const t = fApplySeq(s, g);
-      const k = fEdgeKey(t);
-      if (seen.has(k)) continue;
-      seen.add(k); nf.push(t);
-      if (cap && seen.size >= cap) return seen.size;
-    }
-    fr = nf;
-  }
-  return seen.size;
-}
-// The corner-preserving edge+middle group has order 80,640 and consists of TWO cosets
-// of a 40,320 subgroup.  The base macros (+ their U/D conjugates) generate only the
-// 40,320 subgroup (an edge-permutation-parity invariant).  To reach the other coset we
-// need ONE "parity" macro: a corner-preserving sequence that is an ODD edge permutation.
-// PARITY_MACRO below is such a sequence (derived once via scramble+corner-solve; verified
-// at build time to be legal, corner-preserving, and to extend the closure 40,320 -> 80,640).
-const PARITY_MACRO = [
-  { type: 'U', amount: 1 }, { type: 'D', amount: 7 }, { type: 'U', amount: 7 }, { type: 'D', amount: 4 }, { type: 'slice' },
-  { type: 'U', amount: 4 }, { type: 'D', amount: 6 }, { type: 'U', amount: 1 }, { type: 'D', amount: 2 }, { type: 'U', amount: 10 },
-  { type: 'D', amount: 5 }, { type: 'U', amount: 5 }, { type: 'D', amount: 1 }, { type: 'U', amount: 10 }, { type: 'D', amount: 8 },
-  { type: 'U', amount: 9 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 8 }, { type: 'D', amount: 1 },
-  { type: 'U', amount: 9 }, { type: 'D', amount: 10 }, { type: 'U', amount: 6 }, { type: 'D', amount: 9 }, { type: 'slice' },
-  { type: 'U', amount: 11 }, { type: 'D', amount: 4 }, { type: 'U', amount: 7 }, { type: 'D', amount: 10 }, { type: 'slice' },
-  { type: 'U', amount: 2 }, { type: 'D', amount: 11 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 4 },
-  { type: 'slice' }, { type: 'U', amount: 1 }, { type: 'D', amount: 4 }, { type: 'slice' }, { type: 'U', amount: 3 },
-  { type: 'D', amount: 9 }, { type: 'slice' }, { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 7 },
-  { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'U', amount: 11 }, { type: 'slice' },
-  { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 4 },
-  { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 },
-  { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 },
-];
-const FULL_EDGE_GROUP = 80640;
-function cornerPreservingGenerators() {
-  const start = fAlign(fastSolved()).state;
-  const sk = fEdgeKey(start);
-  const base = discoverBaseMacros();
-  // candidate list: base macros, then their conjugates, then the parity macro.
-  const cands = [];
-  for (const p of base.values()) {
-    cands.push(p);
-    for (let a = 0; a < 12; a++) for (let b = 0; b < 12; b++) {
-      if (!a && !b) continue;
-      const setup = [];
-      if (a) setup.push({ type: 'U', amount: a });
-      if (b) setup.push({ type: 'D', amount: b });
-      const conj = [...setup, ...p, ...moveSeqInverse(setup)];
-      if (fApplySeqLegal(start, conj) && fCornersSolved(fApplySeq(start, conj))) cands.push(conj);
-    }
-  }
-  // Greedy minimal generating set for the 40,320 SUBGROUP (cheap: closures stay <=40,320).
-  const SUBGROUP = 40320;
-  const gens = [];
-  let cur = 1;
-  for (const g of cands) {
-    if (cur >= SUBGROUP) break;
-    gens.push(g);
-    const sz = closureSize(start, sk, gens, SUBGROUP);
-    if (sz > cur) cur = sz; else gens.pop();
-  }
-  // Add the parity macro to bridge into the second coset (40,320 -> 80,640).
-  if (fApplySeqLegal(start, PARITY_MACRO) && fCornersSolved(fApplySeq(start, PARITY_MACRO))) {
-    gens.push(PARITY_MACRO);
-  }
-  return gens;
-}
-// apply a seq; return false if any slice illegal
-function fApplySeqLegal(s, seq) {
-  let t = s;
-  for (const mv of seq) {
-    if (mv.type === 'slice') { if (!fCanSlice(t)) return false; t = fSlice(t); }
-    else t = fApply(t, mv);
-  }
-  return true;
-}
-
-function buildEdgeDB() {
-  const start = fAlign(fastSolved()).state;
-  const gens = cornerPreservingGenerators();
-  const came = new Map(); // edgeKey -> {prevKey, moves}
-  const sk = fEdgeKey(start);
-  came.set(sk, null);
-  let frontier = [start];
-  while (frontier.length) {
-    const next = [];
-    for (const s of frontier) {
-      const ek = fEdgeKey(s);
-      for (const seq of gens) {
-        const t = fApplySeq(s, seq);
-        const nk = fEdgeKey(t);
-        if (came.has(nk)) continue;
-        came.set(nk, { prevKey: ek, moves: seq });
-        next.push(t);
-      }
-    }
-    frontier = next;
-  }
-  return { came, startKey: sk, genCount: gens.length };
-}
-
-function ensureDB() {
-  if (DB) return DB;
-  const dbg = (typeof process !== 'undefined' && process.env) ? process.env.SQ1_DEBUG : '';
-  if (dbg) console.error('[DB] building corner DB...');
-  const corner = buildCornerDB();
-  if (dbg) console.error('[DB] corner DB size=' + corner.came.size);
-  const edge = buildEdgeDB();
-  if (dbg) console.error('[DB] edge DB size=' + edge.came.size + ' gens=' + edge.genCount);
-  DB = { corner, edge };
-  return DB;
-}
-
-// Walk a BFS "came" map (built outward from START) to recover the forward path
-// START->key, then invert it to get key->START.
-function pathToStart(came, key) {
-  const segs = [];
-  let k = key;
-  while (came.get(k) !== null) { const e = came.get(k); segs.push(e.moves); k = e.prevKey; }
-  segs.reverse();
-  const forward = [];
-  for (const seg of segs) for (const m of seg) forward.push(m);
-  return moveSeqInverse(forward);
-}
-
-// =============================================================================
-// solve()
-// =============================================================================
-function solve(input) {
-  let abs;
-  if (Array.isArray(input)) abs = abstractFromProxies(input);
-  else if (input && Array.isArray(input.pieces)) abs = abstractFromProxies(input.pieces);
-  else if (input && input.abstract) abs = cloneState(input.abstract);
-  else if (input && typeof input === 'object' && input['tc-0']) abs = cloneState(input);
-  else throw new Error('solve: unrecognized input format');
-
-  let st = abstractToFast(abs);
-  if (fSolved(st)) return [];
-  ensureDB();
-
-  const solution = [];
-  const push = (mv) => { st = fApply(st, mv); solution.push(mv); };
-
-  // Phase 1: cube shape
-  const shapePath = solveShape(st);
-  if (shapePath === null) throw new Error('solve: failed to reach cube shape');
-  for (const mv of shapePath) push(mv);
-
-  // align
-  let al = fAlign(st);
-  if (!al) throw new Error('solve: align failed');
-  for (const mv of al.moves) push(mv);
-
-  // Phase 2a: corners
-  const ck = fCornerKey(st);
-  if (!DB.corner.came.has(ck)) throw new Error('solve: corner state not in DB');
-  for (const mv of pathToStart(DB.corner.came, ck)) push(mv);
-  al = fAlign(st); for (const mv of al.moves) push(mv);
-
-  // Phase 2b: edges + middle
-  const ek = fEdgeKey(st);
-  if (!DB.edge.came.has(ek)) throw new Error('solve: edge state not in DB (corners=' + fCornersSolved(st) + ')');
-  for (const mv of pathToStart(DB.edge.came, ek)) push(mv);
-
-  // final cleanup alignment
-  if (!fSolved(st)) { const fix = fAlign(st); if (fix) for (const mv of fix.moves) push(mv); }
-  if (!fSolved(st)) {
-    for (let a = 0; a < 12 && !fSolved(st); a++) for (let b = 0; b < 12; b++) {
-      if (fSolved(fD(fU(st, a), b))) { if (a) push({ type: 'U', amount: a }); if (b) push({ type: 'D', amount: b }); break; }
-    }
-  }
-  if (!fSolved(st)) throw new Error('solve: did not reach solved state');
-
-  return normalizeMoves(solution);
-}
-
-// merge consecutive same-layer turns; drop no-ops; amounts in [-6..6]\{0}
 function normalizeMoves(moves) {
   const out = [];
   for (const mv of moves) {
@@ -8708,51 +8589,249 @@ function normalizeMoves(moves) {
   return out;
 }
 
-// abstract helpers (kept for callers / tests)
-function applyAbstract(state, mv) {
-  // operate via fast state then convert back
-  const f = abstractToFast(state);
-  const nf = fApply(f, mv);
-  return fastToAbstract(nf);
-}
-function fastToAbstract(f) {
-  const s = {};
-  for (let i = 0; i < 16; i++) {
-    const id = IDS[i];
-    s[id] = { kind: IS_CORNER[i] ? 'corner' : 'edge', layer: f.p[i] >= 12 ? 'B' : 'T', slot: f.p[i] % 12, flip: f.f[i] };
+// =============================================================================
+// createSolver(arrayBuffer) — decode the asset and return the solving API.
+// =============================================================================
+function createSolver(arrayBuffer) {
+  const buf = arrayBuffer instanceof ArrayBuffer ? arrayBuffer
+    : (arrayBuffer.buffer ? arrayBuffer.buffer.slice(arrayBuffer.byteOffset, arrayBuffer.byteOffset + arrayBuffer.byteLength) : arrayBuffer);
+  const view = new DataView(buf);
+  const u8 = new Uint8Array(buf);
+  let off = 0;
+  const rd32 = () => { const v = view.getUint32(off, true); off += 4; return v; };
+  const align4 = () => { off = (off + 3) & ~3; };
+
+  // ---- header ----
+  const magic = rd32();
+  if (magic !== 0x53513142) throw new Error('createSolver: bad magic 0x' + magic.toString(16));
+  const version = rd32();
+  if (version !== 1) throw new Error('createSolver: unsupported version ' + version);
+  const SHAPE_N = rd32();
+  const SPARSE_N = rd32();
+  const shapeRootDense = rd32();
+  const BITWORDS = rd32();
+  const NBLOCKS = rd32();
+  const CORNER_N = rd32();
+  const cornerRootRank = rd32();
+  const cornerSeqCount = rd32();
+  const EDGE_N = rd32();
+  const edgeRootRank = rd32();
+  const edgeGenCount = rd32();
+  rd32(); rd32(); rd32(); // reserved
+  if (off !== 64) throw new Error('header parse off=' + off);
+
+  // ---- shape rank support ----
+  const cfgCount = rd32();
+  const configs = new Array(cfgCount);
+  for (let i = 0; i < cfgCount; i++) { const cornerMask = rd32(); const edgeMask = rd32(); configs[i] = { cornerMask, edgeMask }; }
+  rd32(); rd32(); // ncMin, ncMax (informational; re-derived)
+  // group(start,len) and offset arrays — informational; makeShapeRankTables re-derives identical values.
+  // We must consume them to advance the offset. Count = number of distinct nc in configs.
+  // Re-derive ncList from configs to know how many entries to read.
+  const ST = makeShapeRankTables(configs);
+  const ncCount = ST.ncList.length;
+  for (let i = 0; i < ncCount; i++) { rd32(); rd32(); } // group start,len
+  for (let i = 0; i < ncCount; i++) { rd32(); }          // offset
+  if (ST.sparseMax !== SPARSE_N) throw new Error('createSolver: sparseMax mismatch ' + ST.sparseMax + ' vs ' + SPARSE_N);
+
+  // ---- shape body (typed-array views over the buffer; no copy) ----
+  // Each Uint32 region is preceded by align4() padding written by the builder, so
+  // its byteOffset is a multiple of 4 and zero-copy views are valid.
+  align4();
+  const shapeParent = new Uint32Array(buf, off, SHAPE_N); off += SHAPE_N * 4;
+  const shapeMv = new Uint8Array(buf, off, SHAPE_N); off += SHAPE_N;
+  align4();
+  const bitmap = new Uint32Array(buf, off, BITWORDS); off += BITWORDS * 4;
+  const blockPrefix = new Uint32Array(buf, off, NBLOCKS); off += NBLOCKS * 4;
+  const BLOCK_WORDS = 32;
+
+  function sparseToDense(sr) {
+    const word = sr >>> 5, bit = sr & 31;
+    const block = (word / BLOCK_WORDS) | 0;
+    let r = blockPrefix[block];
+    const base = block * BLOCK_WORDS;
+    for (let w = base; w < word; w++) r += popcount32(bitmap[w]);
+    r += popcount32(bitmap[word] & ((1 << bit) - 1));
+    return r;
   }
-  s['mid-L'] = { kind: 'middle', side: f.m[0] === 1 ? 'R' : 'L', flip: f.m[1] };
-  s['mid-R'] = { kind: 'middle', side: f.m[2] === 1 ? 'R' : 'L', flip: f.m[3] };
-  return s;
+  function shapePresent(sr) {
+    return (bitmap[sr >>> 5] & (1 << (sr & 31))) !== 0;
+  }
+
+  // ---- corner body ----
+  align4();
+  const cornerSeqTableBytes = rd32();
+  const cornerSeqs = new Array(cornerSeqCount);
+  { let p = off; for (let i = 0; i < cornerSeqCount; i++) { const len = u8[p++]; const arr = new Array(len); for (let j = 0; j < len; j++) arr[j] = decodeMoveByte(u8[p++]); cornerSeqs[i] = arr; } off += cornerSeqTableBytes; }
+  align4();
+  const cornerParent = new Uint32Array(buf, off, CORNER_N); off += CORNER_N * 4;
+  const cornerSeqId = new Uint16Array(buf, off, CORNER_N); off += CORNER_N * 2;
+
+  // ---- edge body ----
+  align4();
+  const edgeSeqTableBytes = rd32();
+  const edgeGens = new Array(edgeGenCount);
+  { let p = off; for (let i = 0; i < edgeGenCount; i++) { const len = u8[p++]; const arr = new Array(len); for (let j = 0; j < len; j++) arr[j] = decodeMoveByte(u8[p++]); edgeGens[i] = arr; } off += edgeSeqTableBytes; }
+  align4();
+  const edgeParent = new Uint32Array(buf, off, EDGE_N); off += EDGE_N * 4;
+  const edgeGen = new Uint8Array(buf, off, EDGE_N); off += EDGE_N;
+
+  // =====================================================================
+  // Path reconstruction by walking parent ranks.
+  // =====================================================================
+
+  // SHAPE: solveShape(start) — find dense rank, walk parents to root collecting the
+  // per-state single move (parent->this), reverse to get cube->start forward, invert.
+  function solveShape(start) {
+    if (fIsCube(start)) return [];
+    const sr = shapeSparseRank(start, ST);
+    if (sr < 0 || sr >= SPARSE_N || !shapePresent(sr)) return null;
+    let dense = sparseToDense(sr);
+    const rev = [];
+    // walk to root (root has mv byte 0 and parent==self)
+    let guard = 0;
+    while (dense !== shapeRootDense) {
+      const mv = decodeShapeMove(shapeMv[dense]);
+      if (mv === null) break; // safety
+      rev.push(mv);
+      dense = shapeParent[dense];
+      if (++guard > 1000) throw new Error('solveShape: walk overflow');
+    }
+    rev.reverse(); // cube->start forward
+    return moveSeqInverse(rev);
+  }
+
+  // CORNER: pathToStart over rank -> walk parents collecting the move-seq (parent->this),
+  // reverse the sequence-of-sequences, flatten, invert.
+  function cornerPathToStart(rank) {
+    const segs = [];
+    let r = rank, guard = 0;
+    while (r !== cornerRootRank) {
+      const sid = cornerSeqId[r];
+      if (sid === 0xFFFF) break;
+      segs.push(cornerSeqs[sid]);
+      r = cornerParent[r];
+      if (++guard > 100000) throw new Error('cornerPath: walk overflow');
+    }
+    segs.reverse();
+    const forward = [];
+    for (const seg of segs) for (const m of seg) forward.push(m);
+    return moveSeqInverse(forward);
+  }
+
+  // EDGE: same but transitions are generators indexed by edgeGen.
+  function edgePathToStart(rank) {
+    const segs = [];
+    let r = rank, guard = 0;
+    while (r !== edgeRootRank) {
+      const gi = edgeGen[r];
+      if (gi === 0xFF) break;
+      segs.push(edgeGens[gi]);
+      r = edgeParent[r];
+      if (++guard > 100000) throw new Error('edgePath: walk overflow');
+    }
+    segs.reverse();
+    const forward = [];
+    for (const seg of segs) for (const m of seg) forward.push(m);
+    return moveSeqInverse(forward);
+  }
+
+  // =====================================================================
+  // solve()
+  // =====================================================================
+  function solve(input) {
+    let abs;
+    if (Array.isArray(input)) abs = abstractFromProxies(input);
+    else if (input && Array.isArray(input.pieces)) abs = abstractFromProxies(input.pieces);
+    else if (input && input.abstract) abs = cloneState(input.abstract);
+    else if (input && typeof input === 'object' && input['tc-0']) abs = cloneState(input);
+    else throw new Error('solve: unrecognized input format');
+
+    let st = abstractToFast(abs);
+    if (fSolved(st)) return [];
+
+    const solution = [];
+    const push = (mv) => { st = fApply(st, mv); solution.push(mv); };
+
+    // Phase 1: cube shape
+    const shapePath = solveShape(st);
+    if (shapePath === null) throw new Error('solve: failed to reach cube shape');
+    for (const mv of shapePath) push(mv);
+
+    // align
+    let al = fAlign(st);
+    if (!al) throw new Error('solve: align failed');
+    for (const mv of al.moves) push(mv);
+
+    // Phase 2a: corners
+    const crank = cornerRank(st);
+    if (crank < 0 || crank >= CORNER_N) throw new Error('solve: corner rank out of range');
+    for (const mv of cornerPathToStart(crank)) push(mv);
+    al = fAlign(st); for (const mv of al.moves) push(mv);
+
+    // Phase 2b: edges + middle
+    const erank = edgeRank(st);
+    if (erank < 0 || erank >= EDGE_N) throw new Error('solve: edge rank out of range (corners=' + fCornersSolved(st) + ')');
+    for (const mv of edgePathToStart(erank)) push(mv);
+
+    // final cleanup alignment
+    if (!fSolved(st)) { const fix = fAlign(st); if (fix) for (const mv of fix.moves) push(mv); }
+    if (!fSolved(st)) {
+      for (let a = 0; a < 12 && !fSolved(st); a++) for (let b = 0; b < 12; b++) {
+        if (fSolved(fD(fU(st, a), b))) { if (a) push({ type: 'U', amount: a }); if (b) push({ type: 'D', amount: b }); break; }
+      }
+    }
+    if (!fSolved(st)) throw new Error('solve: did not reach solved state');
+
+    return normalizeMoves(solution);
+  }
+
+  // abstract helpers (parity with solver.js exports)
+  function applyAbstract(state, mv) { return fastToAbstract(fApply(abstractToFast(state), mv)); }
+  function canSliceState(state) { return fCanSlice(abstractToFast(state)); }
+  function isSolvedState(state) { return fSolved(abstractToFast(state)); }
+
+  return {
+    solve,
+    solvedAbstractState,
+    abstractFromProxies,
+    fastToAbstract,
+    applyAbstract,
+    canSliceState,
+    isSolvedState,
+  };
 }
-function canSliceState(state) { return fCanSlice(abstractToFast(state)); }
-function isSolvedState(state) { return fSolved(abstractToFast(state)); }
-  // Generate a clean, always-legal scramble in the solver's own model: pick a
-  // top/bottom amount per round such that the slice is legal, so no slice is ever
-  // skipped and each turn is a single move (not a run of 30° unit turns).
+
+  // legal, clean Square-1 scramble in the abstract engine (no DB asset needed)
   function scramble(rnd) {
-    let st = fastSolved();
-    const out = [];
+    let st = fastSolved(); const out = [];
     for (let r = 0; r < 13; r++) {
       let a = 0, b = 0, su = null;
-      for (let t = 0; t < 80; t++) {
-        a = Math.floor(rnd() * 12); b = Math.floor(rnd() * 12);
-        const cand = fD(fU(st, a), b);
-        if (fCanSlice(cand)) { su = cand; break; }
-      }
+      for (let t = 0; t < 80; t++) { a = Math.floor(rnd()*12); b = Math.floor(rnd()*12); const cand = fD(fU(st, a), b); if (fCanSlice(cand)) { su = cand; break; } }
       if (!su) continue;
       st = fSlice(su);
-      const za = (a > 6 ? a - 12 : a), zb = (b > 6 ? b - 12 : b);   // reduce to [-5,6]
+      const za = (a > 6 ? a - 12 : a), zb = (b > 6 ? b - 12 : b);
       if (za) out.push({ type: 'U', amount: za });
       if (zb) out.push({ type: 'D', amount: zb });
       out.push({ type: 'slice' });
     }
     return out;
   }
-  return { solve, scramble };
+  return { createSolver, scramble };
 })();
-function sq1SolveFull() {
-  let moves; try { moves = sq1Solver.solve(sq1Pieces); } catch (e) { return null; }
+let _sq1Solve = null, _sq1Loading = null;
+function sq1AssetInit() {
+  if (_sq1Solve || _sq1Loading) return _sq1Loading;
+  _sq1Loading = fetch('./sq1-tables.bin')
+    .then(r => { if (!r.ok) throw new Error('sq1 asset ' + r.status); return r.arrayBuffer(); })
+    .then(buf => { _sq1Solve = sq1Mod.createSolver(buf).solve; })
+    .catch(() => { _sq1Loading = null; });
+  return _sq1Loading;
+}
+async function sq1SolveFull() {
+  if (!_sq1Solve) await sq1AssetInit();
+  if (!_sq1Solve) return null;
+  let moves; try { moves = _sq1Solve(sq1Pieces); } catch (e) { return null; }
   return moves ? sq1MovesToToks(moves) : null;
 }
 const puzzleSq1 = {
@@ -8808,6 +8887,7 @@ function switchPuzzle(id) {
     camera.position.set(0.46, 0.42, 0.78).normalize().multiplyScalar(fit);
     controls.update();
   } else if (id === 'sq1') {                                // shape-shifts → extra room
+    sq1AssetInit();                                         // fetch+decode the precomputed solver DBs now
     const fit = Math.max(7, Math.min(15, 8 / Math.min(1, camera.aspect)));
     camera.position.set(0.5, 0.5, 0.72).normalize().multiplyScalar(fit);
     controls.update();
