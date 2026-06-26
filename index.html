@@ -6893,102 +6893,36 @@ function cube3Scramble() {                                        // random-move
   }
   return toks;
 }
-/* ===== 3×3 solver — table-free beginner-CFOP (CommonJS solver2.js wrapped as an IIFE).
-   Browser-safe: instant load, ~5 MB, ~146-move non-optimal but always-correct solutions. ===== */
-const cube3Solver = (function () {
+/* ===== 3×3 solver — Kociemba two-phase, loaded from a precomputed static asset
+   (cube3-tables.bin, ~5.55 MB move+pruning tables). cube3Mod.createSolver decodes
+   it (~0.1 ms, zero-copy views); solve() returns ~20-move solutions in ~22 ms on
+   the main thread (was ~146 moves with the old beginner method). ===== */
+const cube3Mod = (function () {
+'use strict';
 
 /*
- * Self-contained, BROWSER-SAFE 3x3 Rubik's Cube solver.
+ * solver-kociemba.js — near-optimal 3x3 Rubik's Cube solver via Kociemba's
+ * two-phase algorithm. Browser-safe: no fs / three / node APIs. Receives the
+ * precomputed tables as an ArrayBuffer (built offline by build-cube3-asset.mjs).
  *
- * METHOD: a purely algorithmic layer-by-layer / beginner-CFOP solver. No
- * precomputed pattern databases, no BFS distance tables, no multi-second
- * initialization. Everything is short local searches (a handful of moves to
- * place each piece) plus fixed last-layer algorithm sets applied with
- * setup/AUF. Load and first-solve are effectively instant (< ~50 ms) and the
- * memory footprint is trivial (< ~5 MB). Solutions are non-optimal but always
- * bounded (~60-130 moves typical) and it ALWAYS solves a solvable cube.
+ * PUBLIC API:
+ *   const { solve } = createSolver(arrayBuffer);
+ *   const moves = solve(facelets);   // 54-char Kociemba facelet string
  *
- * Phases:
- *   1. White cross on D            (D-layer cross edges placed & oriented)
- *   2. First-layer (D) corners     (white corners placed)
- *   3. Second-layer edges          (E-slice edges placed)
- *   4. Last-layer edge orientation (yellow cross on U)  -- 2-look OLL part 1
- *   5. Last-layer corner orientation                    -- 2-look OLL part 2
- *   6. Last-layer permutation (corners then edges)      -- 2-look PLL
+ * `solve(facelets)` returns an array of move tokens from
+ *   { U U' U2 R R' R2 F F' F2 D D' D2 L L' L2 B B' B2 }
+ * that, applied in order, solve the cube. solve(SOLVED) === [].
+ * Throws on invalid / unsolvable input.
  *
- * Note on color convention: in the Kociemba facelet convention used here the
- * U face is "white/U", D is "yellow/D". This solver builds the first layer on
- * the *bottom* (D) face and the last layer on the *top* (U) face, so the
- * standard U-layer algorithms apply directly. No whole-cube rotations are ever
- * emitted; the solver only uses {U,R,F,D,L,B} face turns.
- *
- * FACELET CONVENTION (Kociemba order), identical to solver.js — see
- * facelet-convention.md. A 54-char string of letters U/R/F/D/L/B; faces in the
- * order U,R,F,D,L,B (9 each); centers fixed at indices 4/13/22/31/40/49;
- * solved = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB".
- *
- * solve(facelets) -> array of tokens from
- *   { U,U',U2, R,R',R2, F,F',F2, D,D',D2, L,L',L2, B,B',B2 }.
- * Returns [] if already solved. Throws on invalid/unsolvable input. Before
- * returning, solve() re-applies its own solution through the facelet engine and
- * asserts the cube is solved.
+ * Facelet convention (Kociemba order): faces U,R,F,D,L,B (9 each); centers at
+ * 4,13,22,31,40,49. Solved = UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB
  */
 
 // ===========================================================================
-// 1. FACELET MOVE ENGINE  (reused verbatim from solver.js — same source of
-//    truth, so this model and the engine cannot disagree)
+// Facelet <-> cubie mapping (identical ordering to solver2.js)
 // ===========================================================================
-
 const FACE_ORDER = ['U', 'R', 'F', 'D', 'L', 'B'];
 const SOLVED = 'UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB';
-
-// BASE_PERM[f][i] is the source index for a clockwise quarter turn of face f:
-// newState[i] = oldState[BASE_PERM[f][i]]. (Geometrically derived & verified in
-// solver.js: 4x = identity, centers fixed, "CW as seen from outside".)
-const BASE_PERM = {
-  U: [6,3,0,7,4,1,8,5,2,45,46,47,12,13,14,15,16,17,9,10,11,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,18,19,20,39,40,41,42,43,44,36,37,38,48,49,50,51,52,53],
-  R: [0,1,20,3,4,23,6,7,26,15,12,9,16,13,10,17,14,11,18,19,29,21,22,32,24,25,35,27,28,51,30,31,48,33,34,45,36,37,38,39,40,41,42,43,44,8,46,47,5,49,50,2,52,53],
-  F: [0,1,2,3,4,5,44,41,38,6,10,11,7,13,14,8,16,17,24,21,18,25,22,19,26,23,20,15,12,9,30,31,32,33,34,35,36,37,27,39,40,28,42,43,29,45,46,47,48,49,50,51,52,53],
-  D: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,24,25,26,18,19,20,21,22,23,42,43,44,33,30,27,34,31,28,35,32,29,36,37,38,39,40,41,51,52,53,45,46,47,48,49,50,15,16,17],
-  L: [53,1,2,50,4,5,47,7,8,9,10,11,12,13,14,15,16,17,0,19,20,3,22,23,6,25,26,18,28,29,21,31,32,24,34,35,42,39,36,43,40,37,44,41,38,45,46,33,48,49,30,51,52,27],
-  B: [11,14,17,3,4,5,6,7,8,9,10,35,12,13,34,15,16,33,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,36,39,42,2,37,38,1,40,41,0,43,44,51,48,45,52,49,46,53,50,47],
-};
-
-function invertPerm(p) {
-  const inv = new Array(54);
-  for (let i = 0; i < 54; i++) inv[p[i]] = i;
-  return inv;
-}
-function composePerm(p, q) {
-  const r = new Array(54);
-  for (let i = 0; i < 54; i++) r[i] = p[q[i]];
-  return r;
-}
-
-const MOVE_PERM = {};
-for (const f of FACE_ORDER) {
-  const cw = BASE_PERM[f];
-  MOVE_PERM[f] = cw;
-  MOVE_PERM[f + "'"] = invertPerm(cw);
-  MOVE_PERM[f + '2'] = composePerm(cw, cw);
-}
-const ALL_MOVES = Object.keys(MOVE_PERM);
-
-function applyMove(state, token) {
-  const p = MOVE_PERM[token];
-  if (!p) throw new Error('unknown move token: ' + token);
-  const arr = new Array(54);
-  for (let i = 0; i < 54; i++) arr[i] = state[p[i]];
-  return arr.join('');
-}
-function applyMoves(state, moves) {
-  for (const m of moves) state = applyMove(state, m);
-  return state;
-}
-
-// ===========================================================================
-// 2. CUBIE MODEL — validation + solvability (reused from solver.js)
-// ===========================================================================
 
 const CORNER_FACELETS = [
   [8, 9, 20], [6, 18, 38], [0, 36, 47], [2, 45, 11],
@@ -7007,6 +6941,22 @@ const EDGE_COLORS = [
   ['D', 'L'], ['D', 'B'], ['F', 'R'], ['F', 'L'], ['B', 'L'], ['B', 'R'],
 ];
 
+// The 18 move tokens in build-script column order:
+//   U U2 U' R R2 R' F F2 F' D D2 D' L L2 L' B B2 B'
+const MOVE_TOKENS = [
+  'U', 'U2', "U'", 'R', 'R2', "R'", 'F', 'F2', "F'",
+  'D', 'D2', "D'", 'L', 'L2', "L'", 'B', 'B2', "B'",
+];
+// Phase-2 move column -> absolute move index (matches PHASE2_MOVE_INDICES).
+const PHASE2_MOVE_INDICES = [0, 1, 2, 4, 7, 9, 10, 11, 13, 16];
+// Each move's face id 0..5 (for pruning consecutive same-face / opposite-face).
+const MOVE_FACE = [0, 0, 0, 1, 1, 1, 2, 2, 2, 3, 3, 3, 4, 4, 4, 5, 5, 5];
+// Opposite faces: U(0)/D(3), R(1)/L(4), F(2)/B(5).
+const OPP_FACE = [3, 4, 5, 0, 1, 2];
+
+// ===========================================================================
+// Validation (mirrors solver2.js validate)
+// ===========================================================================
 function permParity(perm) {
   let parity = 0;
   const seen = new Array(perm.length).fill(false);
@@ -7019,8 +6969,8 @@ function permParity(perm) {
   return parity;
 }
 
-// Validate input string + solvability. Throws on any problem. Returns nothing.
-function validate(facelets) {
+// Parse a facelet string into cubie arrays {cp,co,ep,eo}; throws if invalid.
+function faceletsToCubies(facelets) {
   if (typeof facelets !== 'string' || facelets.length !== 54) {
     throw new Error('facelets must be a 54-character string');
   }
@@ -7079,541 +7029,295 @@ function validate(facelets) {
   if (permParity(cp) !== permParity(ep)) {
     throw new Error('unsolvable: permutation parity mismatch');
   }
+
+  return { cp, co, ep, eo };
 }
 
 // ===========================================================================
-// 3. SOLVER STATE WRAPPER
+// Coordinate encoders (must match build-cube3-asset.mjs exactly)
 // ===========================================================================
-//
-// We mutate a facelet string and record the move list. All "is this piece in
-// place?" tests read directly off the facelet string, so the model is the
-// engine — there is no separate cubie bookkeeping that could drift.
-
-function makeState(facelets) {
-  return { s: facelets, moves: [] };
+function Cnk(n, k) {
+  if (k < 0 || k > n) return 0;
+  if (k > n - k) k = n - k;
+  let r = 1;
+  for (let i = 0; i < k; i++) r = (r * (n - i)) / (i + 1);
+  return Math.round(r);
 }
-function move(st, token) {
-  st.s = applyMove(st.s, token);
-  st.moves.push(token);
-}
-function seq(st, str) {
-  // Apply a space-separated algorithm string.
-  if (!str) return;
-  for (const t of str.split(/\s+/)) if (t) move(st, t);
-}
-
-// Centers (fixed) tell us which colour each face is. Indexed by face letter.
-// They are always U/R/F/D/L/B by validation, but read them for clarity.
-const C = { U: 'U', R: 'R', F: 'F', D: 'D', L: 'L', B: 'B' };
-
-// Helper: locate an edge cubie (given its two colours, unordered) — returns the
-// edge SLOT index 0..11 that currently holds it, plus orientation (which colour
-// faces the "primary" sticker). We just scan EDGE_FACELETS/colours of current s.
-function findEdge(s, colA, colB) {
-  for (let slot = 0; slot < 12; slot++) {
-    const a = s[EDGE_FACELETS[slot][0]];
-    const b = s[EDGE_FACELETS[slot][1]];
-    if ((a === colA && b === colB) || (a === colB && b === colA)) {
-      return { slot, a, b };
-    }
+function getTwist(co) { let t = 0; for (let i = 0; i < 7; i++) t = t * 3 + co[i]; return t; }
+function getFlip(eo) { let f = 0; for (let i = 0; i < 11; i++) f = f * 2 + eo[i]; return f; }
+function getUDSlice(ep) {
+  const pos = [];
+  for (let i = 0; i < 12; i++) if (ep[i] >= 8) pos.push(i);
+  let rank = 0, prev = -1;
+  for (let i = 0; i < 4; i++) {
+    for (let v = prev + 1; v < pos[i]; v++) rank += Cnk(11 - v, 3 - i);
+    prev = pos[i];
   }
-  return null;
+  return rank;
 }
-function findCorner(s, cols) {
-  // cols: array of 3 colours (unordered). Returns slot 0..7 + the stickers.
-  const want = cols.slice().sort().join('');
-  for (let slot = 0; slot < 8; slot++) {
-    const st = CORNER_FACELETS[slot].map((i) => s[i]);
-    if (st.slice().sort().join('') === want) return { slot, st };
+function getPerm(arr) {
+  const n = arr.length; let idx = 0;
+  for (let i = n - 1; i > 0; i--) {
+    let s = 0;
+    for (let j = i - 1; j >= 0; j--) if (arr[j] > arr[i]) s++;
+    idx = (idx + s) * i;
   }
-  return null;
+  return idx;
 }
+function getCornerPerm(cp) { return getPerm(cp); }
+function getEdge8Perm(ep) { return getPerm(ep.slice(0, 8)); }
+function getSlicePerm(ep) { return getPerm([ep[8] - 8, ep[9] - 8, ep[10] - 8, ep[11] - 8]); }
 
 // ===========================================================================
-// 4. PHASE 1 — WHITE (D) CROSS
+// createSolver: decode tables, return { solve }
 // ===========================================================================
-//
-// Place the four D-layer edges (D paired with F, R, B, L) into the D face with
-// correct orientation. Strategy: bring each target edge to the U layer (top),
-// align it over its destination, then drop it with a double turn of the
-// side face. A bounded local approach with a couple of fixed cases handles
-// every starting position.
-
-// The four D-cross edges, by the side colour they pair with D. `drops` are the
-// two F2L-safe insertion algs for the slot: the first drops a U-layer edge that
-// is correctly oriented (D-sticker on top) straight down with a double turn of
-// the side face; the second is the 3-move "flip insert" for an edge whose
-// D-sticker faces sideways. With AUF (via solveStepMulti) these two algs cover
-// all eight U-layer cases, and each keeps the previously-placed cross edges
-// intact (derived & verified exhaustively against the engine).
-const D_CROSS = [
-  { side: 'F', face: 'F', dEdgeSlot: 5, uEdgeSlot: 1, drops: [['F2'], ['R', "'", 'F', 'R']] },
-  { side: 'R', face: 'R', dEdgeSlot: 4, uEdgeSlot: 0, drops: [['R2'], ['F', 'R', "'", 'F', "'"]] },
-  { side: 'B', face: 'B', dEdgeSlot: 7, uEdgeSlot: 3, drops: [['B2'], ['R', 'B', "'", 'R', "'"]] },
-  { side: 'L', face: 'L', dEdgeSlot: 6, uEdgeSlot: 2, drops: [['L2'], ['F', "'", 'L', 'F']] },
-];
-// Normalise the inline drop algs (the "'" sits as its own token above for
-// readability) into proper move tokens like "R'".
-for (const t of D_CROSS) {
-  t.drops = t.drops.map((alg) => {
-    const out = [];
-    for (const tok of alg) {
-      if (tok === "'") out[out.length - 1] += "'";
-      else out.push(tok);
-    }
-    return out;
-  });
-}
-
-// Bring a single D-cross edge (D + side colour) home. We use a brute, but
-// strictly bounded, approach: try every combination of (U rotation 0..3) then a
-// short fixed insertion, checking the engine, falling back through cases.
-// To keep it simple and ALWAYS correct, we do an exhaustive bounded search of
-// short move sequences that places THIS edge without disturbing already-placed
-// D-cross edges. Search depth is tiny so it is instant.
-
-// Generic bounded breadth-first search that places ONE piece: search sequences
-// over the given move set up to a small depth cap, accepting the first that
-// makes goal(s) true and keeps keep(s) true. A visited set on the facelet string
-// makes this a true BFS — states are never re-expanded — so it is fast and the
-// frontier stays small even though the depth cap looks generous. (The earlier
-// version was an iterative-deepening DFS WITHOUT a visited set, which re-explored
-// states and blew up exponentially; the visited set is the crucial fix.)
-//
-// We also prune "two turns of the same face in a row" (redundant) to shrink the
-// branching factor. Because every cross / first-layer / middle-layer piece is
-// reachable in only a handful of moves when the U layer is free as a buffer, the
-// reachable shell within the cap is tiny and the search is effectively instant.
-function placeBoundedBFS(start, goal, keep, maxDepth, moveSet) {
-  if (goal(start) && keep(start)) return [];
-  const MOVES = moveSet || ALL_MOVES;
-  const seen = new Set([start]);
-  // frontier entries: { s, path, lastFace }
-  let frontier = [{ s: start, path: [], lastFace: '' }];
-  for (let d = 0; d < maxDepth; d++) {
-    const next = [];
-    for (const node of frontier) {
-      for (const mv of MOVES) {
-        const f = mv[0];
-        if (f === node.lastFace) continue; // no two same-face turns in a row
-        const ns = applyMove(node.s, mv);
-        if (seen.has(ns)) continue;
-        seen.add(ns);
-        const path = node.path.concat(mv);
-        if (goal(ns) && keep(ns)) return path;
-        next.push({ s: ns, path, lastFace: f });
-      }
-    }
-    frontier = next;
-    if (frontier.length === 0) break;
+function createSolver(arrayBuffer) {
+  const ab = arrayBuffer;
+  const u8 = new Uint8Array(ab);
+  if (u8[0] !== 0x4b || u8[1] !== 0x43 || u8[2] !== 0x33 || u8[3] !== 0x31) {
+    throw new Error('bad table magic (expected KC31)');
   }
-  return null;
-}
+  const dv = new DataView(ab);
+  const version = dv.getUint32(4, true);
+  if (version !== 1) throw new Error('unsupported table version ' + version);
 
-// Is the (D + side colour) cross edge currently a U-LAYER edge (slot 0..3)?
-function crossEdgeInU(s, dCol, sideCol) {
-  const want = [dCol, sideCol].slice().sort().join('');
-  for (let slot = 0; slot < 4; slot++) {
-    const got = EDGE_FACELETS[slot].map((i) => s[i]).sort().join('');
-    if (got === want) return true;
+  const N_TWIST = 2187, N_FLIP = 2048, N_SLICE = 495;
+  const N_CORNPERM = 40320, N_EDGE8 = 40320, N_SLICEPERM = 24;
+
+  let off = 8;
+  function takeU16(count) { const a = new Uint16Array(ab, off, count); off += count * 2; return a; }
+  function takeU8(count) { const a = new Uint8Array(ab, off, count); off += count; return a; }
+
+  const twistMove = takeU16(N_TWIST * 18);
+  const flipMove = takeU16(N_FLIP * 18);
+  const sliceMove = takeU16(N_SLICE * 18);
+  const cornPermMove = takeU16(N_CORNPERM * 10);
+  const edge8Move = takeU16(N_EDGE8 * 10);
+  const slicePermMove = takeU16(N_SLICEPERM * 10);
+  const pruneFlipSlice = takeU8(N_FLIP * N_SLICE);
+  const pruneTwistSlice = takeU8(N_TWIST * N_SLICE);
+  const pruneCornSlice = takeU8(N_CORNPERM * N_SLICEPERM);
+  const pruneEdge8Slice = takeU8(N_EDGE8 * N_SLICEPERM);
+
+  if (off !== ab.byteLength) {
+    throw new Error('table size mismatch: consumed ' + off + ' of ' + ab.byteLength);
   }
-  return false;
-}
 
-function solveCross(st) {
-  // Place each D-cross edge one at a time, keeping previously placed ones.
-  // Order: F, R, B, L. Two stages per edge:
-  //   (1) If the edge is not already a U-layer edge, lift it to the U layer with
-  //       a tiny depth<=3 BFS that keeps placed cross edges. The goal here (any
-  //       U-layer position, either orientation) is reachable in at most a couple
-  //       of moves, so this never exhausts the shell — it returns almost
-  //       immediately and is trivially cheap.
-  //   (2) Drop it home with AUF + the slot's two F2L-safe drop algs
-  //       (solveStepMulti). Both stages are bounded and table-tiny: no deep BFS.
-  const placed = [];
-  const sideColOf = (p) => C[p.side];
-  for (const t of D_CROSS) {
-    const sideCol = C[t.side];
-    const dCol = C.D;
-    const dPair = EDGE_FACELETS[t.dEdgeSlot]; // [D-sticker idx, side-sticker idx]
-    // keep: all previously placed cross edges remain solved & oriented.
-    const keep = (s) => placed.every((p) => {
-      const dp = EDGE_FACELETS[p.dEdgeSlot];
-      return s[dp[0]] === C.D && s[dp[1]] === sideColOf(p);
-    });
+  // Solved UDSlice coordinate (E-slice edges at positions 8..11). Under our
+  // lex-rank encoding this is the max rank (494), not 0 — phase 1's G1 target.
+  const SOLVED_SLICE = getUDSlice([0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
 
-    // Stage 1: get the edge into the U layer (keeping placed edges).
-    if (!crossEdgeInU(st.s, dCol, sideCol)) {
-      const want = [dCol, sideCol].slice().sort().join('');
-      const inU = (s) => {
-        for (let slot = 0; slot < 4; slot++) {
-          if (EDGE_FACELETS[slot].map((i) => s[i]).sort().join('') === want) return true;
+  // ----- Phase 1 search (IDA* over twist, flip, slice) -----
+  // Returns a list of phase-1 solutions (move-index arrays) of length exactly
+  // `targetLen`, found via depth-limited DFS with pruning. We enumerate ALL
+  // phase-1 solutions of the current target length so phase 2 can be tried on
+  // each — but to keep it fast we cap how many we collect per length.
+
+  // Phase-1 pruning lower bound for a node.
+  function p1Heur(twist, flip, slice) {
+    const a = pruneTwistSlice[twist * N_SLICE + slice];
+    const b = pruneFlipSlice[flip * N_SLICE + slice];
+    return a > b ? a : b;
+  }
+
+  // Phase-2 pruning lower bound.
+  function p2Heur(cornPerm, edge8, slicePerm) {
+    const a = pruneCornSlice[cornPerm * N_SLICEPERM + slicePerm];
+    const b = pruneEdge8Slice[edge8 * N_SLICEPERM + slicePerm];
+    return a > b ? a : b;
+  }
+
+  // Solve phase 2 from a G1 state, return move-index path (absolute indices) of
+  // length <= maxLen, or null. IDA*.
+  function solvePhase2(cornPerm0, edge8Perm0, slicePerm0, maxLen) {
+    if (maxLen < 0) return null;
+    const path = new Int32Array(40);
+    let result = null;
+
+    function dfs(cornPerm, edge8, slicePerm, depth, remaining, lastFace) {
+      if (remaining === 0) {
+        if (cornPerm === 0 && edge8 === 0 && slicePerm === 0) {
+          result = path.slice(0, depth);
+          return true;
         }
         return false;
-      };
-      const lift = placeBoundedBFS(st.s, inU, keep, 4);
-      if (!lift) throw new Error('cross: could not lift ' + t.side + ' edge to U');
-      for (const mv of lift) move(st, mv);
+      }
+      const h = p2Heur(cornPerm, edge8, slicePerm);
+      if (h > remaining) return false;
+      for (let mi = 0; mi < 10; mi++) {
+        const face = MOVE_FACE[PHASE2_MOVE_INDICES[mi]];
+        if (face === lastFace) continue;
+        // avoid e.g. U then D then U; restrict to "no same face, and for
+        // opposite faces only allow a canonical order" — standard pruning.
+        if (lastFace >= 0 && OPP_FACE[face] === lastFace && face > lastFace) continue;
+        const nc = cornPermMove[cornPerm * 10 + mi];
+        const ne = edge8Move[edge8 * 10 + mi];
+        const ns = slicePermMove[slicePerm * 10 + mi];
+        path[depth] = PHASE2_MOVE_INDICES[mi];
+        if (dfs(nc, ne, ns, depth + 1, remaining - 1, face)) return true;
+      }
+      return false;
     }
 
-    // Stage 2: drop it into its D slot, oriented, keeping placed edges.
-    const goal = (s) =>
-      s[dPair[0]] === dCol && s[dPair[1]] === sideCol && keep(s);
-    const path = solveStepMulti(st.s, t.drops, goal, 3, 'cross: ' + t.side + ' edge');
-    for (const mv of path) move(st, mv);
-    placed.push(t);
+    // Start IDA* at the admissible lower bound (shorter is impossible).
+    const lb = p2Heur(cornPerm0, edge8Perm0, slicePerm0);
+    for (let len = lb; len <= maxLen; len++) {
+      if (dfs(cornPerm0, edge8Perm0, slicePerm0, 0, len, -1)) return result;
+    }
+    return null;
   }
-}
 
-// ===========================================================================
-// 5. PHASE 2 — FIRST-LAYER (D) CORNERS
-// ===========================================================================
-//
-// Place the four D corners (each contains D + two adjacent side colours) into
-// their D slots, oriented, without disturbing the cross or already-placed
-// corners. Bounded BFS again, one corner at a time.
+  // Main solve. `opts.maxTimeMs` (default 60) bounds the extra search done to
+  // shorten an already-found solution; the first valid solution is never
+  // abandoned, so correctness/termination never depend on the clock.
+  function solve(facelets, opts) {
+    const maxTimeMs = (opts && typeof opts.maxTimeMs === 'number') ? opts.maxTimeMs : 35;
+    // Stop chasing improvements once a solution this short (or shorter) is found.
+    const goodEnough = (opts && typeof opts.goodEnough === 'number') ? opts.goodEnough : 20;
+    const { cp, co, ep, eo } = faceletsToCubies(facelets);
+    if (facelets === SOLVED) return [];
 
-// D corner slots: 4 DFR, 5 DLF, 6 DBL, 7 DRB. Their colour triples:
-const D_CORNERS = [4, 5, 6, 7];
+    // Phase-1 start coordinates.
+    const twist0 = getTwist(co);
+    const flip0 = getFlip(eo);
+    const slice0 = getUDSlice(ep);
 
-// Each D-corner slot has a fixed, F2L-safe "sexy move" insertion trigger built
-// from the slot's own "right-hand" side face (R/F/L/B for DFR/DLF/DBL/DRB).
-// Applied as a repeated alg with AUF between (via solveStep), it inserts a
-// U-layer corner into the slot in ANY of its three orientations while leaving
-// the cross and the other three D corners untouched (verified exhaustively
-// against the engine). It also EJECTS whatever currently sits in the slot up to
-// the U layer, which we exploit to free wrongly-placed corners.
-const CORNER_TRIGGER = {
-  4: "R U R' U'".split(' '), // DFR
-  5: "F U F' U'".split(' '), // DLF
-  6: "L U L' U'".split(' '), // DBL
-  7: "B U B' U'".split(' '), // DRB
-};
+    // We also need the FULL cubie state to compute phase-2 coordinates after a
+    // phase-1 sequence. We re-derive phase-2 coordinates by applying the
+    // phase-1 moves to a cubie copy. Keep cubie move application local.
+    const startCubie = { cp: cp.slice(), co: co.slice(), ep: ep.slice(), eo: eo.slice() };
 
-// Is the U/D ("D-colour") corner cubie currently a U-LAYER corner (slot 0..3)?
-function cornerInU(s, cubieCols) {
-  const want = cubieCols.slice().sort().join('');
-  for (let slot = 0; slot < 4; slot++) {
-    const got = CORNER_FACELETS[slot].map((i) => s[i]).sort().join('');
-    if (got === want) return true;
-  }
-  return false;
-}
+    // Phase-1 IDA* over phase-1 length. For each phase-1 solution we run phase
+    // 2 and keep the shortest total. We bound by `bestLen`.
+    let best = null;       // array of absolute move indices
+    let bestLen = Infinity;
+    let firstHitLen = -1;  // phase-1 length at which the first full solution appeared
 
-function solveFirstLayerCorners(st) {
-  const placedCorners = [];
-  // keep: cross + all previously placed corners intact.
-  const keepBase = (s) => {
-    for (const t of D_CROSS) {
-      const dp = EDGE_FACELETS[t.dEdgeSlot];
-      if (s[dp[0]] !== C.D || s[dp[1]] !== C[t.side]) return false;
-    }
-    for (const ps of placedCorners) {
-      const pf = CORNER_FACELETS[ps], pc = CORNER_COLORS[ps];
-      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
-    }
-    return true;
-  };
+    const CUBIE_MOVES = getCubieMoves();
+    const p1path = new Int32Array(40);
 
-  for (const slot of D_CORNERS) {
-    const cols = CORNER_COLORS[slot]; // 'D' + two sides
-    const facelets = CORNER_FACELETS[slot];
+    // Soft wall-clock deadline. We only ever consult it AFTER a complete
+    // solution exists (so the first solution is never abandoned); it bounds the
+    // extra "chase a shorter solution" search so worst-case time stays small.
+    const deadline = (typeof Date !== 'undefined') ? Date.now() + maxTimeMs : Infinity;
+    let aborted = false;
 
-    // 1) If the target cubie is wedged in a D slot (the target slot misoriented,
-    //    or any not-yet-placed D slot), eject it to the U layer by applying that
-    //    holding slot's trigger once. Bounded loop: at most a few ejections.
-    for (let guard = 0; guard < 8 && !cornerInU(st.s, cols); guard++) {
-      const loc = findCorner(st.s, cols);
-      if (loc.slot < 4) break; // already in U
-      // Apply the holding slot's trigger (lifts the corner into U). Only
-      // applied to NOT-yet-placed slots; placed slots already hold the right
-      // oriented corner so the target cubie can't be there.
-      for (const mv of CORNER_TRIGGER[loc.slot]) move(st, mv);
-    }
-
-    // 2) Insert from the U layer with AUF + the slot's trigger (solveStep finds
-    //    the right AUF/repeat count for the orientation). The goal also requires
-    //    everything else stay intact, so the result is fully F2L-safe.
-    const goal = (s) =>
-      facelets.every((idx, k) => s[idx] === cols[k]) && keepBase(s);
-    const path = solveStep(st.s, CORNER_TRIGGER[slot], goal, 6,
-      'F2L corners: slot ' + slot);
-    for (const mv of path) move(st, mv);
-    placedCorners.push(slot);
-  }
-}
-
-// ===========================================================================
-// 6. PHASE 3 — SECOND-LAYER EDGES (E-slice)
-// ===========================================================================
-//
-// Place the four E-slice edges (FR, FL, BL, BR — none containing U or D) into
-// their slots, oriented, without disturbing the first two layers (everything
-// already placed in D and the middle). Bounded BFS, one edge at a time, but with
-// a deeper cap since middle-edge insertion takes more moves.
-
-const E_EDGES = [8, 9, 10, 11]; // FR, FL, BL, BR
-
-// Fixed, F2L-safe middle-edge insertion triggers (standard right/left inserts),
-// one per E slot, each using only the slot's two adjacent side faces + U. With
-// AUF (via solveStep) the right repeat count is found for either orientation,
-// and the alg leaves the cross, all D corners, and other E edges untouched
-// (verified against the engine). Applying a slot's trigger also EJECTS whatever
-// edge currently sits in that slot up to the U layer.
-const E_TRIGGER = {
-  8: "U R U' R' U' F' U F".split(' '),   // FR — right insert
-  9: "U' L' U L U F U' F'".split(' '),   // FL — left insert
-  10: "U L U' L' U' B' U B".split(' '),  // BL — right insert
-  11: "U' R' U R U B U' B'".split(' '),  // BR — left insert
-};
-
-// Is the given E-edge cubie (its two non-U/D colours) currently a U-LAYER edge?
-function edgeInU(s, cubieCols) {
-  const want = cubieCols.slice().sort().join('');
-  for (let slot = 0; slot < 4; slot++) {
-    const got = EDGE_FACELETS[slot].map((i) => s[i]).sort().join('');
-    if (got === want) return true;
-  }
-  return false;
-}
-
-function solveSecondLayer(st) {
-  const placedEdges = [];
-  const keepBase = (s) => {
-    for (const t of D_CROSS) {
-      const dp = EDGE_FACELETS[t.dEdgeSlot];
-      if (s[dp[0]] !== C.D || s[dp[1]] !== C[t.side]) return false;
-    }
-    for (const slotC of D_CORNERS) {
-      const pf = CORNER_FACELETS[slotC], pc = CORNER_COLORS[slotC];
-      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
-    }
-    for (const pe of placedEdges) {
-      const pf = EDGE_FACELETS[pe], pc = EDGE_COLORS[pe];
-      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
-    }
-    return true;
-  };
-
-  for (const slot of E_EDGES) {
-    const cols = EDGE_COLORS[slot];
-    const facelets = EDGE_FACELETS[slot];
-
-    // 1) If the target edge is stuck in a wrong (not-yet-placed) E slot, eject
-    //    it to the U layer by applying that holding slot's trigger once.
-    for (let guard = 0; guard < 8 && !edgeInU(st.s, cols); guard++) {
-      const loc = findEdge(st.s, cols[0], cols[1]);
-      if (loc.slot < 8) break; // it's a U/D-layer edge (U-layer for E pieces)
-      for (const mv of E_TRIGGER[loc.slot]) move(st, mv);
-    }
-
-    // 2) Insert from the U layer with AUF + the slot's trigger.
-    const goal = (s) =>
-      facelets.every((idx, k) => s[idx] === cols[k]) && keepBase(s);
-    const path = solveStep(st.s, E_TRIGGER[slot], goal, 3,
-      'second layer: slot ' + slot);
-    for (const mv of path) move(st, mv);
-    placedEdges.push(slot);
-  }
-}
-
-// ===========================================================================
-// 7. LAST LAYER (U) — 2-look OLL + 2-look PLL
-// ===========================================================================
-//
-// The whole first two layers are now solved. We only touch the U layer with
-// algorithms that preserve F2L. We use a robust "apply algorithm, with AUF
-// tries, until the relevant sub-goal is met" loop. Because each standard
-// algorithm restores F2L when its case is matched, and we only ever apply them
-// in matched configurations (verified by checking the engine result), F2L is
-// never broken.
-
-// To keep it bulletproof and table-free we drive each 2-look step with a single
-// fixed algorithm interleaved with AUF (U-face adjustments). Every standard
-// 2-look case is solved by a sequence of the form
-//   AUF, ALG, AUF, ALG, ..., AUF
-// using at most a small number of ALG applications. We search ONLY over the
-// AUF choices (4 each: nothing / U / U2 / U') with a hard cap on the number of
-// ALG applications, so the search is at most 4^(maxAlg+1) sequences — a few
-// hundred — and therefore instant and bounded. This is robust where greedy
-// scoring stalls (e.g. cases needing two ALG applications with no intermediate
-// improvement) without any risk of exponential blow-up.
-
-const AUFS = [[], ['U'], ['U2'], ["U'"]];
-
-// Find an [AUF, ALG, AUF, ALG, ..., AUF] sequence reaching goal(s). `alg` is a
-// token array. Returns the flat token list, or throws. maxAlg caps ALG uses.
-function solveStep(startS, alg, goal, maxAlg, errLabel) {
-  // BFS over number of ALG applications; at each, try all 4 trailing AUFs.
-  // We enumerate sequences breadth-first by alg-count so the result uses the
-  // fewest algorithm applications.
-  // Each search node carries the current string and the token path.
-  let frontier = [{ s: startS, path: [] }];
-  for (let depth = 0; depth <= maxAlg; depth++) {
-    // Try ending here: apply a trailing AUF and test goal.
-    for (const node of frontier) {
-      for (let a = 0; a < 4; a++) {
-        let s2 = node.s;
-        for (const t of AUFS[a]) s2 = applyMove(s2, t);
-        if (goal(s2)) return node.path.concat(AUFS[a]);
+    // Phase-1 DFS. We do NOT track the cubie state per node (too expensive);
+    // phase-2 coordinates are derived once at each phase-1 leaf by replaying
+    // the phase-1 move list on a cubie copy (leaves are comparatively rare).
+    function phase1dfs(twist, flip, slice, depth, remaining, lastFace) {
+      if (aborted) return;
+      if (remaining === 0) {
+        if (twist === 0 && flip === 0 && slice === SOLVED_SLICE) tryPhase2(depth);
+        return;
+      }
+      const h = p1Heur(twist, flip, slice);
+      if (h > remaining) return;
+      if (depth + remaining >= bestLen) return; // can't beat best even if phase2=0
+      // Once we already have a solution, honor the soft deadline.
+      if (best && Date.now() > deadline) { aborted = true; return; }
+      for (let m = 0; m < 18; m++) {
+        const face = MOVE_FACE[m];
+        if (face === lastFace) continue;
+        if (lastFace >= 0 && OPP_FACE[face] === lastFace && face > lastFace) continue;
+        const nt = twistMove[twist * 18 + m];
+        const nf = flipMove[flip * 18 + m];
+        const ns = sliceMove[slice * 18 + m];
+        p1path[depth] = m;
+        phase1dfs(nt, nf, ns, depth + 1, remaining - 1, face);
       }
     }
-    if (depth === maxAlg) break;
-    // Expand: for each node, for each pre-ALG AUF, apply AUF then ALG.
-    const next = [];
-    for (const node of frontier) {
-      for (let a = 0; a < 4; a++) {
-        let s2 = node.s;
-        const path = node.path.slice();
-        for (const t of AUFS[a]) { s2 = applyMove(s2, t); path.push(t); }
-        for (const t of alg) { s2 = applyMove(s2, t); path.push(t); }
-        next.push({ s: s2, path });
-      }
-    }
-    frontier = next;
-  }
-  throw new Error(errLabel + ': no AUF/ALG sequence found');
-}
 
-// Like solveStep but allows a SET of candidate algs at each step (tries each
-// branch). Used by the cross, where a slot has two distinct F2L-safe drop algs
-// (a simple double-turn insert for the oriented case and a 3-move flip insert
-// for the mis-oriented case); AUF covers the four U-layer positions. The search
-// is at most (4*algs.length)^maxAlg sequences — tiny for algs.length<=2 and
-// maxAlg<=3 — so it is instant and bounded.
-function solveStepMulti(startS, algs, goal, maxAlg, errLabel) {
-  let frontier = [{ s: startS, path: [] }];
-  for (let depth = 0; depth <= maxAlg; depth++) {
-    for (const node of frontier) {
-      for (let a = 0; a < 4; a++) {
-        let s2 = node.s;
-        for (const t of AUFS[a]) s2 = applyMove(s2, t);
-        if (goal(s2)) return node.path.concat(AUFS[a]);
-      }
-    }
-    if (depth === maxAlg) break;
-    const next = [];
-    for (const node of frontier) {
-      for (let a = 0; a < 4; a++) {
-        let base = node.s;
-        const basePath = node.path.slice();
-        for (const t of AUFS[a]) { base = applyMove(base, t); basePath.push(t); }
-        for (const alg of algs) {
-          let s2 = base;
-          const path = basePath.slice();
-          for (const t of alg) { s2 = applyMove(s2, t); path.push(t); }
-          next.push({ s: s2, path });
+    function tryPhase2(p1len) {
+      // Replay phase-1 moves on a cubie copy to get phase-2 coords.
+      let cur = { cp: cp.slice(), co: co.slice(), ep: ep.slice(), eo: eo.slice() };
+      for (let i = 0; i < p1len; i++) cur = applyCubieMove(cur, CUBIE_MOVES[p1path[i]]);
+      const cornPerm = getCornerPerm(cur.cp);
+      const edge8 = getEdge8Perm(cur.ep);
+      const slicePerm = getSlicePerm(cur.ep);
+
+      let p2max = (bestLen === Infinity ? 30 : bestLen - 1) - p1len;
+      if (p2max < 0) return;
+      if (p2max > 18) p2max = 18;
+      // Cheap admissible pre-filter: if even the phase-2 lower bound can't beat
+      // the current best total, don't launch the (costly) phase-2 IDA*.
+      if (p2Heur(cornPerm, edge8, slicePerm) > p2max) return;
+      const p2 = solvePhase2(cornPerm, edge8, slicePerm, p2max);
+      if (p2) {
+        const total = p1len + p2.length;
+        if (total < bestLen) {
+          bestLen = total;
+          best = [];
+          for (let i = 0; i < p1len; i++) best.push(p1path[i]);
+          for (let i = 0; i < p2.length; i++) best.push(p2[i]);
+          if (firstHitLen < 0) firstHitLen = p1len;
+          // Good enough: stop chasing further improvements once we hit the
+          // target length. Cuts average solve time without hurting the max bound.
+          if (bestLen <= goodEnough) aborted = true;
         }
       }
     }
-    frontier = next;
-  }
-  throw new Error(errLabel + ': no AUF/ALG sequence found');
-}
 
-function f2lSolved(s) {
-  // Bottom two layers solved means: D face all D, and the bottom two rows of
-  // each side face match that side's colour.
-  // D face:
-  for (let i = 27; i <= 35; i++) if (s[i] !== 'D') return false;
-  // For R,F,L,B faces, the lower 6 facelets (rows 2 and 3) must match center.
-  const sideFaces = [
-    { base: 9, col: 'R' },   // R
-    { base: 18, col: 'F' },  // F
-    { base: 36, col: 'L' },  // L
-    { base: 45, col: 'B' },  // B
-  ];
-  for (const f of sideFaces) {
-    for (let k = 3; k < 9; k++) { // indices base+3 .. base+8 = middle & bottom rows
-      if (s[f.base + k] !== f.col) return false;
+    // Iterative deepening over phase-1 length. Keep searching past the first
+    // full solution to chase shorter totals (a longer phase 1 often enables a
+    // much shorter phase 2). The soft wall-clock deadline (checked only after a
+    // solution exists) caps the worst case, so we can use a generous window.
+    const MAX_P1 = 22;
+    const WINDOW = 6; // max extra phase-1 depth to explore past the first hit
+    for (let len = 0; len <= MAX_P1; len++) {
+      if (len >= bestLen) break;
+      phase1dfs(twist0, flip0, slice0, 0, len, -1);
+      if (aborted) break;
+      if (firstHitLen >= 0 && len >= firstHitLen + WINDOW) break;
     }
+
+    if (!best) throw new Error('solver failed to find a solution');
+
+    let tokens = best.map((m) => MOVE_TOKENS[m]);
+    tokens = simplifyMoves(tokens);
+    return tokens;
   }
-  return true;
-}
 
-// --- 2-look OLL step 1: orient U edges into a "yellow cross" on U ---
-// U face top stickers we care about (the 4 U edges): indices 1,3,5,7.
-function uEdgesOriented(s) {
-  return s[1] === 'U' && s[3] === 'U' && s[5] === 'U' && s[7] === 'U';
-}
-// F (R U R' U' F') style edge-orientation alg.
-const OLL_EDGE_ALG = "F R U R' U' F'".split(' ');
-function orientLLEdges(st) {
-  // Yellow cross on U via the edge-OLL alg + AUF. At most 3 applications cover
-  // all edge-OLL cases (dot -> L-shape/line -> cross).
-  const goal = (s) => uEdgesOriented(s) && f2lSolved(s);
-  const path = solveStep(st.s, OLL_EDGE_ALG, goal, 3, 'OLL edges');
-  for (const t of path) move(st, t);
-}
-
-// --- 2-look OLL step 2: orient U corners (all U stickers up) ---
-function uCornersOriented(s) {
-  return s[0] === 'U' && s[2] === 'U' && s[6] === 'U' && s[8] === 'U';
-}
-// Sune: R U R' U R U2 R'. Combined with AUF, IDDFS over {Sune, U turns} solves
-// every corner-OLL case while keeping the edge cross intact (Sune preserves
-// edge orientation). Each Sune changes corner orientation; applying it from the
-// right AUF positions composes to any valid corner-OLL.
-const SUNE = "R U R' U R U2 R'".split(' ');
-function orientLLCorners(st) {
-  // Orient all U corners using Sune + AUF. At most 4 Sunes solve every
-  // corner-OLL case (Sune preserves the edge cross).
-  const goal = (s) => uCornersOriented(s) && uEdgesOriented(s) && f2lSolved(s);
-  const path = solveStep(st.s, SUNE, goal, 5, 'OLL corners');
-  for (const t of path) move(st, t);
-}
-
-// --- 2-look PLL step 1: permute U corners ---
-// A common corner 3-cycle (clockwise) algorithm. Repeated with AUF solves all
-// corner-permutation cases (or we detect the solved-perm AUF directly).
-const PLL_CORNER_ALG = "R B' R F2 R' B R F2 R2".split(' '); // A-perm 3-cycle of corners
-
-function uCornersPermuted(s) {
-  // Each U corner has all 3 stickers matching their slot's solved colours
-  // EXCEPT we only require that the side stickers are consistent (since OLL has
-  // U on top). After OLL, U corners are oriented; "permuted" means each corner's
-  // two side stickers match their two adjacent face centers. Check side stickers
-  // of the 4 U corners.
-  // URF corner side stickers: R(9), F(20); UFL: F(18), L(38); ULB: L(36), B(47);
-  // UBR: B(45), R(11).
-  return s[9] === 'R' && s[20] === 'F' &&
-         s[18] === 'F' && s[38] === 'L' &&
-         s[36] === 'L' && s[47] === 'B' &&
-         s[45] === 'B' && s[11] === 'R';
-}
-function permuteLLCorners(st) {
-  // IDDFS over {corner 3-cycle alg, U turns}. The corner alg is a pure 3-cycle
-  // of U corners (preserves U/edge orientation and F2L); combined with AUF it
-  // generates every corner permutation, so a short sequence always reaches the
-  // permuted state. Note: the goal here is "U corner side stickers match their
-  // adjacent centers" up to a final AUF — we require it AFTER allowing trailing
-  // U turns, so we ask for uCornersPermuted directly (a real AUF is appended in
-  // the edge phase if still needed).
-  const goal = (s) =>
-    uCornersPermuted(s) && uCornersOriented(s) && uEdgesOriented(s) && f2lSolved(s);
-  // Adjacent-swap cases need one alg, diagonal-swap needs two. Cap at 3.
-  const path = solveStep(st.s, PLL_CORNER_ALG, goal, 3, 'PLL corners');
-  for (const t of path) move(st, t);
-}
-
-// --- 2-look PLL step 2: permute U edges ---
-// U-perm (edge 3-cycle): F2 U L R' F2 L' R U F2  (cycles 3 U edges). Repeated
-// with AUF solves all edge-permutation cases.
-const PLL_EDGE_ALG = "F2 U L R' F2 L' R U F2".split(' ');
-
-function permuteLLEdges(st) {
-  // IDDFS over {edge 3-cycle alg, U turns}, goal = fully solved cube. The edge
-  // alg cycles three U edges (preserving everything else); combined with AUF it
-  // reaches the solved state from any edge-PLL case. The final goal being the
-  // exact solved string also absorbs any leftover AUF.
-  const goal = (s) => s === SOLVED;
-  // 3-cycle and Z/H edge-PLL cases need at most two alg applications. Cap at 3.
-  const path = solveStep(st.s, PLL_EDGE_ALG, goal, 3, 'PLL edges');
-  for (const t of path) move(st, t);
+  return { solve };
 }
 
 // ===========================================================================
-// 8. Move-list cleanup (cancel redundant consecutive same-face turns)
+// Cubie move application (full state) — used to compute phase-2 coordinates
+// after a phase-1 sequence. Derived from the same BASE moves as the build.
+// ===========================================================================
+const BASE = {
+  U: { cp: [3, 0, 1, 2, 4, 5, 6, 7], co: [0, 0, 0, 0, 0, 0, 0, 0], ep: [3, 0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  R: { cp: [4, 1, 2, 0, 7, 5, 6, 3], co: [1, 0, 0, 2, 2, 0, 0, 1], ep: [8, 1, 2, 3, 11, 5, 6, 7, 4, 9, 10, 0], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  F: { cp: [1, 5, 2, 3, 0, 4, 6, 7], co: [2, 1, 0, 0, 1, 2, 0, 0], ep: [0, 9, 2, 3, 4, 8, 6, 7, 1, 5, 10, 11], eo: [0, 1, 0, 0, 0, 1, 0, 0, 1, 1, 0, 0] },
+  D: { cp: [0, 1, 2, 3, 5, 6, 7, 4], co: [0, 0, 0, 0, 0, 0, 0, 0], ep: [0, 1, 2, 3, 5, 6, 7, 4, 8, 9, 10, 11], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  L: { cp: [0, 2, 6, 3, 4, 1, 5, 7], co: [0, 2, 1, 0, 0, 1, 2, 0], ep: [0, 1, 10, 3, 4, 5, 9, 7, 8, 2, 6, 11], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0] },
+  B: { cp: [0, 1, 3, 7, 4, 5, 2, 6], co: [0, 0, 2, 1, 0, 0, 1, 2], ep: [0, 1, 2, 11, 4, 5, 6, 10, 8, 9, 3, 7], eo: [0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 1, 1] },
+};
+const ID = {
+  cp: [0, 1, 2, 3, 4, 5, 6, 7], co: [0, 0, 0, 0, 0, 0, 0, 0],
+  ep: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11], eo: [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+};
+function cmul(a, m) {
+  const cp = new Array(8), co = new Array(8), ep = new Array(12), eo = new Array(12);
+  for (let i = 0; i < 8; i++) { cp[i] = a.cp[m.cp[i]]; co[i] = (a.co[m.cp[i]] + m.co[i]) % 3; }
+  for (let i = 0; i < 12; i++) { ep[i] = a.ep[m.ep[i]]; eo[i] = (a.eo[m.ep[i]] + m.eo[i]) % 2; }
+  return { cp, co, ep, eo };
+}
+let _cubieMoves = null;
+function getCubieMoves() {
+  if (_cubieMoves) return _cubieMoves;
+  const out = [];
+  for (const f of ['U', 'R', 'F', 'D', 'L', 'B']) {
+    let acc = ID;
+    for (let p = 1; p <= 3; p++) { acc = cmul(acc, BASE[f]); out.push(acc); }
+  }
+  _cubieMoves = out;
+  return out;
+}
+function applyCubieMove(a, m) { return cmul(a, m); }
+
+// ===========================================================================
+// Move-list cleanup (cancel redundant consecutive same-face turns)
 // ===========================================================================
 function simplifyMoves(moves) {
   const amount = (t) => (t.length === 1 ? 1 : t[1] === '2' ? 2 : 3);
@@ -7646,37 +7350,20 @@ function simplifyMoves(moves) {
   return arr;
 }
 
-// ===========================================================================
-// 9. PUBLIC solve()
-// ===========================================================================
-function solve(facelets) {
-  validate(facelets); // throws on invalid/unsolvable
-  if (facelets === SOLVED) return [];
-
-  const st = makeState(facelets);
-  solveCross(st);
-  solveFirstLayerCorners(st);
-  solveSecondLayer(st);
-  orientLLEdges(st);
-  orientLLCorners(st);
-  permuteLLCorners(st);
-  permuteLLEdges(st);
-
-  const simplified = simplifyMoves(st.moves);
-
-  // Re-apply the final solution through the facelet engine and assert solved.
-  if (applyMoves(facelets, simplified) !== SOLVED) {
-    throw new Error('internal error: solution did not solve the cube');
-  }
-  return simplified;
-}
-  return { solve, validate, SOLVED, ALL_MOVES };
+// Browser + CommonJS export.
+  return { createSolver };
 })();
+let _cube3Solve = null, _cube3Loading = null;
+function cube3AssetInit() {
+  if (_cube3Solve || _cube3Loading) return _cube3Loading;
+  _cube3Loading = fetch('./cube3-tables.bin')
+    .then(r => { if (!r.ok) throw new Error('cube3 asset ' + r.status); return r.arrayBuffer(); })
+    .then(buf => { _cube3Solve = cube3Mod.createSolver(buf).solve; })
+    .catch(() => { _cube3Loading = null; });
+  return _cube3Loading;
+}
 
-/* ===== 3×3 state reader (cubies → 54-char Kociemba facelet string) + full solver.
-   Each face viewed from outside with U-up/F-front; centers land at 4/13/22/31/40/49.
-   Color→face-letter via the six center colors. Verified: solved→canonical string and
-   scramble→solveFull→solved (Playwright). ===== */
+/* 3×3 state reader: cubies → 54-char Kociemba facelet string (centers at 4/13/22/31/40/49). */
 const _c3letter = new Map([
   [COLORS['+y'], 'U'], [COLORS['+x'], 'R'], [COLORS['+z'], 'F'],
   [COLORS['-y'], 'D'], [COLORS['-x'], 'L'], [COLORS['-z'], 'B'],
@@ -7704,10 +7391,12 @@ function cube3ReadFacelets() {
   }
   return out.join('');
 }
-function cube3SolveFull() {
+async function cube3SolveFull() {
   const fac = cube3ReadFacelets();
   if (fac.indexOf('?') >= 0) return null;
-  let sol; try { sol = cube3Solver.solve(fac); } catch (e) { return null; }
+  if (!_cube3Solve) await cube3AssetInit();
+  if (!_cube3Solve) return null;
+  let sol; try { sol = _cube3Solve(fac); } catch (e) { return null; }
   return sol || null;
 }
 
@@ -9936,6 +9625,7 @@ function switchPuzzle(id) {
   pyraGroup.visible = (id === 'pyraminx');
   megaGroup.visible = (id === 'megaminx');
   if (id !== 'megaminx') megaPoolDispose();                 // release the solver workers when leaving Megaminx
+  if (id === '3x3') cube3AssetInit();                       // fetch+decode the Kociemba tables now, so Solve is instant
   skewbGroup.visible = (id === 'skewb');
   sq1Group.visible = (id === 'sq1');
   projGroup.visible = (id === '2x2');                       // 2×2 projections
@@ -9981,6 +9671,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 
 // Restore the puzzle chosen on the previous visit (2×2 stays the first-load default).
