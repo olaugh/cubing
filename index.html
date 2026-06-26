@@ -7744,16 +7744,11 @@ const skewbGroup = new THREE.Group(); skewbGroup.visible = false; scene.add(skew
 const SKEWB_KEYS = ['a','b','c','d','e','f','g','h'];                  // 8 corner caps
 const SKEWB_CORNER_DIRS = [];
 for (const p of skewbGeo.pieces) if (p.kind === 'corner') { const c = p.center, l = Math.hypot(c[0],c[1],c[2]); SKEWB_CORNER_DIRS[p.homeIndex] = [c[0]/l,c[1]/l,c[2]/l]; }
-// Each corner is an endpoint of one body-diagonal turn-axis. Every move turns the
-// AXIS's (+ end) cap, so the solver's reference corner (corner 0, on no axis cap)
-// never moves and every reachable state stays in the solver's space — while all 8
-// corners remain clickable (each maps to its diagonal's cap turn).
-const SKEWB_CORNER_TO_AXISDIR = SKEWB_CORNER_DIRS.map(d => { let bj = 0, bd = -2; for (let j = 0; j < skewbGeo.axes.length; j++) { const a = skewbGeo.axes[j].dir, ad = Math.abs(d[0]*a[0]+d[1]*a[1]+d[2]*a[2]); if (ad > bd) { bd = ad; bj = j; } } return skewbGeo.axes[bj].dir; });
 // Offset every edge of a convex planar polygon inward by a CONSTANT distance g
 // (true polygon erosion), so the black grout is the same width on every piece —
 // scaling toward the centroid by a fixed fraction instead makes big facelets
 // (face centres) get fat grout and small ones (corner triangles) get thin grout.
-function skewbInset(poly, n, g) {
+function insetFacelet(poly, n, g) {
   const N = poly.length;
   const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]], scl=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
   const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
@@ -7783,7 +7778,7 @@ const skewbPieces = skewbGeo.pieces.map(desc => {
     for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...pc,...a,...b);}
     for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...a,...b,...O);}
     const RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
-    const ip=skewbInset(poly, cn, SKEWB_GROUT).map(p=>[p[0]+r[0],p[1]+r[1],p[2]+r[2]]);
+    const ip=insetFacelet(poly, cn, SKEWB_GROUT).map(p=>[p[0]+r[0],p[1]+r[1],p[2]+r[2]]);
     const Cr=[pc[0]+r[0],pc[1]+r[1],pc[2]+r[2]], cpos=[], cnrm=[];
     for(let i=0;i<ip.length;i++){const a=ip[i],b=ip[(i+1)%ip.length];cpos.push(...Cr,...a,...b);for(let k=0;k<3;k++)cnrm.push(cn[0],cn[1],cn[2]);}
     const fg=new THREE.BufferGeometry();
@@ -7800,14 +7795,61 @@ const skewbPieces = skewbGeo.pieces.map(desc => {
   return { id:desc.id, kind:desc.kind, homeIndex:desc.homeIndex, home:desc.center.slice(), position:g.position, quaternion:g.quaternion, group:g };
 });
 function skewbReset(){ for(const p of skewbPieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
-function skewbBuildMove(tok,prime){ const i=SKEWB_KEYS.indexOf(tok); const d=SKEWB_CORNER_TO_AXISDIR[i]; return {axis:new THREE.Vector3(d[0],d[1],d[2]),axisName:tok,target:(prime?1:-1)*(2*Math.PI/3),done:0,notation:tok+(prime?"'":"")}; }
+// Natural Skewb turn: each of the 8 corners turns its OWN cap (all 8 distinct).
+function skewbBuildMove(tok,prime){ const i=SKEWB_KEYS.indexOf(tok); const d=SKEWB_CORNER_DIRS[i]; return {axis:new THREE.Vector3(d[0],d[1],d[2]),axisName:tok,target:(prime?1:-1)*(2*Math.PI/3),done:0,notation:tok+(prime?"'":"")}; }
 function skewbReadState(){ return skewbGeo.readState(skewbPieces); }
 function skewbSolved(){ const s=skewbReadState(); return s.cp.every((v,i)=>v===i)&&s.co.every(v=>v===0)&&s.cenp.every((v,i)=>v===i); }
 function skewbScramble(){ const t=[]; let last=-1; for(let i=0;i<12;i++){let c;do{c=Math.floor(Math.random()*8);}while(c===last);last=c;t.push(SKEWB_KEYS[c]+(Math.random()<0.5?"'":""));} return t; }
 function skewbFinalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&skewbSolved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
 // solver outputs axis tokens A0..A3; map each axis to the corner-cap key with the matching direction
 const SKEWB_AXIS_TO_KEY = skewbGeo.axes.map(ax => { let bi=0,bd=-2; for(let i=0;i<SKEWB_CORNER_DIRS.length;i++){const d=SKEWB_CORNER_DIRS[i];const dot=d[0]*ax.dir[0]+d[1]*ax.dir[1]+d[2]*ax.dir[2];if(dot>bd){bd=dot;bi=i;}} return SKEWB_KEYS[bi]; });
-function skewbSolveFull(){ return skewbSolveState(skewbReadState()).map(t => SKEWB_AXIS_TO_KEY[+t[1]] + (t.endsWith("'") ? "'" : '')); }
+// The IDA* solver keeps reference corner 0 fixed (its 4 axes never touch it) and
+// hangs on states where corner 0 has moved — which natural 8-corner play produces.
+// So first bring corner 0 home with a short BFS over all 8 caps, then hand the
+// corner-0-fixed remainder to the solver. Every move stays a real corner turn.
+function skewbCloneProxies(src){ return src.map(p => ({ id:p.id, position:p.position.clone(), quaternion:p.quaternion.clone() })); }
+function skewbApplyCapProxy(px, i, prime){
+  const d = SKEWB_CORNER_DIRS[i], axis = new THREE.Vector3(d[0],d[1],d[2]);
+  const sel = skewbGeo.selectPieces({ axis }, px);
+  const q = new THREE.Quaternion().setFromAxisAngle(axis, (prime?1:-1)*(2*Math.PI/3));
+  for (const c of sel){ c.position.applyQuaternion(q); c.quaternion.premultiply(q); }
+  for (const c of sel) skewbGeo.snapPiece(c);
+}
+const _skKey = st => st.cp.join()+'|'+st.co.join()+'|'+st.cenp.join();
+function skewbFixCorner0(){
+  let level = [{ px: skewbCloneProxies(skewbPieces), path: [] }];
+  const seen = new Set([ _skKey(skewbGeo.readState(level[0].px)) ]);
+  let nodes = 0;
+  for (let depth = 0; depth <= 8 && level.length; depth++){
+    const next = [];
+    for (const node of level){
+      const st = skewbGeo.readState(node.px);
+      if (st.cp[0] === 0 && st.co[0] === 0) return { toks: node.path, state: st };
+      for (let i = 0; i < 8; i++) for (const prime of [false, true]){
+        if (++nodes > 80000) return null;
+        const np = skewbCloneProxies(node.px);
+        skewbApplyCapProxy(np, i, prime);
+        const key = _skKey(skewbGeo.readState(np));
+        if (seen.has(key)) continue;
+        seen.add(key);
+        next.push({ px: np, path: node.path.concat(SKEWB_KEYS[i] + (prime ? "'" : '')) });
+      }
+    }
+    level = next;
+  }
+  return null;
+}
+function skewbSolveFull(){
+  const s0 = skewbReadState();
+  let pre = [], state = s0;
+  if (!(s0.cp[0] === 0 && s0.co[0] === 0)) {           // reference corner displaced → bring it home first
+    const fix = skewbFixCorner0();
+    if (!fix) return null;
+    pre = fix.toks; state = fix.state;
+  }
+  const main = skewbSolveState(state).map(t => SKEWB_AXIS_TO_KEY[+t[1]] + (t.endsWith("'") ? "'" : ''));
+  return pre.concat(main);
+}
 const puzzleSkewb = {
   id:'skewb', name:'Skewb', group:skewbGroup,
   DEFS:Object.fromEntries(SKEWB_KEYS.map(c=>[c,{}])),
@@ -8065,6 +8107,7 @@ const SQ1_FACE_HEX = [COLORS['+y'], COLORS['-y'], COLORS['+z'], COLORS['-z'], CO
 const SQ1_FACE_N = [[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],[-1,0,0],[1,0,0]];
 const SQ1_DARK = new THREE.MeshStandardMaterial({ color: 0x161619, roughness: 0.82, metalness: 0.0, side: THREE.DoubleSide });
 const sq1Group = new THREE.Group(); sq1Group.visible = false; scene.add(sq1Group);
+const SQ1_GROUT = 0.04, SQ1_ROUND = 0.055;     // constant grout width + corner fillet radius
 const sq1Pieces = sq1Geo.pieces.map(desc => {
   const g = new THREE.Group(); g.position.set(desc.center[0],desc.center[1],desc.center[2]);
   const dark = [];
@@ -8074,8 +8117,14 @@ const sq1Pieces = sq1Geo.pieces.map(desc => {
     for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...pc,...a,...b);}   // closed wedge body
     if (fl.faceIndex < 0) continue;                                  // internal cut face → dark only
     const cn = SQ1_FACE_N[fl.faceIndex];
-    const INSET=0.9, RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
-    const ip=poly.map(p=>[pc[0]+(p[0]-pc[0])*INSET+r[0],pc[1]+(p[1]-pc[1])*INSET+r[1],pc[2]+(p[2]-pc[2])*INSET+r[2]]);
+    const RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
+    // constant-width grout (not a fixed fraction → uniform gaps), then QiYi rounded corners
+    const ins=insetFacelet(poly, cn, SQ1_GROUT).map(p=>[p[0]+r[0],p[1]+r[1],p[2]+r[2]]);
+    const Ni=ins.length;
+    const cuts=ins.map((Vc,i)=>{ const pv=ins[(i+Ni-1)%Ni], nx=ins[(i+1)%Ni];
+      const lp=Math.hypot(Vc[0]-pv[0],Vc[1]-pv[1],Vc[2]-pv[2]), ln=Math.hypot(Vc[0]-nx[0],Vc[1]-nx[1],Vc[2]-nx[2]);
+      return Math.min(0.42, SQ1_ROUND/Math.max(1e-6,Math.min(lp,ln))); });   // ~constant fillet radius, edge-safe
+    const ip=pyraRoundedOutline(ins, cuts, 4);
     const Cr=[pc[0]+r[0],pc[1]+r[1],pc[2]+r[2]], cpos=[], cnrm=[];
     for(let i=0;i<ip.length;i++){const a=ip[i],b=ip[(i+1)%ip.length];cpos.push(...Cr,...a,...b);for(let k=0;k<3;k++)cnrm.push(cn[0],cn[1],cn[2]);}
     const fg=new THREE.BufferGeometry();
