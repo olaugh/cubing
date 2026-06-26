@@ -436,6 +436,1651 @@
 }
 </script>
 
+<script id="megaWorker2Src" type="text/plain">
+import * as THREE from 'https://unpkg.com/three@0.160.0/build/three.module.js';
+// mega-geo.js
+// Self-contained Megaminx geometry + engine module.
+//
+// Exposes a single factory `makeMegaGeo(THREE, scale = 1)` returning the
+// geometry (pieces, faces) plus the engine helpers (selectPieces, buildMove,
+// snapPiece, readState) used to drive a Three.js twisty-puzzle animation.
+//
+// Coordinate system: the standard regular dodecahedron with vertices at
+// (+-1,+-1,+-1) and the cyclic (0, +-1/phi, +-phi) permutations. All geometry
+// is computed in those raw units and multiplied by `scale` on output. The
+// "home position" of a piece (its solved-state centroid) is what we snap to.
+//
+// Rendering note: each of the 12 pentagonal faces is subdivided into 11
+// facelets (1 center + 5 edge + 5 corner). Facelet polygons wind CCW as seen
+// from outside the puzzle (looking down the +normal direction), because the
+// face vertices P0..P4 are sorted CCW about the outward normal.
+
+// ---------------------------------------------------------------------------
+// Tunable subdivision constants (kept near the top so they can be retuned).
+// ---------------------------------------------------------------------------
+const FACELET_S = 0.42; // central-pentagon shrink factor toward centroid
+const FACELET_T = 0.32; // outer-edge division fraction (Ai = Pi + t*(P(i+1)-Pi))
+
+const PHI = (1 + Math.sqrt(5)) / 2;
+const IP = 1 / PHI;
+
+// ---------------------------------------------------------------------------
+// Tiny pure-array vector helpers (independent of THREE, used to build geometry)
+// ---------------------------------------------------------------------------
+const vSub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vAdd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vScale = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const vDot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vCross = (a, b) => [
+  a[1] * b[2] - a[2] * b[1],
+  a[2] * b[0] - a[0] * b[2],
+  a[0] * b[1] - a[1] * b[0],
+];
+const vLen = (a) => Math.sqrt(vDot(a, a));
+const vNorm = (a) => {
+  const l = vLen(a);
+  return [a[0] / l, a[1] / l, a[2] / l];
+};
+const vDist = (a, b) => vLen(vSub(a, b));
+
+// ---------------------------------------------------------------------------
+// Build the dodecahedron foundation (12 normals, 20 vertices, 30 edges, faces)
+// ---------------------------------------------------------------------------
+function buildDodeca() {
+  // --- 12 face normals (icosahedron vertices) -----------------------------
+  // even permutations of (0, +-phi, +-1)
+  let rawFN = [];
+  for (const a of [PHI, -PHI])
+    for (const b of [1, -1]) {
+      rawFN.push([0, a, b]);
+      rawFN.push([b, 0, a]);
+      rawFN.push([a, b, 0]);
+    }
+  // dedup + normalize -> 12 unit normals
+  const FN = dedup(rawFN).map(vNorm);
+  if (FN.length !== 12) throw new Error(`expected 12 normals, got ${FN.length}`);
+
+  // --- 20 dodecahedron vertices -------------------------------------------
+  let rawV = [];
+  for (const a of [1, -1])
+    for (const b of [1, -1])
+      for (const c of [1, -1]) rawV.push([a, b, c]);
+  for (const b of [1, -1])
+    for (const c of [1, -1]) {
+      rawV.push([0, b * IP, c * PHI]);
+      rawV.push([b * IP, c * PHI, 0]);
+      rawV.push([c * PHI, 0, b * IP]);
+    }
+  const V = dedup(rawV);
+  if (V.length !== 20) throw new Error(`expected 20 vertices, got ${V.length}`);
+
+  // --- faces: the 5 vertices with the largest dot(V, FN[f]) ---------------
+  const faceVerts = FN.map((n) => {
+    const order = V.map((v, i) => ({ i, d: vDot(v, n) })).sort((a, b) => b.d - a.d);
+    return order.slice(0, 5).map((o) => o.i);
+  });
+
+  // --- edges: the 30 vertex pairs at minimum pairwise distance ------------
+  let minD = Infinity;
+  for (let i = 0; i < V.length; i++)
+    for (let j = i + 1; j < V.length; j++) {
+      const d = vDist(V[i], V[j]);
+      if (d < minD) minD = d;
+    }
+  const eps = minD * 1e-6;
+  const edges = []; // [vi, vj]
+  for (let i = 0; i < V.length; i++)
+    for (let j = i + 1; j < V.length; j++) {
+      if (Math.abs(vDist(V[i], V[j]) - minD) < eps) edges.push([i, j]);
+    }
+  if (edges.length !== 30) throw new Error(`expected 30 edges, got ${edges.length}`);
+
+  // --- incidence: which faces touch each vertex / each edge ---------------
+  const vertexFaces = V.map((v, vi) => {
+    const fs = [];
+    for (let f = 0; f < 12; f++) if (faceVerts[f].includes(vi)) fs.push(f);
+    return fs; // exactly 3
+  });
+  const edgeFaces = edges.map(([a, b]) => {
+    const fs = [];
+    for (let f = 0; f < 12; f++)
+      if (faceVerts[f].includes(a) && faceVerts[f].includes(b)) fs.push(f);
+    return fs; // exactly 2
+  });
+
+  return { FN, V, faceVerts, edges, vertexFaces, edgeFaces, edgeLen: minD };
+}
+
+// Deduplicate an array of [x,y,z] within a tolerance.
+function dedup(arr, tol = 1e-9) {
+  const out = [];
+  for (const p of arr) {
+    if (!out.some((q) => vDist(p, q) < tol)) out.push(p);
+  }
+  return out;
+}
+
+// Order a face's vertices CCW about its outward normal, starting anywhere.
+// CCW means: looking from the +normal side (outside), increasing angle.
+function orderCCW(vertexIndices, V, normal, centroid) {
+  // build an in-plane orthonormal basis (u, w) with w = u x normal so that
+  // angle measured by atan2(dot(.,w), dot(.,u)) increases CCW about +normal.
+  const ref = vSub(V[vertexIndices[0]], centroid);
+  const u = vNorm(vSub(ref, vScale(normal, vDot(ref, normal)))); // ref projected into plane
+  const w = vCross(normal, u); // right-handed: angle CCW about +normal
+  const withAngle = vertexIndices.map((vi) => {
+    const r = vSub(V[vi], centroid);
+    const ang = Math.atan2(vDot(r, w), vDot(r, u));
+    return { vi, ang };
+  });
+  withAngle.sort((a, b) => a.ang - b.ang);
+  return withAngle.map((o) => o.vi);
+}
+
+// ---------------------------------------------------------------------------
+// Factory
+// ---------------------------------------------------------------------------
+function makeMegaGeo(THREE, scale = 1) {
+  const { FN, V, faceVerts, edges, vertexFaces, edgeFaces, edgeLen } = buildDodeca();
+
+  // ---- faces -------------------------------------------------------------
+  const faces = FN.map((normal, index) => ({
+    index,
+    normal: normal.slice(),
+    name: `F${index}`,
+  }));
+  const faceByName = new Map(faces.map((f) => [f.name, f]));
+
+  // face centroids + CCW-ordered vertices (used for both pieces and facelets)
+  const faceCentroid = faceVerts.map((vis) => {
+    let c = [0, 0, 0];
+    for (const vi of vis) c = vAdd(c, V[vi]);
+    return vScale(c, 1 / vis.length);
+  });
+  const faceCCW = faceVerts.map((vis, f) =>
+    orderCCW(vis, V, FN[f], faceCentroid[f])
+  );
+
+  // face inradius = dot of any face vertex with unit normal (centroid dist too)
+  const faceInradius = vDot(faceCentroid[0], FN[0]); // ~1.3764
+
+  // ---- home positions ----------------------------------------------------
+  // centers: face centroid; corners: vertex; edges: edge midpoint.
+  const centerHome = faceCentroid.map((c) => c.slice());
+  const cornerHome = V.map((v) => v.slice());
+  const edgeHome = edges.map(([a, b]) => vScale(vAdd(V[a], V[b]), 0.5));
+
+  // ---- per-face facelet geometry -----------------------------------------
+  // For each face we compute the 11 facelet polygons and tag them to the
+  // owning piece (centerIndex / cornerVertexIndex / edgeIndex).
+  // Returns { center:[poly], corners:{vi->poly}, edges:{edgeIndex->poly} }.
+  function faceFacelets(f) {
+    const O = faceCentroid[f];
+    const P = faceCCW[f].map((vi) => V[vi]); // P0..P4 positions (CCW)
+    const Pidx = faceCCW[f]; // the vertex indices, same order
+    const C = P.map((Pi) => vAdd(O, vScale(vSub(Pi, O), FACELET_S))); // central pentagon
+    // division points on each outer edge Pi -> P(i+1)
+    const A = [], B = [];
+    for (let i = 0; i < 5; i++) {
+      const Pi = P[i], Pn = P[(i + 1) % 5];
+      A[i] = vAdd(Pi, vScale(vSub(Pn, Pi), FACELET_T)); // near Pi
+      B[i] = vAdd(Pi, vScale(vSub(Pn, Pi), 1 - FACELET_T)); // near P(i+1)
+    }
+
+    const center = [C[0], C[1], C[2], C[3], C[4]];
+
+    // edge facelet for outer edge (Pi,P(i+1)): quad [Ai, Bi, C(i+1), Ci]
+    const edgeFacelets = {}; // edgeIndex -> poly
+    for (let i = 0; i < 5; i++) {
+      const ni = (i + 1) % 5;
+      const va = Pidx[i], vb = Pidx[ni];
+      const ei = edgeIndexOf(va, vb);
+      edgeFacelets[ei] = [A[i], B[i], C[ni], C[i]];
+    }
+
+    // corner facelet at Pi: quad [Pi, Ai, Ci, B(i-1)]
+    const cornerFacelets = {}; // vertexIndex -> poly
+    for (let i = 0; i < 5; i++) {
+      const pi = (i + 4) % 5; // i-1
+      cornerFacelets[Pidx[i]] = [P[i], A[i], C[i], B[pi]];
+    }
+
+    return { center, corners: cornerFacelets, edges: edgeFacelets };
+  }
+
+  // map an undirected vertex pair to its edge index
+  const edgeKey = (a, b) => (a < b ? `${a},${b}` : `${b},${a}`);
+  const edgeIndexMap = new Map(edges.map(([a, b], i) => [edgeKey(a, b), i]));
+  function edgeIndexOf(a, b) {
+    const k = edgeIndexMap.get(edgeKey(a, b));
+    if (k === undefined) throw new Error(`no edge for (${a},${b})`);
+    return k;
+  }
+
+  // precompute facelets per face once
+  const faceletsByFace = FN.map((_, f) => faceFacelets(f));
+
+  // ---- assemble the 62 piece descriptors ---------------------------------
+  const sc = (p) => [p[0] * scale, p[1] * scale, p[2] * scale];
+  const scPoly = (poly) => poly.map(sc);
+
+  const pieces = [];
+
+  // 12 centers
+  for (let f = 0; f < 12; f++) {
+    pieces.push({
+      id: `center-${f}`,
+      kind: "center",
+      homeIndex: f,
+      center: sc(centerHome[f]),
+      faces: [f],
+      facelets: [{ faceIndex: f, poly: scPoly(faceletsByFace[f].center) }],
+    });
+  }
+
+  // 20 corners
+  for (let vi = 0; vi < 20; vi++) {
+    const fs = vertexFaces[vi]; // 3 faces
+    const facelets = fs.map((f) => ({
+      faceIndex: f,
+      poly: scPoly(faceletsByFace[f].corners[vi]),
+    }));
+    pieces.push({
+      id: `corner-${vi}`,
+      kind: "corner",
+      homeIndex: vi,
+      center: sc(cornerHome[vi]),
+      faces: fs.slice(),
+      facelets,
+    });
+  }
+
+  // 30 edges
+  for (let ei = 0; ei < 30; ei++) {
+    const fs = edgeFaces[ei]; // 2 faces
+    const facelets = fs.map((f) => ({
+      faceIndex: f,
+      poly: scPoly(faceletsByFace[f].edges[ei]),
+    }));
+    pieces.push({
+      id: `edge-${ei}`,
+      kind: "edge",
+      homeIndex: ei,
+      center: sc(edgeHome[ei]),
+      faces: fs.slice(),
+      facelets,
+    });
+  }
+
+  // ---- home-position lookup tables (scaled) for snapping/readState -------
+  const cornerHomeScaled = cornerHome.map(sc);
+  const edgeHomeScaled = edgeHome.map(sc);
+  const centerHomeScaled = centerHome.map(sc);
+  const allHomeByKind = {
+    corner: cornerHomeScaled,
+    edge: edgeHomeScaled,
+    center: centerHomeScaled,
+  };
+
+  // unit normals as THREE vectors (cached)
+  const normalVecs = FN.map((n) => new THREE.Vector3(n[0], n[1], n[2]));
+
+  // ---- consistent-chirality incidence (for orientation reading) ----------
+  // The Megaminx orientation laws (corners sum ≡0 mod3, edges sum ≡0 mod2)
+  // only hold if orientation is measured against face triples/pairs of a
+  // CONSISTENT chirality. We order each corner's 3 incident faces CCW around
+  // the vertex's outward direction, and each edge's 2 faces in a fixed
+  // (deterministic) order. Because every face turn is a proper (chirality-
+  // preserving) rotation, a piece's CCW face-triple always maps onto the
+  // destination slot's CCW face-triple by a pure cyclic rotation, whose offset
+  // is the twist; cyclic offsets sum to 0 mod 3 over any permutation cycle.
+  //
+  // cornerFacesCCW[v] = [f0,f1,f2] ordered CCW about the vertex direction V[v].
+  function orderFacesCCWAroundVertex(faceList, vertexPos) {
+    const axis = vNorm(vertexPos); // outward radial direction at the vertex
+    // reference in-plane direction from the first face normal
+    const n0 = FN[faceList[0]];
+    const u = vNorm(vSub(n0, vScale(axis, vDot(n0, axis))));
+    const w = vCross(axis, u); // right-handed about +axis -> CCW
+    return faceList
+      .map((f) => {
+        const n = FN[f];
+        const proj = vSub(n, vScale(axis, vDot(n, axis)));
+        const ang = Math.atan2(vDot(proj, w), vDot(proj, u));
+        return { f, ang };
+      })
+      .sort((a, b) => a.ang - b.ang)
+      .map((o) => o.f);
+  }
+  const cornerFacesCCW = V.map((v, vi) =>
+    orderFacesCCWAroundVertex(vertexFaces[vi], v)
+  );
+  // edges: order the 2 faces deterministically but consistently. We pick the
+  // ordering [fa, fb] such that (n_fa x n_fb) points along +edgeMidpoint
+  // (outward), giving a globally consistent chirality for the binary flip.
+  const edgeFacesOrdered = edgeFaces.map((fs, ei) => {
+    const [a, b] = fs;
+    const cr = vCross(FN[a], FN[b]);
+    const out = edgeHome[ei]; // outward direction at edge midpoint
+    return vDot(cr, out) >= 0 ? [a, b] : [b, a];
+  });
+
+  // ---- the 60 chiral-icosahedral rotation quaternions --------------------
+  const rotationQuats = buildRotationGroup(THREE, FN, V, edges);
+
+  // =========================================================================
+  // selectPieces(move, runtimePieces)
+  // -------------------------------------------------------------------------
+  // Return the subset of runtimePieces on the move's face: those whose live
+  // position has dot(position, faceNormal) within epsilon of the maximum such
+  // dot over all pieces. The outer layer at a face is exactly its 11 pieces.
+  // =========================================================================
+  function selectPieces(move, runtimePieces) {
+    const n = move.axis; // THREE.Vector3 unit normal
+    let maxDot = -Infinity;
+    const dots = new Array(runtimePieces.length);
+    for (let i = 0; i < runtimePieces.length; i++) {
+      const d = runtimePieces[i].position.dot(n);
+      dots[i] = d;
+      if (d > maxDot) maxDot = d;
+    }
+    // epsilon scaled to geometry: the gap between on-face and next layer is
+    // large (~0.5*scale at inradius). Use a fraction of the inradius.
+    const epsilon = 1e-3 * scale * Math.max(1, faceInradius);
+    const out = [];
+    for (let i = 0; i < runtimePieces.length; i++) {
+      if (maxDot - dots[i] < epsilon) out.push(runtimePieces[i]);
+    }
+    return out;
+  }
+
+  // =========================================================================
+  // buildMove(faceName, prime, double)
+  // -------------------------------------------------------------------------
+  // Convention for "clockwise looking at the face from outside":
+  //   A viewer outside the puzzle on the +normal side looks toward the origin,
+  //   i.e. along -n. For that viewer, set up a right-handed screen frame
+  //   (right=u, up=v, toward-viewer=+n, so u x v = n). On screen, increasing
+  //   atan2(up,right) is COUNTER-clockwise. A right-handed rotation by +theta
+  //   about +n moves a point CCW *on that screen* (verified empirically:
+  //   +theta gave +72deg screen delta). Therefore CLOCKWISE-from-outside is a
+  //   NEGATIVE rotation about +n, so the unprimed turn uses sign = -1.
+  //   (prime flips it to +theta; double scales to 144deg.)
+  // =========================================================================
+  function buildMove(faceName, prime = false, double = false) {
+    const face = faceByName.get(faceName);
+    if (!face) throw new Error(`unknown face ${faceName}`);
+    const axis = new THREE.Vector3(face.normal[0], face.normal[1], face.normal[2]);
+    const base = (2 * Math.PI) / 5; // 72 degrees
+    const sign = -1; // unprimed = clockwise viewed from outside = -theta about +n
+    let angle = (double ? 2 * base : base) * sign;
+    if (prime) angle = -angle;
+    const notation =
+      faceName + (double ? "2" : "") + (prime ? "'" : "");
+    return {
+      axis,
+      axisName: faceName,
+      target: angle,
+      done: 0,
+      notation,
+    };
+  }
+
+  // =========================================================================
+  // snapPiece(piece) — kill floating-point drift.
+  //   position -> nearest home position (scaled) of the piece's kind.
+  //   quaternion -> nearest of the 60 valid orientations.
+  // =========================================================================
+  function snapPiece(piece) {
+    const kind = kindOfId(piece.id);
+    const homes = allHomeByKind[kind];
+    // nearest home position
+    let bestI = 0, bestD = Infinity;
+    for (let i = 0; i < homes.length; i++) {
+      const h = homes[i];
+      const dx = piece.position.x - h[0];
+      const dy = piece.position.y - h[1];
+      const dz = piece.position.z - h[2];
+      const d = dx * dx + dy * dy + dz * dz;
+      if (d < bestD) { bestD = d; bestI = i; }
+    }
+    piece.position.set(homes[bestI][0], homes[bestI][1], homes[bestI][2]);
+
+    // nearest orientation quaternion (max |dot| == min angle)
+    let bestQ = rotationQuats[0], bestAbs = -1;
+    const q = piece.quaternion;
+    for (let i = 0; i < rotationQuats.length; i++) {
+      const r = rotationQuats[i];
+      const dot = Math.abs(q.x * r.x + q.y * r.y + q.z * r.z + q.w * r.w);
+      if (dot > bestAbs) { bestAbs = dot; bestQ = r; }
+    }
+    piece.quaternion.copy(bestQ);
+    return piece;
+  }
+
+  // =========================================================================
+  // readState(runtimePieces) — canonical logical state.
+  //   cp[slot]   = which corner-home index currently occupies slot
+  //   co[slot]   = corner orientation 0..2
+  //   ep[slot]   = which edge-home index currently occupies slot
+  //   eo[slot]   = edge orientation 0..1
+  // Permutation: nearest-home matching of live positions.
+  // Orientation: rotate the piece's reference sticker direction by its live
+  //   quaternion; see which incident face normal it points along. The twist is
+  //   the index (mod 3 / mod 2) of that face within the slot's ordered faces.
+  // =========================================================================
+  function readState(runtimePieces) {
+    const cp = new Array(20).fill(-1);
+    const co = new Array(20).fill(0);
+    const ep = new Array(30).fill(-1);
+    const eo = new Array(30).fill(0);
+
+    // For each home SLOT, find which piece sits there (nearest home position
+    // matching, but we already know each piece reports a home via kind+id, so
+    // instead we go piece -> slot via nearest home, which is a bijection).
+    for (const p of runtimePieces) {
+      const kind = kindOfId(p.id);
+      if (kind === "center") continue;
+      const homeIndex = idIndex(p.id); // the piece's identity (home it belongs to)
+      const homes = allHomeByKind[kind];
+      // nearest slot for this piece's current position
+      let slot = 0, bestD = Infinity;
+      for (let i = 0; i < homes.length; i++) {
+        const h = homes[i];
+        const dx = p.position.x - h[0];
+        const dy = p.position.y - h[1];
+        const dz = p.position.z - h[2];
+        const d = dx * dx + dy * dy + dz * dz;
+        if (d < bestD) { bestD = d; slot = i; }
+      }
+      if (kind === "corner") {
+        cp[slot] = homeIndex;
+        co[slot] = cornerOrientation(p, slot);
+      } else {
+        ep[slot] = homeIndex;
+        eo[slot] = edgeOrientation(p, slot);
+      }
+    }
+    return { cp, co, ep, eo };
+  }
+
+  // --- orientation reading helpers ----------------------------------------
+  // The "marked sticker" of a piece is its first CCW-ordered home face. After
+  // the piece's live quaternion is applied to that home face normal, the result
+  // points along one of the destination slot's incident face normals.
+  // Orientation = the index of that face within the slot's CCW-ordered face
+  // list. Because both piece and slot triples share the CCW chirality and face
+  // turns are proper rotations, this is the standard Megaminx twist and its sum
+  // is conserved (mod 3 for corners, mod 2 for edges).
+
+  function cornerOrientation(p, slot) {
+    const homeIndex = idIndex(p.id);
+    const refFace = cornerFacesCCW[homeIndex][0]; // piece's marked face
+    const refDir = normalVecs[refFace].clone().applyQuaternion(p.quaternion);
+    return nearestFaceIndexInList(refDir, cornerFacesCCW[slot]); // 0..2
+  }
+
+  function edgeOrientation(p, slot) {
+    const homeIndex = idIndex(p.id);
+    const refFace = edgeFacesOrdered[homeIndex][0]; // piece's marked face
+    const refDir = normalVecs[refFace].clone().applyQuaternion(p.quaternion);
+    return nearestFaceIndexInList(refDir, edgeFacesOrdered[slot]); // 0..1
+  }
+
+  // Given a direction and a list of face indices, return the position (0..n-1)
+  // in the list whose face normal is closest (max dot) to the direction.
+  function nearestFaceIndexInList(dir, faceList) {
+    let best = 0, bestDot = -Infinity;
+    for (let i = 0; i < faceList.length; i++) {
+      const d = dir.dot(normalVecs[faceList[i]]);
+      if (d > bestDot) { bestDot = d; best = i; }
+    }
+    return best;
+  }
+
+  // ---- helpers ------------------------------------------------------------
+  function kindOfId(id) {
+    if (id.startsWith("corner")) return "corner";
+    if (id.startsWith("edge")) return "edge";
+    return "center";
+  }
+  function idIndex(id) {
+    return parseInt(id.slice(id.indexOf("-") + 1), 10);
+  }
+
+  return {
+    pieces,
+    faces,
+    selectPieces,
+    buildMove,
+    snapPiece,
+    readState,
+    // extras useful for the integrator / tests:
+    rotationQuats,
+    faceInradius,
+    edgeLen,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Build the 60-element chiral icosahedral rotation group as THREE quaternions.
+// We seed with a few generators (face 72-degree turns) and BFS-close the set
+// under multiplication, deduping by quaternion (q ~ -q identified). The closure
+// of any two suitable rotations of the icosahedral group yields all 60.
+// ---------------------------------------------------------------------------
+function buildRotationGroup(THREE, FN, V, edges) {
+  const gens = [];
+  // generator 1: 72 deg about face axis 0
+  const g1 = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(FN[0][0], FN[0][1], FN[0][2]),
+    (2 * Math.PI) / 5
+  );
+  // generator 2: 72 deg about a *different, non-parallel* face axis.
+  // pick the face axis least parallel to FN[0] to ensure they generate the
+  // whole group (two non-coaxial rotations generate icosahedral group).
+  let pick = 1, bestAbs = Infinity;
+  for (let f = 1; f < FN.length; f++) {
+    const a = Math.abs(
+      FN[f][0] * FN[0][0] + FN[f][1] * FN[0][1] + FN[f][2] * FN[0][2]
+    );
+    if (a < bestAbs) { bestAbs = a; pick = f; }
+  }
+  const g2 = new THREE.Quaternion().setFromAxisAngle(
+    new THREE.Vector3(FN[pick][0], FN[pick][1], FN[pick][2]),
+    (2 * Math.PI) / 5
+  );
+  gens.push(g1, g2);
+
+  const elems = [];
+  const keyOf = (q) => {
+    // identify q and -q: canonicalize sign by first significant component.
+    let x = q.x, y = q.y, z = q.z, w = q.w;
+    const arr = [x, y, z, w];
+    let s = 1;
+    for (const c of arr) {
+      if (Math.abs(c) > 1e-6) { s = c < 0 ? -1 : 1; break; }
+    }
+    const r = (v) => Math.round((v * s) * 1e5) / 1e5;
+    return `${r(x)},${r(y)},${r(z)},${r(w)}`;
+  };
+
+  const seen = new Set();
+  const push = (q) => {
+    const qn = q.clone().normalize();
+    const k = keyOf(qn);
+    if (!seen.has(k)) { seen.add(k); elems.push(qn); return true; }
+    return false;
+  };
+
+  // start from identity
+  push(new THREE.Quaternion(0, 0, 0, 1));
+  // BFS closure
+  let frontier = elems.slice();
+  // also ensure generators are in
+  for (const g of gens) push(g);
+  frontier = elems.slice();
+
+  let guard = 0;
+  while (frontier.length && guard++ < 1000) {
+    const next = [];
+    for (const a of frontier) {
+      for (const g of gens) {
+        const prod = a.clone().multiply(g);
+        if (push(prod)) next.push(prod);
+        const prod2 = a.clone().multiply(g.clone().invert());
+        if (push(prod2)) next.push(prod2);
+      }
+    }
+    frontier = next;
+  }
+
+  if (elems.length !== 60) {
+    throw new Error(`rotation group closure gave ${elems.length}, expected 60`);
+  }
+  return elems;
+}
+// solver-mega2.js — Megaminx solver (ESM), ASSET-LOADED + DIVERSIFIED.
+// =============================================================================
+// Extends the prior PDB-guided F2L reduction winner with two levers required by
+// the spec:
+//
+//  (A) PRECOMPUTED TABLES, BUILT OFFLINE. The expensive finisher tables (the
+//      oriented 3-cycle tables C_ORI/E_ORI and the 2-twist/2-flip residue tables
+//      TWIST_TBL/FLIP_TBL) are NOT rebuilt at runtime; they are DECODED from a
+//      compact little-endian binary asset (megaminx2-tables.bin) produced offline
+//      by build-mega2-asset.mjs. Runtime init is a fast decode (<~2s) plus cheap
+//      geo/GEN/PDB setup. Browser-safe (no fs).
+//
+//  (B) DIVERSIFIED, PARALLELIZABLE SEARCH. solve(state, {variant}) deterministically
+//      diversifies the per-solve search by variant (integer, default 0): a
+//      different face-priority permutation, a different piece-insertion tie-break
+//      ordering/jitter, and different finisher phase seeding. Different variants
+//      therefore explore different reductions and yield DIFFERENT valid solutions
+//      of DIFFERENT lengths. A single variant is capped to solve FAST (~0.3-0.6s);
+//      running N variants in parallel and keeping the shortest lowers the move
+//      count (best-of-8 << single variant). Each solve(state,{variant}) is a clean
+//      independent unit suitable for a Web Worker.
+//
+// METHOD (per variant):
+//   * REDUCTION FRONT-END (PDB-guided IDA*). Insert EDGES cheapest-first (the
+//     finisher's most expensive pieces — each placed edge saves the ~9-move/edge
+//     finisher cost), then the corners that remain cheap. Each insertion search
+//     NEVER disturbs already-locked pieces (the goal predicate requires the whole
+//     locked set to stay solved), so phases compose. A per-piece movement-distance
+//     pattern database (PDB) gives an admissible IDA* heuristic. Variant parameters
+//     perturb the order and the search so the front-end reaches DIFFERENT residues.
+//   * VERIFIED FINISHER (precomputed oriented 3-cycles). Whatever the bounded
+//     front-end leaves is finished by the table-driven oriented-3-cycle reduction
+//     (decoded from the asset), which ALWAYS solves any state — guaranteeing the
+//     solver always solves. The finisher is ~5ms, so per variant it is run under
+//     SEVERAL deterministic tie-break seeds and the shortest COMBINED (front+tail,
+//     after same-face compression) result is kept; a different finisher path can
+//     cancel more against the front moves, so this is a nearly-free move-count win.
+//   * Every returned solution is re-simulated on the logical model and asserted
+//     solved; we THROW rather than ever return a wrong answer.
+//
+// Move convention (must match buildMove('F'+face, prime)):
+//   amount>0 => |amount| UNPRIMED 72deg turns; amount<0 => |amount| PRIMED.
+//   face 0..11, amount in {-2,-1,1,2}, never 0. solve(solved) === [].
+//
+// Usage (browser-safe):
+//   import * as THREE from "three";
+//   import { makeMegaGeo } from "./mega-geo.js";
+//   import { createSolver } from "./solver-mega2.js";
+//   const buf = await fetch("./megaminx2-tables.bin").then(r => r.arrayBuffer());
+//   const { solve } = createSolver(THREE, makeMegaGeo, buf);
+//   const moves = solve(state, { variant: 0 });
+//
+// BINARY FORMAT: see build-mega2-asset.mjs. Header magic 0x4D454732 ('MEG2').
+// =============================================================================
+
+function createSolver(THREE, makeMegaGeo, arrayBuffer) {
+  const geo = makeMegaGeo(THREE, 1.0);
+  const { pieces, selectPieces, buildMove, snapPiece, readState } = geo;
+
+  // -------------------------------------------------------------------------
+  // Engine -> logical generators (24 single 72deg turns). gi = face*2 + prime.
+  // (Cheap; identical to solver2.js.)
+  // -------------------------------------------------------------------------
+  function makeProxies() {
+    return pieces.map((p) => ({
+      id: p.id,
+      position: new THREE.Vector3(p.center[0], p.center[1], p.center[2]),
+      quaternion: new THREE.Quaternion(0, 0, 0, 1),
+    }));
+  }
+  function engineApply(proxies, faceName, prime) {
+    const m = buildMove(faceName, prime, false);
+    const sel = selectPieces(m, proxies);
+    const q = new THREE.Quaternion().setFromAxisAngle(m.axis, m.target);
+    for (const p of sel) { p.position.applyQuaternion(q); p.quaternion.premultiply(q); }
+    for (const p of sel) snapPiece(p);
+  }
+  function deriveGen(faceName, prime) {
+    const px = makeProxies();
+    engineApply(px, faceName, prime);
+    return readState(px);
+  }
+
+  const GEN = [];
+  const genFace = [];
+  const genPrime = [];
+  for (let f = 0; f < 12; f++) {
+    for (const pr of [false, true]) {
+      const g = deriveGen("F" + f, pr);
+      GEN.push({
+        cp: Int8Array.from(g.cp), co: Int8Array.from(g.co),
+        ep: Int8Array.from(g.ep), eo: Int8Array.from(g.eo),
+      });
+      genFace.push(f); genPrime.push(pr);
+    }
+  }
+  const NG = GEN.length;
+  const ginv = [];
+  for (let f = 0; f < 12; f++) { ginv[f * 2] = f * 2 + 1; ginv[f * 2 + 1] = f * 2; }
+
+  const IDS = {
+    cp: Int8Array.from({ length: 20 }, (_, i) => i),
+    co: new Int8Array(20),
+    ep: Int8Array.from({ length: 30 }, (_, i) => i),
+    eo: new Int8Array(30),
+  };
+
+  // state composition: (S then move gi)
+  function comp(S, gi) {
+    const g = GEN[gi];
+    const cp = new Int8Array(20), co = new Int8Array(20);
+    const ep = new Int8Array(30), eo = new Int8Array(30);
+    for (let i = 0; i < 20; i++) { const s = g.cp[i]; cp[i] = S.cp[s]; co[i] = (S.co[s] + g.co[i]) % 3; }
+    for (let i = 0; i < 30; i++) { const s = g.ep[i]; ep[i] = S.ep[s]; eo[i] = (S.eo[s] + g.eo[i]) % 2; }
+    return { cp, co, ep, eo };
+  }
+  function applySeqState(S, seq) { let X = S; for (const gi of seq) X = comp(X, gi); return X; }
+  function genOf(seq) { return applySeqState(IDS, seq); }
+
+  function composeGen(A, B) { // result = A then B
+    const cp = new Int8Array(20), co = new Int8Array(20);
+    const ep = new Int8Array(30), eo = new Int8Array(30);
+    for (let i = 0; i < 20; i++) { const s = B.cp[i]; cp[i] = A.cp[s]; co[i] = (A.co[s] + B.co[i]) % 3; }
+    for (let i = 0; i < 30; i++) { const s = B.ep[i]; ep[i] = A.ep[s]; eo[i] = (A.eo[s] + B.eo[i]) % 2; }
+    return { cp, co, ep, eo };
+  }
+  const invSeq = (seq) => seq.slice().reverse().map((g) => ginv[g]);
+
+  // Self-cancel / merge a gi-sequence (identical to solver2.js).
+  function reduceSeq(seq) {
+    const stack = [];
+    for (const gi of seq) {
+      const face = genFace[gi];
+      const amt = genPrime[gi] ? 4 : 1;
+      if (stack.length && stack[stack.length - 1].face === face) {
+        const top = stack[stack.length - 1];
+        top.net = (top.net + amt) % 5;
+        if (top.net === 0) stack.pop();
+      } else {
+        stack.push({ face, net: amt % 5 });
+      }
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i + 1 < stack.length; i++) {
+        if (stack[i].face === stack[i + 1].face) {
+          const net = (stack[i].net + stack[i + 1].net) % 5;
+          stack.splice(i, 2, ...(net === 0 ? [] : [{ face: stack[i].face, net }]));
+          changed = true; break;
+        }
+      }
+    }
+    const out = [];
+    for (const { face, net } of stack) {
+      if (net === 1) out.push(face * 2);
+      else if (net === 2) { out.push(face * 2); out.push(face * 2); }
+      else if (net === 3) { out.push(face * 2 + 1); out.push(face * 2 + 1); }
+      else if (net === 4) out.push(face * 2 + 1);
+    }
+    return out;
+  }
+  function moveCount(seq) {
+    let c = 0, last = -1;
+    for (const gi of seq) { if (genFace[gi] !== last) { c++; last = genFace[gi]; } }
+    return c;
+  }
+
+  function fwdCycle(p, n) {
+    const inv = new Int8Array(n).fill(-1);
+    for (let i = 0; i < n; i++) inv[p[i]] = i;
+    let start = -1;
+    for (let i = 0; i < n; i++) if (p[i] !== i) { start = i; break; }
+    if (start < 0) return null;
+    const c = [start];
+    let cur = inv[start];
+    while (cur !== start) { c.push(cur); cur = inv[cur]; }
+    return c;
+  }
+
+  // -------------------------------------------------------------------------
+  // DECODE the binary asset into the exact structures solve() reads.
+  // -------------------------------------------------------------------------
+  const dv = new DataView(arrayBuffer);
+  let pos = 0;
+  const rdU8 = () => dv.getUint8(pos++);
+  const rdU16 = () => { const v = dv.getUint16(pos, true); pos += 2; return v; };
+  const rdU32 = () => { const v = dv.getUint32(pos, true); pos += 4; return v; };
+
+  // Header
+  const magic = rdU32();
+  if (magic !== 0x4d454732) throw new Error("megaminx2-tables.bin: bad magic " + magic.toString(16));
+  const version = rdU16();
+  if (version !== 1) throw new Error("megaminx2-tables.bin: unsupported version " + version);
+  rdU16(); rdU32(); rdU32(); // reserved
+
+  function readPool() {
+    const nSeqPool = rdU32();
+    const pool = new Array(nSeqPool);
+    for (let i = 0; i < nSeqPool; i++) {
+      const len = rdU8();
+      const seq = new Array(len);
+      for (let k = 0; k < len; k++) seq[k] = rdU8();
+      pool[i] = seq;
+    }
+    return pool;
+  }
+
+  // Oriented table decode. Rebuilds:
+  //   tbl: "cur,home" -> { dm: Map(d -> Map(third -> Map(dThird -> {seq,mc,dCur}))), full }
+  function decodeOriented(om, ocoord) {
+    const nPairs = rdU32();
+    const pool = readPool();
+    const tbl = new Map();
+    for (let pi = 0; pi < nPairs; pi++) {
+      const cur = rdU8();
+      const home = rdU8();
+      const nLeaves = rdU16();
+      const rec = { dm: new Map(), full: false };
+      tbl.set(cur + "," + home, rec);
+      for (let li = 0; li < nLeaves; li++) {
+        const d = rdU8();
+        const third = rdU8();
+        const dThird = rdU8();
+        const seqRef = rdU16();
+        const seq = pool[seqRef];
+        // dCur derived from seq: orientation delivered to slot cur.
+        const g = genOf(seq);
+        const dCur = g[ocoord][cur];
+        const mc = moveCount(seq);
+        let dm = rec.dm.get(d);
+        if (!dm) { dm = new Map(); rec.dm.set(d, dm); }
+        let tm = dm.get(third);
+        if (!tm) { tm = new Map(); dm.set(third, tm); }
+        tm.set(dThird, { seq, mc, dCur });
+      }
+      // full derived: has all `om` orientation deliveries.
+      rec.full = rec.dm.size >= om;
+    }
+    return tbl;
+  }
+
+  // TWIST table decode -> Map("x,y" -> {seq, mc, dx, dy}); dx,dy derived.
+  function decodeTwist() {
+    const nEntries = rdU32();
+    const pool = readPool();
+    const tbl = new Map();
+    for (let i = 0; i < nEntries; i++) {
+      const x = rdU8();
+      const y = rdU8();
+      const seqRef = rdU16();
+      const seq = pool[seqRef];
+      const g = genOf(seq);
+      tbl.set(x + "," + y, { seq, mc: moveCount(seq), dx: g.co[x], dy: g.co[y] });
+    }
+    return tbl;
+  }
+
+  // FLIP table decode -> Map("x,y" -> {seq, mc}); mc derived.
+  function decodeFlip() {
+    const nEntries = rdU32();
+    const pool = readPool();
+    const tbl = new Map();
+    for (let i = 0; i < nEntries; i++) {
+      const x = rdU8();
+      const y = rdU8();
+      const seqRef = rdU16();
+      const seq = pool[seqRef];
+      tbl.set(x + "," + y, { seq, mc: moveCount(seq) });
+    }
+    return tbl;
+  }
+
+  const C_ORI = decodeOriented(3, "co");
+  const E_ORI = decodeOriented(2, "eo");
+  const TWIST_TBL = decodeTwist();
+  const FLIP_TBL = decodeFlip();
+
+  const FLIP_ADJ = (() => {
+    const adj = Array.from({ length: 30 }, () => new Set());
+    for (const k of FLIP_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
+    return adj;
+  })();
+  const TWIST_ADJ = (() => {
+    const adj = Array.from({ length: 20 }, () => new Set());
+    for (const k of TWIST_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
+    return adj;
+  })();
+
+  // =========================================================================
+  // FRONT-END: PDB-guided IDA* reduction (diversified by `variant`).
+  // =========================================================================
+
+  // --- Incidence (which corners/edges live on each face) — from geometry. ---
+  const faceCorners = [], faceEdges = [];
+  for (let f = 0; f < 12; f++) {
+    const px = makeProxies();
+    const m = buildMove("F" + f, false, false);
+    const sel = selectPieces(m, px);
+    const c = [], e = [];
+    for (const p of sel) {
+      if (p.id.startsWith("corner-")) c.push(parseInt(p.id.slice(7)));
+      else if (p.id.startsWith("edge-")) e.push(parseInt(p.id.slice(5)));
+    }
+    faceCorners.push(c); faceEdges.push(e);
+  }
+
+  // --- Per-piece movement-distance pattern databases (admissible heuristic). --
+  //   CD[H][s*3+o] = min #face-moves to bring the corner whose home is H from
+  //     (slot s, orient o) to (slot H, orient 0), ignoring all other pieces.
+  //   ED[H][s*2+o] = same for edges.
+  // A single face turn advances any one tracked piece by at most one step, so the
+  // MAX over a target set of these distances is an admissible lower bound on the
+  // number of moves needed to place that whole set.
+  function buildDist(NP, om, cpKey, coKey) {
+    const dist = [];
+    const inv = [];
+    for (let gi = 0; gi < NG; gi++) {
+      const g = GEN[gi];
+      const map = new Int8Array(NP);
+      const cp = g[cpKey];
+      for (let j = 0; j < NP; j++) map[cp[j]] = j;
+      inv.push(map);
+    }
+    for (let H = 0; H < NP; H++) {
+      const d = new Int8Array(NP * om).fill(-1);
+      d[H * om + 0] = 0;
+      let frontier = [[H, 0]];
+      while (frontier.length) {
+        const nf = [];
+        for (const [s, o] of frontier) {
+          const cd = d[s * om + o];
+          for (let gi = 0; gi < NG; gi++) {
+            const g = GEN[gi];
+            const j = inv[gi][s];
+            const no = (o + g[coKey][j]) % om;
+            const idx = j * om + no;
+            if (d[idx] === -1) { d[idx] = cd + 1; nf.push([j, no]); }
+          }
+        }
+        frontier = nf;
+      }
+      dist.push(d);
+    }
+    return dist;
+  }
+  const CD = buildDist(20, 3, "cp", "co");
+  const ED = buildDist(30, 2, "ep", "eo");
+
+  function edgeDist(S, H) {
+    let s = -1;
+    for (let k = 0; k < 30; k++) if (S.ep[k] === H) { s = k; break; }
+    return ED[H][s * 2 + S.eo[s]];
+  }
+  function cornerDist(S, H) {
+    let s = -1;
+    for (let k = 0; k < 20; k++) if (S.cp[k] === H) { s = k; break; }
+    return CD[H][s * 3 + S.co[s]];
+  }
+  function frontHeuristic(S, cs, es) {
+    let m = 0;
+    for (const H of cs) {
+      let s = -1;
+      for (let k = 0; k < 20; k++) if (S.cp[k] === H) { s = k; break; }
+      const d = CD[H][s * 3 + S.co[s]];
+      if (d > m) m = d;
+    }
+    for (const H of es) {
+      let s = -1;
+      for (let k = 0; k < 30; k++) if (S.ep[k] === H) { s = k; break; }
+      const d = ED[H][s * 2 + S.eo[s]];
+      if (d > m) m = d;
+    }
+    return m;
+  }
+  function frontGoalMet(S, cs, es) {
+    for (const c of cs) if (S.cp[c] !== c || S.co[c]) return false;
+    for (const e of es) if (S.ep[e] !== e || S.eo[e]) return false;
+    return true;
+  }
+  // IDA* placement, NEVER disturbing the locked set (cs corner-homes, es edge-homes
+  // — each must be home+oriented). `faceOrder` permutes which face is tried first
+  // (diversification). Returns a list of {face, amount(1..4)} or null on cap/depth.
+  function idaPlace(S0, cs, es, maxDepth, nodeCap, faceOrder) {
+    if (frontGoalMet(S0, cs, es)) return [];
+    let path = [];
+    let nodes = 0;
+    let aborted = false;
+    function dfs(S, g, limit, lastFace) {
+      if (++nodes > nodeCap) { aborted = true; return false; }
+      if (frontGoalMet(S, cs, es)) return true;
+      if (g + frontHeuristic(S, cs, es) > limit) return false;
+      for (let fi = 0; fi < 12; fi++) {
+        const face = faceOrder[fi];
+        if (face === lastFace) continue;
+        let X = S;
+        for (let amt = 1; amt <= 4; amt++) {
+          X = comp(X, face * 2);
+          path.push({ face, amount: amt });
+          if (dfs(X, g + 1, limit, face)) return true;
+          path.pop();
+          if (aborted) return false;
+        }
+      }
+      return false;
+    }
+    for (let limit = 1; limit <= maxDepth; limit++) {
+      path = [];
+      if (dfs(S0, 0, limit, -1)) return path.slice();
+      if (aborted) return null;
+    }
+    return null;
+  }
+
+  function applyFrontMoves(S, moves) {
+    for (const mv of moves) {
+      const gi = mv.face * 2;
+      for (let k = 0; k < mv.amount; k++) S = comp(S, gi);
+    }
+    return S;
+  }
+
+  // mulberry32 deterministic RNG for variant diversification.
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6d2b79f5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function shuffleInPlace(arr, rng) {
+    for (let i = arr.length - 1; i > 0; i--) {
+      const j = Math.floor(rng() * (i + 1));
+      const t = arr[i]; arr[i] = arr[j]; arr[j] = t;
+    }
+    return arr;
+  }
+
+  // Search-budget configuration. Defaults are tuned for ~0.3-0.6s per variant.
+  // (Node-only env overrides exist for offline tuning; browsers use the defaults.)
+  const ENV = (typeof process !== "undefined" && process && process.env) ? process.env : {};
+  const numEnv = (k, d) => (ENV[k] !== undefined ? parseInt(ENV[k], 10) : d);
+  const CFG = {
+    // Loose tier (many slots open): searches mostly SUCCEED — give them room so
+    // the cheap edges actually land. Tight tier (cube nearly full): searches
+    // mostly FAIL and exhausting a big cap is wasted time, so the tight cap is
+    // small (fail fast). This keeps per-variant time low while still placing the
+    // edges that matter most.
+    cap0Loose: numEnv("MG_CAP0L", 34000),
+    capVLoose: numEnv("MG_CAPVL", 28000),
+    cap0Tight: numEnv("MG_CAP0T", 22000),
+    capVTight: numEnv("MG_CAPVT", 16000),
+    depthLoose: numEnv("MG_DL", 10),
+    depthTight: numEnv("MG_DT", 9),
+    // Diversity knobs (variant>0): tie-break rank scale (<1 keeps cheapest-first)
+    // and the +1 adjacent-swap nudge probability.
+    rankScale: (ENV.MG_RANK !== undefined ? parseFloat(ENV.MG_RANK) : 0.5),
+    nudgeP: (ENV.MG_NUDGE !== undefined ? parseFloat(ENV.MG_NUDGE) : 0.5),
+  };
+
+  // The diversified reduction front-end. Returns { S, moves } where `moves` is a
+  // list of {face, amount(1..4)} and S is the residual state for the finisher.
+  //   variant === 0: the deterministic baseline (identity face order, no insertion-
+  //     order perturbation) — the strongest single reduction.
+  //   variant  >  0: a seeded face-priority permutation + a gentle per-piece
+  //     insertion-order perturbation, so the reduction takes a DIFFERENT path to a
+  //     DIFFERENT residue (which is what makes best-of-N pay off).
+  function runFront(S0, variant) {
+    const rng = mulberry32((0x9e3779b1 ^ Math.imul(variant + 1, 2654435761)) >>> 0);
+    const baseFaceOrder = [];
+    for (let f = 0; f < 12; f++) baseFaceOrder.push(f);
+    const faceOrder = variant === 0 ? baseFaceOrder : shuffleInPlace(baseFaceOrder.slice(), rng);
+
+    // Per-variant budgets. Capped so ONE variant is fast (~0.3-0.6s); best-of-N
+    // recovers the moves. The dominant cost is FAILED searches that exhaust the
+    // cap near the "wall", so caps are kept modest; diversity recovers the rest.
+    const CAP_LOOSE = variant === 0 ? CFG.cap0Loose : CFG.capVLoose;
+    const DEPTH_LOOSE = CFG.depthLoose;
+    const CAP_TIGHT = variant === 0 ? CFG.cap0Tight : CFG.capVTight;
+    const DEPTH_TIGHT = CFG.depthTight;
+
+    let S = S0;
+    const moves = [];
+    const dE = [], dC = [];
+    // Adaptive depth slack: an insertion that does NOT need to disturb the locked
+    // set is found at a depth near the new piece's standalone PDB distance. Capping
+    // each search's max depth at (newPieceDist + ADAPT_SLACK) makes HOPELESS
+    // insertions (piece can't be placed without disturbing locks) abort far sooner
+    // instead of burning the whole node cap at the deepest limit — a large speedup
+    // with negligible move-count cost. The hard depth ceiling still applies.
+    const ADAPT_SLACK = 2;
+    const tryPlace = (cs, es, cap, depth) => {
+      const seq = idaPlace(S, cs, es, depth, cap, faceOrder);
+      if (!seq) return false;
+      S = applyFrontMoves(S, seq);
+      for (const mv of seq) moves.push(mv);
+      return true;
+    };
+
+    // DIVERSIFICATION of the cheapest-first insertion order (variant>0 only).
+    // Two combined, GENTLE perturbations keep each variant strong (cheapest-first
+    // is the strong ordering) while decorrelating which residue it reaches:
+    //   * a fixed per-piece sub-1 rank breaks SAME-distance ties differently;
+    //   * an occasional +1 nudge swaps a few ADJACENT-distance pieces.
+    // Larger perturbations wreck the ordering and RAISE best-of-N, so both are
+    // kept small. Variant 0 is fully deterministic (the strongest single baseline).
+    const eRank = new Float64Array(30), cRank = new Float64Array(20);
+    if (variant !== 0) {
+      for (let e = 0; e < 30; e++) eRank[e] = rng() * CFG.rankScale;
+      for (let c = 0; c < 20; c++) cRank[c] = rng() * CFG.rankScale;
+    }
+    const nudgeP = variant === 0 ? 0 : CFG.nudgeP;
+    const ejit = (e) => (variant === 0 ? 0 : eRank[e] + (rng() < nudgeP ? 1 : 0));
+    const cjit = (c) => (variant === 0 ? 0 : cRank[c] + (rng() < nudgeP ? 1 : 0));
+
+    const lockEdge = (e) => { if (S.ep[e] === e && !S.eo[e]) { dE.push(e); return true; } return false; };
+    const lockCorner = (c) => { if (S.cp[c] === c && !S.co[c]) { dC.push(c); return true; } return false; };
+
+    // gather currently-unplaced homes
+    const collect = () => {
+      const remE = [], remC = [];
+      for (let e = 0; e < 30; e++) if (!(S.ep[e] === e && !S.eo[e])) remE.push(e);
+      for (let c = 0; c < 20; c++) if (!(S.cp[c] === c && !S.co[c])) remC.push(c);
+      return { remE, remC };
+    };
+    // initialize locked sets
+    for (let e = 0; e < 30; e++) lockEdge(e);
+    for (let c = 0; c < 20; c++) lockCorner(c);
+
+    // SPEED MODEL (measured): in a reduction, FAILED insertions outnumber
+    // successes ~1.7:1 and each failure burns its FULL node cap, while the median
+    // SUCCESS finishes in only a few thousand nodes. So failed searches dominate
+    // the time. Two cuts make a variant fast without losing the placements that
+    // matter:
+    //   (1) DON'T-RETRY-WITHOUT-PROGRESS: a piece that just failed at this exact
+    //       board cannot succeed again until the board changes (a different piece
+    //       got placed). We only retry failed pieces after some OTHER piece lands.
+    //   (2) MODEST CAPS: caps are sized near the p90 of successful searches, so we
+    //       keep almost all real placements while every failure costs far less.
+    // placeEdges: place every currently-placeable edge cheapest-first, preserving
+    // the locked set. Repeats until a full pass lands nothing new.
+    const placeEdges = () => {
+      let prog = true;
+      let blocked = new Set(); // failed since last successful placement
+      while (prog) {
+        prog = false;
+        let { remE } = collect();
+        if (!remE.length) break;
+        remE.sort((a, b) => (edgeDist(S, a) + ejit(a)) - (edgeDist(S, b) + ejit(b)));
+        const loose = remE.length >= 10;
+        const cap = loose ? CAP_LOOSE : CAP_TIGHT;
+        const depth = loose ? DEPTH_LOOSE : DEPTH_TIGHT;
+        for (const e of remE) {
+          if (lockEdge(e)) { prog = true; blocked.clear(); continue; }
+          if (blocked.has(e)) continue;
+          const aDepth = Math.min(depth, edgeDist(S, e) + ADAPT_SLACK);
+          if (tryPlace(dC, [...dE, e], cap, aDepth)) { dE.push(e); prog = true; blocked.clear(); }
+          else blocked.add(e);
+        }
+      }
+    };
+    const placeCorners = () => {
+      let prog = true;
+      let blocked = new Set();
+      while (prog) {
+        prog = false;
+        let { remC } = collect();
+        if (!remC.length) break;
+        remC.sort((a, b) => (cornerDist(S, a) + cjit(a)) - (cornerDist(S, b) + cjit(b)));
+        for (const c of remC) {
+          if (lockCorner(c)) { prog = true; blocked.clear(); continue; }
+          if (blocked.has(c)) continue;
+          const aDepth = Math.min(DEPTH_TIGHT, cornerDist(S, c) + ADAPT_SLACK);
+          if (tryPlace([...dC, c], dE, CAP_TIGHT, aDepth)) { dC.push(c); prog = true; blocked.clear(); }
+          else blocked.add(c);
+        }
+      }
+    };
+    // SCHEDULE: edges-first, then corners, with trailing mop-up passes (a later
+    // placement can free an edge or a corner). Edges-first is the strongest single
+    // reduction — every probe confirms corners-first / interleaved / early-corner
+    // schedules reach a MORE expensive residue, because the finisher costs ~9 moves
+    // per residual edge vs ~7 per residual corner, so stranding edges is worse than
+    // stranding corners. ALL variants use edges-first; diversity comes entirely
+    // from the per-variant insertion-order perturbation (ejit/cjit) and the
+    // finisher tie-break seed, both gentle enough to keep every variant strong.
+    placeEdges();
+    placeCorners();
+    placeEdges();
+    placeCorners();
+
+    return { S, moves };
+  }
+
+  // amount(1..4) -> canonical, merge same-face, drop zeros (for combining front +
+  // finisher move lists).
+  function normAmount(a) {
+    a = ((a % 5) + 5) % 5;
+    if (a === 0) return 0;
+    if (a === 1) return 1;
+    if (a === 2) return 2;
+    if (a === 3) return -2;
+    return -1;
+  }
+  function rawSum2(a, b) { const t = (x) => (x < 0 ? x + 5 : x); return t(a) + t(b); }
+  function compressMoves(moves) {
+    const stack = [];
+    for (const mv of moves) {
+      const a = normAmount(mv.amount);
+      if (a === 0) continue;
+      if (stack.length && stack[stack.length - 1].face === mv.face) {
+        const top = stack[stack.length - 1];
+        const na = normAmount(rawSum2(top.amount, a));
+        if (na === 0) stack.pop();
+        else top.amount = na;
+      } else {
+        stack.push({ face: mv.face, amount: a });
+      }
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i + 1 < stack.length; i++) {
+        if (stack[i].face === stack[i + 1].face) {
+          const na = normAmount(rawSum2(stack[i].amount, stack[i + 1].amount));
+          stack.splice(i, 2, ...(na === 0 ? [] : [{ face: stack[i].face, amount: na }]));
+          changed = true; break;
+        }
+      }
+    }
+    return stack;
+  }
+
+  // -------------------------------------------------------------------------
+  // SOLVER (identical logic to solver2.js).
+  // -------------------------------------------------------------------------
+  function isSolvedState(S) {
+    for (let i = 0; i < 20; i++) if (S.cp[i] !== i || S.co[i]) return false;
+    for (let i = 0; i < 30; i++) if (S.ep[i] !== i || S.eo[i]) return false;
+    return true;
+  }
+
+  function twistDirect(tbl, x, A, y) {
+    A = ((A % 3) + 3) % 3;
+    if (A === 0) return [];
+    const e = tbl.get(x + "," + y);
+    if (!e) return null;
+    const base = ((e.dx % 3) + 3) % 3;
+    const k = (A * (base === 1 ? 1 : 2)) % 3;
+    const out = [];
+    for (let i = 0; i < k; i++) out.push(...e.seq);
+    return out;
+  }
+  function twistPair(tbl, tadj, x, A, y) {
+    A = ((A % 3) + 3) % 3;
+    if (A === 0) return [];
+    const d = twistDirect(tbl, x, A, y);
+    if (d) return d;
+    const prev = new Map([[x, -1]]);
+    const q = [x]; let h = 0;
+    while (h < q.length) {
+      const u = q[h++];
+      if (u === y) break;
+      for (const v of tadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
+    }
+    if (!prev.has(y)) return null;
+    const path = [];
+    let cur = y;
+    while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
+    const out = [];
+    for (let i = 0; i + 1 < path.length; i++) {
+      const seg = twistDirect(tbl, path[i], A, path[i + 1]);
+      if (!seg) return null;
+      out.push(...seg);
+    }
+    return out;
+  }
+  function flipPair(tbl, fadj, x, y) {
+    if (tbl.has(x + "," + y)) return tbl.get(x + "," + y).seq.slice();
+    const prev = new Map([[x, -1]]);
+    const q = [x];
+    let h = 0;
+    while (h < q.length) {
+      const u = q[h++];
+      if (u === y) break;
+      for (const v of fadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
+    }
+    if (!prev.has(y)) return null;
+    const path = [];
+    let cur = y;
+    while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
+    const out = [];
+    for (let i = 0; i + 1 < path.length; i++) out.push(...tbl.get(path[i] + "," + path[i + 1]).seq);
+    return out;
+  }
+
+  function phaseOriented(ctx, run, coord, ocoord, n, om, otbl, ptbl, finRng) {
+    let guard = 0;
+    while (guard++ < 400) {
+      const p = ctx.S[coord], o = ctx.S[ocoord];
+      const mis = [];
+      for (let i = 0; i < n; i++) if (p[i] !== i) mis.push(i);
+      if (mis.length === 0) return;
+      if (mis.length === 3) {
+        const closed = solveFinalTriple(otbl, ptbl, p, o, om, n, mis);
+        if (closed) { run(closed); continue; }
+      }
+      {
+        // Global two-piece-both-oriented fix: pick the shortest among all such ops.
+        // finRng (when present) breaks near-ties differently per variant, so the
+        // finisher yields a DIFFERENT (still valid) tail from the same residue —
+        // multiplying diversity at ~zero cost (the finisher is ~5ms).
+        let bestSeq = null, bestScore = Infinity;
+        for (const home of mis) {
+          let cur = -1;
+          for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
+          const twoFix = p[home];
+          if (twoFix === cur) continue;
+          if (p[twoFix] === twoFix) continue;
+          const need = ((om - o[cur]) % om);
+          const rec = otbl.get(cur + "," + home);
+          if (!rec) continue;
+          const dm = rec.dm.get(need);
+          if (!dm) continue;
+          const tm = dm.get(twoFix);
+          if (!tm) continue;
+          const needThird = ((om - o[home]) % om);
+          const ent = tm.get(needThird);
+          if (ent) {
+            const score = ent.mc + (finRng ? finRng() * 1.5 : 0);
+            if (score < bestScore) { bestScore = score; bestSeq = ent.seq; }
+          }
+        }
+        if (bestSeq) { run(bestSeq); continue; }
+      }
+      // Monotone fallback: ALWAYS solve the lowest misplaced slot (mis[0]). The
+      // monotone third-helper guarantee (a misplaced slot > home must exist) relies
+      // on this, so it is NOT diversified — finisher diversity comes entirely from
+      // the safe two-fix tie-break above.
+      let home = mis[0];
+      let cur = -1;
+      for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
+      const oc = o[cur];
+      const need = ((om - oc) % om);
+      const twoFix = p[home];
+      const rec = otbl.get(cur + "," + home);
+      let chosen = null;
+      if (rec) {
+        const dm = rec.dm.get(need);
+        if (dm) {
+          let best = null, bestScore = Infinity;
+          for (const [t, tm] of dm) {
+            if (t <= home || t === cur) continue;
+            for (const [dThird, ent] of tm) {
+              const resThird = (o[home] + dThird) % om;
+              const resCur = (o[t] + ent.dCur) % om;
+              let score = ent.mc * 0.4;
+              if (t === twoFix && resThird === 0) {
+                score -= 100;
+              } else {
+                if (p[t] === t) score += 6;
+                score += (resThird !== 0 ? 1 : 0) * 5 + (resCur !== 0 ? 1 : 0) * 5;
+              }
+              // Per-variant tie-break: perturb near-equal scores so different
+              // variants pick different (still monotone-safe, t>home) thirds.
+              if (finRng) score += finRng() * 0.6;
+              if (score < bestScore) { bestScore = score; best = ent; }
+            }
+          }
+          if (best) chosen = best.seq;
+        }
+      }
+      if (!chosen) {
+        const seq = pickPlainCycle(ptbl, coord, n, p, home, cur);
+        run(seq);
+        continue;
+      }
+      run(chosen);
+    }
+    throw new Error("phaseOriented did not converge");
+  }
+
+  function solveFinalTriple(otbl, ptbl, p, o, om, n, mis) {
+    const coord = n === 20 ? "cp" : "ep";
+    const ocoord = n === 20 ? "co" : "eo";
+    const cands = [];
+    for (const a of mis) for (const b of mis) {
+      if (a === b) continue;
+      const rec = otbl.get(a + "," + b);
+      if (!rec) continue;
+      for (const [, dm] of rec.dm) for (const [, tm] of dm) for (const [, ent] of tm) cands.push(ent);
+    }
+    let best = null, bestMc = Infinity;
+    for (const ent of cands) {
+      if (ent.mc >= bestMc) continue;
+      const g = genOf(ent.seq);
+      let ok = true;
+      for (const s of mis) {
+        const src = g[coord][s];
+        if (p[src] !== s) { ok = false; break; }
+        const oSrc = o[src];
+        if (((oSrc + g[ocoord][s]) % om) !== 0) { ok = false; break; }
+      }
+      if (!ok) continue;
+      let clean = true;
+      for (let i = 0; i < n; i++) {
+        if (mis.includes(i)) continue;
+        if (g[coord][i] !== i || g[ocoord][i]) { clean = false; break; }
+      }
+      if (!clean) continue;
+      best = ent.seq; bestMc = ent.mc;
+    }
+    return best;
+  }
+
+  function posSeqFor(otbl, coord, a, b, c) {
+    const tryKey = (x, y, z) => {
+      const rec = otbl.get(x + "," + y); if (!rec) return null;
+      let best = null;
+      for (const [, dm] of rec.dm) { const tm = dm.get(z); if (!tm) continue; for (const [, e] of tm) if (!best || e.mc < best.mc) best = e; }
+      return best ? best.seq : null;
+    };
+    let s = tryKey(a, b, c); if (s) return s;
+    s = tryKey(b, c, a); if (s) return s;
+    s = tryKey(c, a, b); if (s) return s;
+    return null;
+  }
+  function isPosCycle3(seq, coord, n, a, b, c) {
+    const g = genOf(seq);
+    const op = coord === "cp" ? "ep" : "cp";
+    for (let i = 0; i < 20; i++) if (g.co[i]) return false;
+    for (let i = 0; i < 30; i++) if (g.eo[i]) return false;
+    const om = coord === "cp" ? 30 : 20;
+    for (let i = 0; i < om; i++) if (g[op][i] !== i) return false;
+    const p = g[coord];
+    for (let i = 0; i < n; i++) {
+      const want = i === a ? c : i === b ? a : i === c ? b : i;
+      if (p[i] !== want) return false;
+    }
+    return true;
+  }
+  function posCycle3(otbl, n, a, b, c) {
+    const coord = n === 20 ? "cp" : "ep";
+    const d = posSeqFor(otbl, coord, a, b, c);
+    if (d && isPosCycle3(d, coord, n, a, b, c)) return d;
+    for (let h = 0; h < n; h++) {
+      if (h === a || h === b || h === c) continue;
+      const s1 = posSeqFor(otbl, coord, a, b, h);
+      if (!s1) continue;
+      const s2 = posSeqFor(otbl, coord, a, h, c);
+      if (!s2) continue;
+      const seq = [...s1, ...s2];
+      if (isPosCycle3(seq, coord, n, a, b, c)) return seq;
+    }
+    return null;
+  }
+  function pickPlainCycle(otbl, coord, n, p, home, cur) {
+    const twoFix = p[home];
+    const rec = otbl.get(cur + "," + home);
+    if (rec) {
+      const best = new Map();
+      for (const [, dm] of rec.dm) for (const [t, tm] of dm) {
+        for (const [, ent] of tm) {
+          const ex = best.get(t);
+          if (!ex || ent.mc < ex.mc) best.set(t, ent);
+        }
+      }
+      if (twoFix > home && twoFix !== cur && best.has(twoFix)) return best.get(twoFix).seq;
+      let third = -1, bestMc = Infinity;
+      for (const [t, ent] of best) {
+        if (t <= home || t === cur) continue;
+        if (p[t] !== t && ent.mc < bestMc) { bestMc = ent.mc; third = t; }
+      }
+      if (third >= 0) return best.get(third).seq;
+    }
+    let helper = -1;
+    for (let i = home + 1; i < n; i++) if (p[i] !== i && i !== cur) { helper = i; break; }
+    if (helper >= 0) {
+      const seq = posCycle3(otbl, n, cur, home, helper);
+      if (seq) return seq;
+    }
+    throw new Error("pickPlainCycle: no cycle for " + [cur, home]);
+  }
+  function phaseTwist(ctx, run) {
+    let guard = 0;
+    while (guard++ < 60) {
+      const co = ctx.S.co;
+      const tw = [];
+      for (let i = 0; i < 20; i++) if (co[i]) tw.push(i);
+      if (tw.length === 0) return;
+      const x = tw[0];
+      const y = tw[1] !== undefined ? tw[1] : tw[0];
+      const A = (3 - co[x]) % 3;
+      const seq = twistPair(TWIST_TBL, TWIST_ADJ, x, A, y);
+      if (!seq) throw new Error("phaseTwist: no twistPair " + [x, y]);
+      run(seq);
+    }
+    throw new Error("phaseTwist did not converge");
+  }
+  function phaseFlip(ctx, run) {
+    let guard = 0;
+    while (guard++ < 60) {
+      const eo = ctx.S.eo;
+      const fl = [];
+      for (let i = 0; i < 30; i++) if (eo[i]) fl.push(i);
+      if (fl.length === 0) return;
+      const seq = flipPair(FLIP_TBL, FLIP_ADJ, fl[0], fl[1]);
+      if (!seq) throw new Error("phaseFlip: no flipPair " + [fl[0], fl[1]]);
+      run(seq);
+    }
+    throw new Error("phaseFlip did not converge");
+  }
+
+  function gisToMoves(gis) {
+    const stack = [];
+    const norm = (a) => { a = ((a % 5) + 5) % 5; if (a === 3) return -2; if (a === 4) return -1; return a; };
+    for (const gi of gis) {
+      const face = genFace[gi];
+      const amt = genPrime[gi] ? -1 : 1;
+      if (stack.length && stack[stack.length - 1].face === face) {
+        const top = stack[stack.length - 1];
+        const na = norm(top.amt + amt);
+        if (na === 0) stack.pop();
+        else top.amt = na;
+      } else {
+        stack.push({ face, amt: norm(amt) });
+      }
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (let i = 0; i + 1 < stack.length; i++) {
+        if (stack[i].face === stack[i + 1].face) {
+          const na = norm(stack[i].amt + stack[i + 1].amt);
+          stack.splice(i, 2, ...(na === 0 ? [] : [{ face: stack[i].face, amt: na }]));
+          changed = true;
+          break;
+        }
+      }
+    }
+    return stack.map((e) => ({ face: e.face, amount: e.amt }));
+  }
+
+  // -------------------------------------------------------------------------
+  // FINISHER runner: solve whatever the front-end left, via the decoded oriented
+  // 3-cycle tables. ALWAYS solves any reachable state. `finRng` (optional) is a
+  // deterministic per-variant RNG that perturbs the finisher's tie-breaks so two
+  // variants reaching a SIMILAR residue still produce DIFFERENT (valid) tails —
+  // multiplying best-of-N diversity at ~zero cost. Returns a gi-stream S->solved.
+  function runFinisher(S0, finRng) {
+    const ctx = { S: {
+      cp: Int8Array.from(S0.cp), co: Int8Array.from(S0.co),
+      ep: Int8Array.from(S0.ep), eo: Int8Array.from(S0.eo),
+    } };
+    const stream = [];
+    const run = (seq) => {
+      if (!seq) throw new Error("null sequence");
+      for (const gi of seq) { ctx.S = comp(ctx.S, gi); stream.push(gi); }
+    };
+    phaseOriented(ctx, run, "cp", "co", 20, 3, C_ORI, C_ORI, finRng);
+    phaseTwist(ctx, run);
+    phaseOriented(ctx, run, "ep", "eo", 30, 2, E_ORI, E_ORI, finRng);
+    phaseFlip(ctx, run);
+    if (!isSolvedState(ctx.S)) throw new Error("finisher did not reach solved");
+    return stream;
+  }
+
+  // -------------------------------------------------------------------------
+  // solve(state, opts) -> [{face, amount}].
+  //   opts.variant (default 0): deterministic diversification index. Different
+  //   variants take different reduction paths and yield different-length valid
+  //   solutions. Run variants 0..N-1 independently (e.g. parallel Web Workers)
+  //   and keep the shortest; best-of-N is shorter than a single variant.
+  // ALWAYS solves; verifies its own output by re-simulation and throws otherwise.
+  // -------------------------------------------------------------------------
+  function solve(state, opts) {
+    const variant = (opts && Number.isInteger(opts.variant)) ? opts.variant : 0;
+    const S0 = {
+      cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
+      ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
+    };
+    if (isSolvedState(S0)) return [];
+
+    // (B) Diversified reduction front-end.
+    const { S: Sres, moves: frontMoves } = runFront(S0, variant);
+
+    // (A) Precomputed-table finisher cleans the residue (always solves). The
+    // finisher is ~5ms, so we run it under SEVERAL deterministic tie-break seeds
+    // and keep the shortest COMBINED (front+tail, after compression) result. This
+    // is nearly free and strictly improves every variant (a different finisher
+    // path can cancel more against the front moves). The first seed is the
+    // deterministic baseline (null), the rest are variant-derived.
+    const FIN_TRIES = (ENV.MG_FINTRIES !== undefined ? parseInt(ENV.MG_FINTRIES, 10) : 16);
+    let combined = null;
+    for (let t = 0; t < FIN_TRIES; t++) {
+      const finRng = t === 0 ? null
+        : mulberry32((0x85ebca6b ^ Math.imul(variant * 31 + t + 1, 2246822519)) >>> 0);
+      const tailGis = runFinisher(Sres, finRng);
+      const tailMoves = [];
+      for (const gi of tailGis) {
+        tailMoves.push({ face: genFace[gi], amount: genPrime[gi] ? -1 : 1 });
+      }
+      const cand = compressMoves([...frontMoves, ...tailMoves]);
+      if (combined === null || cand.length < combined.length) combined = cand;
+    }
+
+    // VERIFY on the logical model: re-apply to the ORIGINAL state -> solved.
+    let V = {
+      cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
+      ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
+    };
+    for (const mv of combined) {
+      const prime = mv.amount < 0;
+      const gi = mv.face * 2 + (prime ? 1 : 0);
+      for (let k = 0; k < Math.abs(mv.amount); k++) V = comp(V, gi);
+    }
+    if (!isSolvedState(V)) throw new Error("solver-mega2: combined moves did not solve");
+    return combined;
+  }
+
+  return { solve };
+}
+
+// ---- worker: load tables once (URL passed from the page — a Blob worker can't
+// resolve page-relative paths), then solve a variant per job ----
+let _solve = null, _url = null;
+async function _ensure() {
+  if (_solve) return;
+  const buf = await fetch(_url).then(r => { if (!r.ok) throw new Error('bin ' + r.status); return r.arrayBuffer(); });
+  _solve = createSolver(THREE, makeMegaGeo, buf).solve;
+}
+self.onmessage = async (e) => {
+  const d = e.data;
+  if (d.url) _url = d.url;
+  if (d.warmup) { try { await _ensure(); self.postMessage({ ready: true }); } catch (err) { self.postMessage({ error: String(err && err.message || err) }); } return; }
+  try { await _ensure(); const moves = _solve(d.state, { variant: d.variant }); self.postMessage({ jobId: d.jobId, moves }); }
+  catch (err) { self.postMessage({ jobId: d.jobId, error: String(err && err.message || err) }); }
+};
+
+</script>
+
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
@@ -5071,648 +6716,59 @@ function megaFinalize() {
   renderHistory();
 }
 
-/* ===== Megaminx solver — loaded from a precomputed static asset
-   (megaminx-tables.bin, ~1.2 MB). megaCreateSolver DECODES it (~0.4s) instead of the
-   old ~9s in-browser table build. Fetched + decoded when the Megaminx is opened. ===== */
-// solver2-asset.js — short from-state Megaminx solver (ESM), ASSET-LOADED.
-// =============================================================================
-// Behaviorally identical to solver2.js's solve(), but the expensive precomputed
-// tables (C_ORI, E_ORI, TWIST_TBL, FLIP_TBL) are NOT rebuilt here. Instead they
-// are DECODED from a compact binary asset (megaminx-tables.bin) produced offline
-// by build-mega-asset.mjs. Runtime init is therefore a fast decode + the cheap
-// geo/GEN setup (no primitive/commutator search, no oriented-table sweep).
-//
-// Usage (browser-safe; no node APIs, no fs):
-//   import * as THREE from "three";
-//   import { makeMegaGeo } from "./mega-geo.js";
-//   import { createSolver } from "./solver2-asset.js";
-//   const buf = await fetch("./megaminx-tables.bin").then(r => r.arrayBuffer());
-//   const { solve } = createSolver(THREE, makeMegaGeo, buf);
-//   const moves = solve(state); // [{face, amount}], amount in {-2,-1,1,2}
-//
-// solve(state) -> [{face, amount}], identical convention to solver2.js:
-//   amount>0 => |amount| UNPRIMED 72deg turns, amount<0 => |amount| PRIMED.
-//   face is 0..11. amount in {-2,-1,1,2}, never 0. solve(solved) === [].
-//
-// ------------------------------------------------------------------------------
-// BINARY FORMAT (megaminx-tables.bin) — ALL multi-byte ints LITTLE-ENDIAN.
-// (Must match build-mega-asset.mjs exactly.)
-//
-// A `seq` is an array of generator indices gi in [0,23] (gi = face*2 + prime).
-// seqs are deduplicated into a shared pool PER TABLE.
-//
-// HEADER (16 bytes):
-//   u32 magic     = 0x4D454741
-//   u16 version   = 1
-//   u16 reserved  = 0
-//   u32 reserved2 = 0
-//   u32 reserved3 = 0
-//
-// Then four TABLE blocks in fixed order: C_ORI(om=3), E_ORI(om=2), TWIST, FLIP.
-//
-// Oriented table block (C_ORI / E_ORI):
-//   u32 nPairs
-//   u32 nSeqPool
-//   SEQ POOL: for each pooled seq: u8 len, then len * u8 gi
-//   PAIRS: for each pair:
-//     u8  cur, u8 home, u16 nLeaves
-//     for each leaf: u8 d, u8 third, u8 dThird, u16 seqRef
-//
-// Pair table block (TWIST / FLIP):
-//   u32 nEntries
-//   u32 nSeqPool
-//   SEQ POOL (same encoding)
-//   ENTRIES: for each entry: u8 x, u8 y, u16 seqRef
-//
-// At load, all DERIVED fields are recomputed from seq+key (verified derivable):
-//   oriented entry .mc   = moveCount(seq)
-//   oriented entry .dCur = genOf(seq)[ocoord][cur]
-//   oriented rec   .full = (rec.dm.size >= om)
-//   TWIST entry .dx/.dy  = genOf(seq)[co][x] / [y];  .mc = moveCount(seq)
-//   FLIP  entry .mc      = moveCount(seq)
-//   TWIST_ADJ / FLIP_ADJ rebuilt from entry keys.
-// =============================================================================
-
-function megaCreateSolver(THREE, makeMegaGeo, arrayBuffer) {
-  const geo = makeMegaGeo(THREE, 1.0);
-  const { pieces, selectPieces, buildMove, snapPiece, readState } = geo;
-
-  // -------------------------------------------------------------------------
-  // Engine -> logical generators (24 single 72deg turns). gi = face*2 + prime.
-  // (Cheap; identical to solver2.js.)
-  // -------------------------------------------------------------------------
-  function makeProxies() {
-    return pieces.map((p) => ({
-      id: p.id,
-      position: new THREE.Vector3(p.center[0], p.center[1], p.center[2]),
-      quaternion: new THREE.Quaternion(0, 0, 0, 1),
-    }));
-  }
-  function engineApply(proxies, faceName, prime) {
-    const m = buildMove(faceName, prime, false);
-    const sel = selectPieces(m, proxies);
-    const q = new THREE.Quaternion().setFromAxisAngle(m.axis, m.target);
-    for (const p of sel) { p.position.applyQuaternion(q); p.quaternion.premultiply(q); }
-    for (const p of sel) snapPiece(p);
-  }
-  function deriveGen(faceName, prime) {
-    const px = makeProxies();
-    engineApply(px, faceName, prime);
-    return readState(px);
-  }
-
-  const GEN = [];
-  const genFace = [];
-  const genPrime = [];
-  for (let f = 0; f < 12; f++) {
-    for (const pr of [false, true]) {
-      const g = deriveGen("F" + f, pr);
-      GEN.push({
-        cp: Int8Array.from(g.cp), co: Int8Array.from(g.co),
-        ep: Int8Array.from(g.ep), eo: Int8Array.from(g.eo),
-      });
-      genFace.push(f); genPrime.push(pr);
-    }
-  }
-  const NG = GEN.length;
-  const ginv = [];
-  for (let f = 0; f < 12; f++) { ginv[f * 2] = f * 2 + 1; ginv[f * 2 + 1] = f * 2; }
-
-  const IDS = {
-    cp: Int8Array.from({ length: 20 }, (_, i) => i),
-    co: new Int8Array(20),
-    ep: Int8Array.from({ length: 30 }, (_, i) => i),
-    eo: new Int8Array(30),
-  };
-
-  // state composition: (S then move gi)
-  function comp(S, gi) {
-    const g = GEN[gi];
-    const cp = new Int8Array(20), co = new Int8Array(20);
-    const ep = new Int8Array(30), eo = new Int8Array(30);
-    for (let i = 0; i < 20; i++) { const s = g.cp[i]; cp[i] = S.cp[s]; co[i] = (S.co[s] + g.co[i]) % 3; }
-    for (let i = 0; i < 30; i++) { const s = g.ep[i]; ep[i] = S.ep[s]; eo[i] = (S.eo[s] + g.eo[i]) % 2; }
-    return { cp, co, ep, eo };
-  }
-  function applySeqState(S, seq) { let X = S; for (const gi of seq) X = comp(X, gi); return X; }
-  function genOf(seq) { return applySeqState(IDS, seq); }
-
-  function composeGen(A, B) { // result = A then B
-    const cp = new Int8Array(20), co = new Int8Array(20);
-    const ep = new Int8Array(30), eo = new Int8Array(30);
-    for (let i = 0; i < 20; i++) { const s = B.cp[i]; cp[i] = A.cp[s]; co[i] = (A.co[s] + B.co[i]) % 3; }
-    for (let i = 0; i < 30; i++) { const s = B.ep[i]; ep[i] = A.ep[s]; eo[i] = (A.eo[s] + B.eo[i]) % 2; }
-    return { cp, co, ep, eo };
-  }
-  const invSeq = (seq) => seq.slice().reverse().map((g) => ginv[g]);
-
-  // Self-cancel / merge a gi-sequence (identical to solver2.js).
-  function reduceSeq(seq) {
-    const stack = [];
-    for (const gi of seq) {
-      const face = genFace[gi];
-      const amt = genPrime[gi] ? 4 : 1;
-      if (stack.length && stack[stack.length - 1].face === face) {
-        const top = stack[stack.length - 1];
-        top.net = (top.net + amt) % 5;
-        if (top.net === 0) stack.pop();
-      } else {
-        stack.push({ face, net: amt % 5 });
-      }
-    }
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (let i = 0; i + 1 < stack.length; i++) {
-        if (stack[i].face === stack[i + 1].face) {
-          const net = (stack[i].net + stack[i + 1].net) % 5;
-          stack.splice(i, 2, ...(net === 0 ? [] : [{ face: stack[i].face, net }]));
-          changed = true; break;
-        }
-      }
-    }
-    const out = [];
-    for (const { face, net } of stack) {
-      if (net === 1) out.push(face * 2);
-      else if (net === 2) { out.push(face * 2); out.push(face * 2); }
-      else if (net === 3) { out.push(face * 2 + 1); out.push(face * 2 + 1); }
-      else if (net === 4) out.push(face * 2 + 1);
-    }
-    return out;
-  }
-  function moveCount(seq) {
-    let c = 0, last = -1;
-    for (const gi of seq) { if (genFace[gi] !== last) { c++; last = genFace[gi]; } }
-    return c;
-  }
-
-  function fwdCycle(p, n) {
-    const inv = new Int8Array(n).fill(-1);
-    for (let i = 0; i < n; i++) inv[p[i]] = i;
-    let start = -1;
-    for (let i = 0; i < n; i++) if (p[i] !== i) { start = i; break; }
-    if (start < 0) return null;
-    const c = [start];
-    let cur = inv[start];
-    while (cur !== start) { c.push(cur); cur = inv[cur]; }
-    return c;
-  }
-
-  // -------------------------------------------------------------------------
-  // DECODE the binary asset into the exact structures solve() reads.
-  // -------------------------------------------------------------------------
-  const dv = new DataView(arrayBuffer);
-  let pos = 0;
-  const rdU8 = () => dv.getUint8(pos++);
-  const rdU16 = () => { const v = dv.getUint16(pos, true); pos += 2; return v; };
-  const rdU32 = () => { const v = dv.getUint32(pos, true); pos += 4; return v; };
-
-  // Header
-  const magic = rdU32();
-  if (magic !== 0x4d454741) throw new Error("megaminx-tables.bin: bad magic " + magic.toString(16));
-  const version = rdU16();
-  if (version !== 1) throw new Error("megaminx-tables.bin: unsupported version " + version);
-  rdU16(); rdU32(); rdU32(); // reserved
-
-  function readPool() {
-    const nSeqPool = rdU32();
-    const pool = new Array(nSeqPool);
-    for (let i = 0; i < nSeqPool; i++) {
-      const len = rdU8();
-      const seq = new Array(len);
-      for (let k = 0; k < len; k++) seq[k] = rdU8();
-      pool[i] = seq;
-    }
-    return pool;
-  }
-
-  // Oriented table decode. Rebuilds:
-  //   tbl: "cur,home" -> { dm: Map(d -> Map(third -> Map(dThird -> {seq,mc,dCur}))), full }
-  function decodeOriented(om, ocoord) {
-    const nPairs = rdU32();
-    const pool = readPool();
-    const tbl = new Map();
-    for (let pi = 0; pi < nPairs; pi++) {
-      const cur = rdU8();
-      const home = rdU8();
-      const nLeaves = rdU16();
-      const rec = { dm: new Map(), full: false };
-      tbl.set(cur + "," + home, rec);
-      for (let li = 0; li < nLeaves; li++) {
-        const d = rdU8();
-        const third = rdU8();
-        const dThird = rdU8();
-        const seqRef = rdU16();
-        const seq = pool[seqRef];
-        // dCur derived from seq: orientation delivered to slot cur.
-        const g = genOf(seq);
-        const dCur = g[ocoord][cur];
-        const mc = moveCount(seq);
-        let dm = rec.dm.get(d);
-        if (!dm) { dm = new Map(); rec.dm.set(d, dm); }
-        let tm = dm.get(third);
-        if (!tm) { tm = new Map(); dm.set(third, tm); }
-        tm.set(dThird, { seq, mc, dCur });
-      }
-      // full derived: has all `om` orientation deliveries.
-      rec.full = rec.dm.size >= om;
-    }
-    return tbl;
-  }
-
-  // TWIST table decode -> Map("x,y" -> {seq, mc, dx, dy}); dx,dy derived.
-  function decodeTwist() {
-    const nEntries = rdU32();
-    const pool = readPool();
-    const tbl = new Map();
-    for (let i = 0; i < nEntries; i++) {
-      const x = rdU8();
-      const y = rdU8();
-      const seqRef = rdU16();
-      const seq = pool[seqRef];
-      const g = genOf(seq);
-      tbl.set(x + "," + y, { seq, mc: moveCount(seq), dx: g.co[x], dy: g.co[y] });
-    }
-    return tbl;
-  }
-
-  // FLIP table decode -> Map("x,y" -> {seq, mc}); mc derived.
-  function decodeFlip() {
-    const nEntries = rdU32();
-    const pool = readPool();
-    const tbl = new Map();
-    for (let i = 0; i < nEntries; i++) {
-      const x = rdU8();
-      const y = rdU8();
-      const seqRef = rdU16();
-      const seq = pool[seqRef];
-      tbl.set(x + "," + y, { seq, mc: moveCount(seq) });
-    }
-    return tbl;
-  }
-
-  const C_ORI = decodeOriented(3, "co");
-  const E_ORI = decodeOriented(2, "eo");
-  const TWIST_TBL = decodeTwist();
-  const FLIP_TBL = decodeFlip();
-
-  const FLIP_ADJ = (() => {
-    const adj = Array.from({ length: 30 }, () => new Set());
-    for (const k of FLIP_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
-    return adj;
-  })();
-  const TWIST_ADJ = (() => {
-    const adj = Array.from({ length: 20 }, () => new Set());
-    for (const k of TWIST_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
-    return adj;
-  })();
-
-  // -------------------------------------------------------------------------
-  // SOLVER (identical logic to solver2.js).
-  // -------------------------------------------------------------------------
-  function isSolvedState(S) {
-    for (let i = 0; i < 20; i++) if (S.cp[i] !== i || S.co[i]) return false;
-    for (let i = 0; i < 30; i++) if (S.ep[i] !== i || S.eo[i]) return false;
-    return true;
-  }
-
-  function twistDirect(tbl, x, A, y) {
-    A = ((A % 3) + 3) % 3;
-    if (A === 0) return [];
-    const e = tbl.get(x + "," + y);
-    if (!e) return null;
-    const base = ((e.dx % 3) + 3) % 3;
-    const k = (A * (base === 1 ? 1 : 2)) % 3;
-    const out = [];
-    for (let i = 0; i < k; i++) out.push(...e.seq);
-    return out;
-  }
-  function twistPair(tbl, tadj, x, A, y) {
-    A = ((A % 3) + 3) % 3;
-    if (A === 0) return [];
-    const d = twistDirect(tbl, x, A, y);
-    if (d) return d;
-    const prev = new Map([[x, -1]]);
-    const q = [x]; let h = 0;
-    while (h < q.length) {
-      const u = q[h++];
-      if (u === y) break;
-      for (const v of tadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
-    }
-    if (!prev.has(y)) return null;
-    const path = [];
-    let cur = y;
-    while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
-    const out = [];
-    for (let i = 0; i + 1 < path.length; i++) {
-      const seg = twistDirect(tbl, path[i], A, path[i + 1]);
-      if (!seg) return null;
-      out.push(...seg);
-    }
-    return out;
-  }
-  function flipPair(tbl, fadj, x, y) {
-    if (tbl.has(x + "," + y)) return tbl.get(x + "," + y).seq.slice();
-    const prev = new Map([[x, -1]]);
-    const q = [x];
-    let h = 0;
-    while (h < q.length) {
-      const u = q[h++];
-      if (u === y) break;
-      for (const v of fadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
-    }
-    if (!prev.has(y)) return null;
-    const path = [];
-    let cur = y;
-    while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
-    const out = [];
-    for (let i = 0; i + 1 < path.length; i++) out.push(...tbl.get(path[i] + "," + path[i + 1]).seq);
-    return out;
-  }
-
-  function phaseOriented(ctx, run, coord, ocoord, n, om, otbl, ptbl) {
-    let guard = 0;
-    while (guard++ < 400) {
-      const p = ctx.S[coord], o = ctx.S[ocoord];
-      const mis = [];
-      for (let i = 0; i < n; i++) if (p[i] !== i) mis.push(i);
-      if (mis.length === 0) return;
-      if (mis.length === 3) {
-        const closed = solveFinalTriple(otbl, ptbl, p, o, om, n, mis);
-        if (closed) { run(closed); continue; }
-      }
-      {
-        let bestSeq = null, bestMc = Infinity;
-        for (const home of mis) {
-          let cur = -1;
-          for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
-          const twoFix = p[home];
-          if (twoFix === cur) continue;
-          if (p[twoFix] === twoFix) continue;
-          const need = ((om - o[cur]) % om);
-          const rec = otbl.get(cur + "," + home);
-          if (!rec) continue;
-          const dm = rec.dm.get(need);
-          if (!dm) continue;
-          const tm = dm.get(twoFix);
-          if (!tm) continue;
-          const needThird = ((om - o[home]) % om);
-          const ent = tm.get(needThird);
-          if (ent && ent.mc < bestMc) { bestMc = ent.mc; bestSeq = ent.seq; }
-        }
-        if (bestSeq) { run(bestSeq); continue; }
-      }
-      let home = mis[0];
-      let cur = -1;
-      for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
-      const oc = o[cur];
-      const need = ((om - oc) % om);
-      const twoFix = p[home];
-      const rec = otbl.get(cur + "," + home);
-      let chosen = null;
-      if (rec) {
-        const dm = rec.dm.get(need);
-        if (dm) {
-          let best = null, bestScore = Infinity;
-          for (const [t, tm] of dm) {
-            if (t <= home || t === cur) continue;
-            for (const [dThird, ent] of tm) {
-              const resThird = (o[home] + dThird) % om;
-              const resCur = (o[t] + ent.dCur) % om;
-              let score = ent.mc * 0.4;
-              if (t === twoFix && resThird === 0) {
-                score -= 100;
-              } else {
-                if (p[t] === t) score += 6;
-                score += (resThird !== 0 ? 1 : 0) * 5 + (resCur !== 0 ? 1 : 0) * 5;
-              }
-              if (score < bestScore) { bestScore = score; best = ent; }
-            }
-          }
-          if (best) chosen = best.seq;
-        }
-      }
-      if (!chosen) {
-        const seq = pickPlainCycle(ptbl, coord, n, p, home, cur);
-        run(seq);
-        continue;
-      }
-      run(chosen);
-    }
-    throw new Error("phaseOriented did not converge");
-  }
-
-  function solveFinalTriple(otbl, ptbl, p, o, om, n, mis) {
-    const coord = n === 20 ? "cp" : "ep";
-    const ocoord = n === 20 ? "co" : "eo";
-    const cands = [];
-    for (const a of mis) for (const b of mis) {
-      if (a === b) continue;
-      const rec = otbl.get(a + "," + b);
-      if (!rec) continue;
-      for (const [, dm] of rec.dm) for (const [, tm] of dm) for (const [, ent] of tm) cands.push(ent);
-    }
-    let best = null, bestMc = Infinity;
-    for (const ent of cands) {
-      if (ent.mc >= bestMc) continue;
-      const g = genOf(ent.seq);
-      let ok = true;
-      for (const s of mis) {
-        const src = g[coord][s];
-        if (p[src] !== s) { ok = false; break; }
-        const oSrc = o[src];
-        if (((oSrc + g[ocoord][s]) % om) !== 0) { ok = false; break; }
-      }
-      if (!ok) continue;
-      let clean = true;
-      for (let i = 0; i < n; i++) {
-        if (mis.includes(i)) continue;
-        if (g[coord][i] !== i || g[ocoord][i]) { clean = false; break; }
-      }
-      if (!clean) continue;
-      best = ent.seq; bestMc = ent.mc;
-    }
-    return best;
-  }
-
-  function posSeqFor(otbl, coord, a, b, c) {
-    const tryKey = (x, y, z) => {
-      const rec = otbl.get(x + "," + y); if (!rec) return null;
-      let best = null;
-      for (const [, dm] of rec.dm) { const tm = dm.get(z); if (!tm) continue; for (const [, e] of tm) if (!best || e.mc < best.mc) best = e; }
-      return best ? best.seq : null;
-    };
-    let s = tryKey(a, b, c); if (s) return s;
-    s = tryKey(b, c, a); if (s) return s;
-    s = tryKey(c, a, b); if (s) return s;
-    return null;
-  }
-  function isPosCycle3(seq, coord, n, a, b, c) {
-    const g = genOf(seq);
-    const op = coord === "cp" ? "ep" : "cp";
-    for (let i = 0; i < 20; i++) if (g.co[i]) return false;
-    for (let i = 0; i < 30; i++) if (g.eo[i]) return false;
-    const om = coord === "cp" ? 30 : 20;
-    for (let i = 0; i < om; i++) if (g[op][i] !== i) return false;
-    const p = g[coord];
-    for (let i = 0; i < n; i++) {
-      const want = i === a ? c : i === b ? a : i === c ? b : i;
-      if (p[i] !== want) return false;
-    }
-    return true;
-  }
-  function posCycle3(otbl, n, a, b, c) {
-    const coord = n === 20 ? "cp" : "ep";
-    const d = posSeqFor(otbl, coord, a, b, c);
-    if (d && isPosCycle3(d, coord, n, a, b, c)) return d;
-    for (let h = 0; h < n; h++) {
-      if (h === a || h === b || h === c) continue;
-      const s1 = posSeqFor(otbl, coord, a, b, h);
-      if (!s1) continue;
-      const s2 = posSeqFor(otbl, coord, a, h, c);
-      if (!s2) continue;
-      const seq = [...s1, ...s2];
-      if (isPosCycle3(seq, coord, n, a, b, c)) return seq;
-    }
-    return null;
-  }
-  function pickPlainCycle(otbl, coord, n, p, home, cur) {
-    const twoFix = p[home];
-    const rec = otbl.get(cur + "," + home);
-    if (rec) {
-      const best = new Map();
-      for (const [, dm] of rec.dm) for (const [t, tm] of dm) {
-        for (const [, ent] of tm) {
-          const ex = best.get(t);
-          if (!ex || ent.mc < ex.mc) best.set(t, ent);
-        }
-      }
-      if (twoFix > home && twoFix !== cur && best.has(twoFix)) return best.get(twoFix).seq;
-      let third = -1, bestMc = Infinity;
-      for (const [t, ent] of best) {
-        if (t <= home || t === cur) continue;
-        if (p[t] !== t && ent.mc < bestMc) { bestMc = ent.mc; third = t; }
-      }
-      if (third >= 0) return best.get(third).seq;
-    }
-    let helper = -1;
-    for (let i = home + 1; i < n; i++) if (p[i] !== i && i !== cur) { helper = i; break; }
-    if (helper >= 0) {
-      const seq = posCycle3(otbl, n, cur, home, helper);
-      if (seq) return seq;
-    }
-    throw new Error("pickPlainCycle: no cycle for " + [cur, home]);
-  }
-  function phaseTwist(ctx, run) {
-    let guard = 0;
-    while (guard++ < 60) {
-      const co = ctx.S.co;
-      const tw = [];
-      for (let i = 0; i < 20; i++) if (co[i]) tw.push(i);
-      if (tw.length === 0) return;
-      const x = tw[0];
-      const y = tw[1] !== undefined ? tw[1] : tw[0];
-      const A = (3 - co[x]) % 3;
-      const seq = twistPair(TWIST_TBL, TWIST_ADJ, x, A, y);
-      if (!seq) throw new Error("phaseTwist: no twistPair " + [x, y]);
-      run(seq);
-    }
-    throw new Error("phaseTwist did not converge");
-  }
-  function phaseFlip(ctx, run) {
-    let guard = 0;
-    while (guard++ < 60) {
-      const eo = ctx.S.eo;
-      const fl = [];
-      for (let i = 0; i < 30; i++) if (eo[i]) fl.push(i);
-      if (fl.length === 0) return;
-      const seq = flipPair(FLIP_TBL, FLIP_ADJ, fl[0], fl[1]);
-      if (!seq) throw new Error("phaseFlip: no flipPair " + [fl[0], fl[1]]);
-      run(seq);
-    }
-    throw new Error("phaseFlip did not converge");
-  }
-
-  function gisToMoves(gis) {
-    const stack = [];
-    const norm = (a) => { a = ((a % 5) + 5) % 5; if (a === 3) return -2; if (a === 4) return -1; return a; };
-    for (const gi of gis) {
-      const face = genFace[gi];
-      const amt = genPrime[gi] ? -1 : 1;
-      if (stack.length && stack[stack.length - 1].face === face) {
-        const top = stack[stack.length - 1];
-        const na = norm(top.amt + amt);
-        if (na === 0) stack.pop();
-        else top.amt = na;
-      } else {
-        stack.push({ face, amt: norm(amt) });
-      }
-    }
-    let changed = true;
-    while (changed) {
-      changed = false;
-      for (let i = 0; i + 1 < stack.length; i++) {
-        if (stack[i].face === stack[i + 1].face) {
-          const na = norm(stack[i].amt + stack[i + 1].amt);
-          stack.splice(i, 2, ...(na === 0 ? [] : [{ face: stack[i].face, amt: na }]));
-          changed = true;
-          break;
-        }
-      }
-    }
-    return stack.map((e) => ({ face: e.face, amount: e.amt }));
-  }
-
-  function solve(state) {
-    const S0 = {
-      cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
-      ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
-    };
-    if (isSolvedState(S0)) return [];
-    const ctx = { S: S0 };
-    const stream = [];
-    const run = (seq) => {
-      if (!seq) throw new Error("null sequence");
-      for (const gi of seq) { ctx.S = comp(ctx.S, gi); stream.push(gi); }
-    };
-    phaseOriented(ctx, run, "cp", "co", 20, 3, C_ORI, C_ORI);
-    phaseTwist(ctx, run);
-    phaseOriented(ctx, run, "ep", "eo", 30, 2, E_ORI, E_ORI);
-    phaseFlip(ctx, run);
-    if (!isSolvedState(ctx.S)) throw new Error("solver did not reach solved");
-
-    const moves = gisToMoves(stream);
-    let V = {
-      cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
-      ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
-    };
-    for (const mv of moves) {
-      const prime = mv.amount < 0;
-      const gi = mv.face * 2 + (prime ? 1 : 0);
-      for (let k = 0; k < Math.abs(mv.amount); k++) V = comp(V, gi);
-    }
-    if (!isSolvedState(V)) throw new Error("move-optimization broke the solution");
-    return moves;
-  }
-
-  return { solve };
-}
-
+/* ===== Megaminx solver — PARALLEL best-of-N. The solver (createSolver, bundled in
+   the #megaWorker2Src block) runs in a pool of Web Workers capped at hardware
+   concurrency; each Solve fans MEGA_VARIANTS diversified variants across the pool
+   (queued in waves) and keeps the SHORTEST. best-of-32 averages ~249 moves vs ~402
+   single-shot. Tables come from the precomputed megaminx2-tables.bin asset (no
+   runtime build); each worker loads it once (pre-warmed on Megaminx open). ===== */
 const _megaTok = m => MEGA_KEYS[m.face] + (Math.abs(m.amount) === 2 ? '2' : '') + (m.amount < 0 ? "'" : '');
-let _megaSolve = null, _megaLoading = null;
-function megaAssetInit() {
-  if (_megaSolve || _megaLoading) return _megaLoading;
-  _megaLoading = fetch('./megaminx-tables.bin')
-    .then(r => { if (!r.ok) throw new Error('mega asset ' + r.status); return r.arrayBuffer(); })
-    .then(buf => { _megaSolve = megaCreateSolver(THREE, makeMegaGeo, buf).solve; })
-    .catch(() => { _megaLoading = null; });
-  return _megaLoading;
+const MEGA_VARIANTS = 32;
+let megaPool = null;
+function megaPoolInit() {
+  if (megaPool || typeof Worker === 'undefined') return;
+  try {
+    const src = document.getElementById('megaWorker2Src').textContent;
+    const url = URL.createObjectURL(new Blob([src], { type: 'application/javascript' }));
+    const W = Math.min(MEGA_VARIANTS, Math.max(2, (navigator.hardwareConcurrency || 4) - 1));  // leave a core for the main thread (UI stays responsive during the solve)
+    megaPool = [];
+    const assetUrl = new URL('./megaminx2-tables.bin', location.href).href;
+    for (let i = 0; i < W; i++) { const w = new Worker(url, { type: 'module' }); w.postMessage({ warmup: true, url: assetUrl }); megaPool.push(w); }
+  } catch (e) { megaPool = null; }
 }
-async function megaSolveFull() {
-  if (!_megaSolve) await megaAssetInit();
-  if (!_megaSolve) return null;
-  let moves; try { moves = _megaSolve(megaReadState()); } catch (e) { return null; }
-  return moves ? moves.map(_megaTok) : null;
+function megaPoolDispose() {                                   // free the workers (each holds THREE + tables) when leaving Megaminx
+  if (!megaPool) return;
+  for (const w of megaPool) w.terminate();
+  megaPool = null;
+}
+function megaSolveFull() {
+  megaPoolInit();
+  if (!megaPool) return null;
+  const state = megaReadState();
+  if (state.cp.every((v, i) => v === i) && state.co.every(v => v === 0) && state.ep.every((v, i) => v === i) && state.eo.every(v => v === 0)) return [];  // already solved
+  return new Promise((resolve) => {
+    const sols = new Array(MEGA_VARIANTS).fill(null);
+    let next = 0, done = 0, settled = false;
+    const finish = () => {
+      if (settled) return; settled = true;
+      const valid = sols.filter(Boolean);
+      if (!valid.length) { resolve(null); return; }
+      valid.sort((a, b) => a.length - b.length);
+      resolve(valid[0].map(_megaTok));
+    };
+    for (const w of megaPool) {
+      const handler = (e) => {
+        const d = e.data;
+        if (d.ready) return;                                     // warmup ack (tables preloaded)
+        if (typeof d.jobId === 'number') { sols[d.jobId] = d.moves || null; done++; }
+        if (next < MEGA_VARIANTS) { const v = next++; w.postMessage({ state, variant: v, jobId: v }); }
+        else w.removeEventListener('message', handler);
+        if (done >= MEGA_VARIANTS) finish();
+      };
+      w.addEventListener('message', handler);
+      if (next < MEGA_VARIANTS) { const v = next++; w.postMessage({ state, variant: v, jobId: v }); }
+    }
+  });
 }
 const puzzleMega = {
   id: 'megaminx', name: 'Megaminx',
@@ -8879,6 +9935,7 @@ function switchPuzzle(id) {
   cube3Group.visible = (id === '3x3');
   pyraGroup.visible = (id === 'pyraminx');
   megaGroup.visible = (id === 'megaminx');
+  if (id !== 'megaminx') megaPoolDispose();                 // release the solver workers when leaving Megaminx
   skewbGroup.visible = (id === 'skewb');
   sq1Group.visible = (id === 'sq1');
   projGroup.visible = (id === '2x2');                       // 2×2 projections
@@ -8895,7 +9952,7 @@ function switchPuzzle(id) {
     camera.position.copy(best).multiplyScalar(fit);
     controls.update();
   } else if (id === 'megaminx') {                           // dodecahedron ~1.7× the 2×2's size
-    megaAssetInit();                                        // fetch+decode the precomputed solver table now, so Solve is instant later
+    megaPoolInit();                                         // spin up the solver worker pool + pre-warm tables now, so Solve is ready
     const fit = Math.max(8, Math.min(18, 9 / Math.min(1, camera.aspect)));
     camera.position.set(0.46, 0.42, 0.78).normalize().multiplyScalar(fit);
     controls.update();
