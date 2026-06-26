@@ -377,11 +377,14 @@
       <button class="pz" data-puz="3x3">3×3</button>
       <button class="pz" data-puz="pyraminx">Pyraminx</button>
       <button class="pz" data-puz="megaminx">Megaminx</button>
+      <button class="pz" data-puz="skewb">Skewb</button>
+      <button class="pz" data-puz="sq1">Square-1</button>
     </div>
     <div class="spacer"></div>
     <div class="top-actions">
       <button class="btn" id="statsBtn">Stats</button>
       <button class="btn" id="resetBtn">Reset</button>
+      <button class="btn" id="solveBtn">Solve</button>
       <button class="btn primary" id="scrambleBtn">Scramble</button>
     </div>
   </div>
@@ -950,6 +953,19 @@ function applyMove(tok, phase = 'solve', force = false) {
   flashButton(tok);
 }
 
+// Apply a (world) move's full rotation immediately, no animation. Used by Solve to
+// snap through long solutions (3×3 ~146, Megaminx ~1700 moves) that would take
+// minutes to animate. Mirrors the engine's per-move math in one step.
+const _instQ = new THREE.Quaternion();
+function applyMoveInstant(tok) {
+  const move = puzzle.buildMove(tok[0], tok.includes("'"), tok.includes('2'));
+  if (!move) return;
+  const cubies = puzzle.selectPieces(move);
+  _instQ.setFromAxisAngle(move.axis, move.target);
+  for (const c of cubies) { c.position.applyQuaternion(_instQ); c.quaternion.premultiply(_instQ); }
+  for (const c of cubies) puzzle.snapPiece(c);
+}
+
 /* ============================================================
    Random-STATE 2×2 scrambler.
    A 7-corner model (DBL fixed) using the SAME 90° rotation
@@ -1135,6 +1151,20 @@ function resetState(rebuild = true) {
 
 document.getElementById('scrambleBtn').addEventListener('click', scramble);
 document.getElementById('resetBtn').addEventListener('click', () => { drillTarget = null; resetState(true); });
+// Solve: compute a full solution from the current state (per-puzzle solveFull) and play it.
+const solveBtnEl = document.getElementById('solveBtn');
+solveBtnEl.addEventListener('click', () => {
+  if (!puzzle.solveFull || current || queue.length) return;        // need a solver + a settled puzzle
+  let sol;
+  try { sol = puzzle.solveFull(); } catch (e) { sol = null; }
+  if (!sol || !sol.length) return;
+  if (sol.length <= 50) {
+    for (const tok of sol) applyMove(tok, 'solve', true);          // short → animate (watchable)
+  } else {
+    for (const tok of sol) applyMoveInstant(tok);                  // long → snap (minutes to animate otherwise)
+    puzzle.updateNet(); puzzle.updateProjections();
+  }
+});
 document.getElementById('puzzleChooser').addEventListener('click', (e) => {
   const b = e.target.closest('.pz'); if (b) switchPuzzle(b.dataset.puz);
 });
@@ -4143,6 +4173,14 @@ const puzzlePyra = {
   finalizeMovePhase: pyraFinalize,
   readState: pyraReadState,
   scramble: () => PYRA.scramblePyra().tokens,
+  solveFull: () => {                                          // full solve = optimal non-tip solution + tip fixes (world tokens)
+    const s0 = pyraReadState();
+    const nonTip = PYRA.solvePyra(s0) || [];
+    const after = PYRA.applySeq(s0, nonTip);                  // tips left after the vertex moves
+    const TIP = ['u', 'l', 'r', 'b'], tips = [];
+    for (let v = 0; v < 4; v++) for (let k = 0; k < after.tips[v]; k++) tips.push(TIP[v]);
+    return nonTip.concat(tips);
+  },
   storageKey: 'pyra-solves',
   resolveKey: pyraResolveKey,                              // pose-relative move keys
   keymap: {
@@ -4185,6 +4223,97 @@ const puzzlePyra = {
     <div>Drag to orbit · scroll to zoom</div>`,
 };
 
+/* ===== 2×2 full-solve: read (cp,co) from the live cubies, then the existing
+   optimal IDA* solve(cp,co). The corner at the world [-1,-1,-1] octant is the
+   fixed reference (its frame axes coincide with world axes), so we derive the
+   face-colour frame from it — robust to any whole-cube orientation / free play,
+   always reaching all-faces-solid. ===== */
+const _opp2 = new Map([
+  [COLORS['+x'], COLORS['-x']], [COLORS['-x'], COLORS['+x']],
+  [COLORS['+y'], COLORS['-y']], [COLORS['-y'], COLORS['+y']],
+  [COLORS['+z'], COLORS['-z']], [COLORS['-z'], COLORS['+z']],
+]);
+const _c2n = new THREE.Vector3();
+function readCornerState2x2() {
+  const corners = [];
+  for (const c of cubies) {
+    const octId = OCT.findIndex(o => o[0] === Math.sign(c.position.x) && o[1] === Math.sign(c.position.y) && o[2] === Math.sign(c.position.z));
+    const stickers = {};
+    for (const t of c.children) {
+      if (!t.userData || !t.userData.isTile) continue;
+      _c2n.copy(t.userData.normal).applyQuaternion(c.quaternion);
+      const ax = Math.abs(_c2n.x) >= Math.abs(_c2n.y) && Math.abs(_c2n.x) >= Math.abs(_c2n.z) ? 'x'
+               : Math.abs(_c2n.y) >= Math.abs(_c2n.z) ? 'y' : 'z';
+      stickers[(_c2n[ax] > 0 ? '+' : '-') + ax] = t.userData.color;
+    }
+    corners.push({ octId, stickers });
+  }
+  const ref = corners.find(c => c.octId === 6);            // the corner at [-1,-1,-1]
+  if (!ref) return null;
+  const Dc = ref.stickers['-y'], Lc = ref.stickers['-x'], Bc = ref.stickers['-z'];
+  const faceColor = { '+x': _opp2.get(Lc), '-x': Lc, '+y': _opp2.get(Dc), '-y': Dc, '+z': _opp2.get(Bc), '-z': Bc };
+  const Uc = faceColor['+y'];
+  const colorFace = new Map(); for (const k in faceColor) colorFace.set(faceColor[k], k);
+  const cp = new Array(7), co = new Array(7);
+  for (const c of corners) {
+    if (c.octId === 6) continue;
+    const k = idToK[c.octId];
+    let hx = 0, hy = 0, hz = 0, udAxis = 'x';
+    for (const wkey in c.stickers) {
+      const col = c.stickers[wkey], hf = colorFace.get(col);
+      const sgn = hf[0] === '+' ? 1 : -1;
+      if (hf[1] === 'x') hx = sgn; else if (hf[1] === 'y') hy = sgn; else hz = sgn;
+      if (col === Uc || col === Dc) udAxis = wkey[1];       // axis the U/D sticker points along
+    }
+    const homeOct = OCT.findIndex(o => o[0] === hx && o[1] === hy && o[2] === hz);
+    cp[k] = idToK[homeOct];
+    co[k] = udAxis === 'y' ? 0 : udAxis === 'z' ? 1 : 2;
+  }
+  return { cp, co };
+}
+/* Physically-correct corner-orientation transition. The existing moveCo is
+   ADDITIVE — fine for the scrambler (its only prior use: model→moves), but the
+   real cube's orientation (the axis the U/D sticker points along, oOfU) composes
+   as a PERMUTATION when a corner passes through the turning layer. We solve a
+   READ state, so we need the true transition. ncoOf applies, per move, the axis
+   permutation πm to corners that land in the moving layer; others are unchanged. */
+const SLOTPOS = POS7.map(o => OCT[o]);
+const _axisVec = o => (o === 0 ? [0, 1, 0] : o === 1 ? [0, 0, 1] : [1, 0, 0]);
+function _rotVturn(v, axis, turn) { let r = v.slice(); for (let t = 0; t < turn; t++) r = rotV(r, axis, -1); return r; }
+const PI_M = SCR_MOVES.map(({ face, turn }) => { const ax = FACE_AXIS[face]; return [0, 1, 2].map(o => oOfU(_rotVturn(_axisVec(o), ax, turn))); });
+const MOVING2 = SCR_MOVES.map(({ face }) => { const ax = FACE_AXIS[face]; const s = new Set(); for (let k = 0; k < 7; k++) if (SLOTPOS[k][ax] === 1) s.add(k); return s; });
+function ncoOf(co, m) { const src = MV[m].cp, out = new Array(7); for (let k = 0; k < 7; k++) { const c = co[src[k]]; out[k] = MOVING2[m].has(k) ? PI_M[m][c] : c; } return out; }
+let _prune2P = null, _prune2O = null;
+function build2Tables() {
+  if (_prune2P) return;
+  _prune2P = new Int8Array(5040).fill(-1);
+  let fr = [[0, 1, 2, 3, 4, 5, 6]]; _prune2P[permIndex(fr[0])] = 0;
+  for (let d = 0; fr.length; d++) { const nx = []; for (const cp of fr) for (let m = 0; m < 9; m++) { const ncp = moveCp(cp, m), i = permIndex(ncp); if (_prune2P[i] < 0) { _prune2P[i] = d + 1; nx.push(ncp); } } fr = nx; }
+  _prune2O = new Int16Array(2187).fill(-1);
+  let fo = [[0, 0, 0, 0, 0, 0, 0]]; _prune2O[0] = 0;
+  for (let d = 0; fo.length; d++) { const nx = []; for (const co of fo) for (let m = 0; m < 9; m++) { const nco = ncoOf(co, m), i = oriIndex(nco); if (_prune2O[i] < 0) { _prune2O[i] = d + 1; nx.push(nco); } } fo = nx; }
+}
+const _heur2 = (cp, co) => Math.max(_prune2P[permIndex(cp)], _prune2O[oriIndex(co)]);
+function _dfs2(cp, co, limit, last, sol) {
+  if (cp.every((v, k) => v === k) && co.every(v => v === 0)) return true;
+  if (limit <= 0 || _heur2(cp, co) > limit) return false;
+  for (let m = 0; m < 9; m++) {
+    const f = SCR_MOVES[m].face; if (f === last) continue;
+    const ncp = moveCp(cp, m), nco = ncoOf(co, m);
+    sol.push(m);
+    if (_dfs2(ncp, nco, limit - 1, f, sol)) return true;
+    sol.pop();
+  }
+  return false;
+}
+function solve2(cp0, co0) { build2Tables(); for (let L = _heur2(cp0, co0); L <= 14; L++) { const sol = []; if (_dfs2(cp0, co0, L, -1, sol)) return sol; } return []; }
+function solve2x2Full() {
+  const st = readCornerState2x2();
+  if (!st || st.cp.some(v => v === undefined)) return null;
+  let sol; try { sol = solve2(st.cp, st.co); } catch (e) { return null; }
+  return (sol || []).map(moveToken);
+}
+
 /* ============================================================
    Puzzle registry. The 2×2 implementation above is unchanged; it is
    exposed here behind one interface and driven via the active `puzzle`,
@@ -4203,6 +4332,7 @@ const puzzle2x2 = {
   updateProjections: updateProjectionLayout,
   finalizeMovePhase,
   scramble: randomStateScramble,
+  solveFull: solve2x2Full,
   storageKey: STORAGE_KEY,
   keymap: { faceKeys: FACE_KEYS, primeKeys: PRIME_KEYS, rotKeys: ROT_KEYS },
   phaseConfig: { order: ['fll', 'oll', 'pbl'], labels: { fll: 'FLL', oll: 'OLL', pbl: 'PBL' } },
@@ -4924,6 +5054,660 @@ function megaFinalize() {
   renderHistory();
 }
 
+/* ===== Megaminx solver — reduction/commutator (node-verified 200/200, ~1700-move
+   non-optimal but always-solves). Imports stripped; reuses the app's THREE +
+   makeMegaGeo. Table build (~5s) is LAZY — deferred to the first Megaminx Solve. ===== */
+let _megaSolveFn = null;
+function megaGetSolve() {
+  if (_megaSolveFn) return _megaSolveFn;
+  _megaSolveFn = (function () {
+// ---------------------------------------------------------------------------
+// Geometry engine + logical generators
+// ---------------------------------------------------------------------------
+const geo = makeMegaGeo(THREE, 1.0);
+const { pieces, selectPieces, buildMove, snapPiece, readState } = geo;
+
+function makeProxies() {
+  return pieces.map((p) => ({
+    id: p.id,
+    position: new THREE.Vector3(p.center[0], p.center[1], p.center[2]),
+    quaternion: new THREE.Quaternion(0, 0, 0, 1),
+  }));
+}
+function engineApply(proxies, faceName, prime) {
+  const m = buildMove(faceName, prime, false);
+  const sel = selectPieces(m, proxies);
+  const q = new THREE.Quaternion().setFromAxisAngle(m.axis, m.target);
+  for (const p of sel) {
+    p.position.applyQuaternion(q);
+    p.quaternion.premultiply(q);
+  }
+  for (const p of sel) snapPiece(p);
+}
+function deriveGen(faceName, prime) {
+  const px = makeProxies();
+  engineApply(px, faceName, prime);
+  return readState(px);
+}
+
+const SOLVED = readState(makeProxies());
+
+// Token <-> generator index. 24 single-turn tokens.
+const TOKENS = [];
+const GEN = []; // index -> {cp,co,ep,eo} (typed)
+const tokFace = [];
+const tokInv = [];
+const tokIndex = new Map();
+for (let f = 0; f < 12; f++) {
+  for (const pr of [false, true]) {
+    const tok = "F" + f + (pr ? "'" : "");
+    const g = deriveGen("F" + f, pr);
+    tokIndex.set(tok, TOKENS.length);
+    TOKENS.push(tok);
+    GEN.push({
+      cp: Int8Array.from(g.cp),
+      co: Int8Array.from(g.co),
+      ep: Int8Array.from(g.ep),
+      eo: Int8Array.from(g.eo),
+    });
+    tokFace.push(f);
+  }
+}
+const NG = TOKENS.length;
+for (let i = 0; i < NG; i++) {
+  const t = TOKENS[i];
+  const inv = t.endsWith("'") ? t.slice(0, -1) : t + "'";
+  tokInv.push(tokIndex.get(inv));
+}
+
+const IDS = {
+  cp: Int8Array.from({ length: 20 }, (_, i) => i),
+  co: new Int8Array(20),
+  ep: Int8Array.from({ length: 30 }, (_, i) => i),
+  eo: new Int8Array(30),
+};
+
+// Compose state with one generator index.
+function comp(S, gi) {
+  const g = GEN[gi];
+  const cp = new Int8Array(20), co = new Int8Array(20);
+  const ep = new Int8Array(30), eo = new Int8Array(30);
+  for (let i = 0; i < 20; i++) {
+    const s = g.cp[i];
+    cp[i] = S.cp[s];
+    co[i] = (S.co[s] + g.co[i]) % 3;
+  }
+  for (let i = 0; i < 30; i++) {
+    const s = g.ep[i];
+    ep[i] = S.ep[s];
+    eo[i] = (S.eo[s] + g.eo[i]) % 2;
+  }
+  return { cp, co, ep, eo };
+}
+// Generator (effect-on-solved) for a list of token indices.
+function genOfIdx(idxList) {
+  let S = IDS;
+  for (const gi of idxList) S = comp(S, gi);
+  return S;
+}
+// Compose two generators: result = (apply A, then B). result.cp[i] = A.cp[B.cp[i]] ...
+function composeGen(A, B) {
+  const cp = new Int8Array(20), co = new Int8Array(20);
+  const ep = new Int8Array(30), eo = new Int8Array(30);
+  for (let i = 0; i < 20; i++) {
+    const s = B.cp[i];
+    cp[i] = A.cp[s];
+    co[i] = (A.co[s] + B.co[i]) % 3;
+  }
+  for (let i = 0; i < 30; i++) {
+    const s = B.ep[i];
+    ep[i] = A.ep[s];
+    eo[i] = (A.eo[s] + B.eo[i]) % 2;
+  }
+  return { cp, co, ep, eo };
+}
+// Inverse generator.
+function invGen(A) {
+  const cp = new Int8Array(20), co = new Int8Array(20);
+  const ep = new Int8Array(30), eo = new Int8Array(30);
+  for (let i = 0; i < 20; i++) { cp[A.cp[i]] = i; co[A.cp[i]] = (3 - A.co[i]) % 3; }
+  for (let i = 0; i < 30; i++) { ep[A.ep[i]] = i; eo[A.ep[i]] = (2 - A.eo[i]) % 2; }
+  return { cp, co, ep, eo };
+}
+const idxOfTokens = (toks) => toks.map((t) => tokIndex.get(t));
+const tokensOfIdx = (idx) => idx.map((i) => TOKENS[i]);
+const invIdxList = (idx) => idx.slice().reverse().map((i) => tokInv[i]);
+
+// ---------------------------------------------------------------------------
+// Base primitive shapes (found once by commutator search over the generators).
+// ---------------------------------------------------------------------------
+const CORNER_BASES = [
+  ["F0", "F4'", "F0'", "F2", "F0", "F4", "F0'", "F2'"],
+  ["F0", "F2", "F7", "F2'", "F0'", "F2", "F7'", "F2'"],
+  ["F0", "F4'", "F11'", "F4", "F0'", "F4'", "F11", "F4"],
+  ["F1", "F4", "F11", "F4'", "F1'", "F4", "F11'", "F4'"],
+  ["F2", "F5", "F9", "F5'", "F2'", "F5", "F9'", "F5'"],
+  ["F3", "F7", "F9", "F7'", "F3'", "F7", "F9'", "F7'"],
+  ["F3'", "F10", "F11'", "F10'", "F3", "F10", "F11", "F10'"],
+  ["F4", "F8", "F10", "F8'", "F4'", "F8", "F10'", "F8'"],
+  ["F4'", "F11", "F9'", "F11'", "F4", "F11", "F9", "F11'"],
+  ["F5", "F6", "F11", "F6'", "F5'", "F6", "F11'", "F6'"],
+  ["F5'", "F9", "F10'", "F9'", "F5", "F9", "F10", "F9'"],
+];
+// The base edge 3-cycle shape, plus a family of 55 edge 3-cycle shapes (found
+// once by commutator search) whose conjugation orbits cover all 870 directed
+// edge content-moves.
+const EDGE3 = ["F0", "F1", "F0'", "F6", "F4", "F6'", "F0", "F1'", "F0'", "F6", "F4'", "F6'"];
+const EDGE_BASES = [
+  ["F0", "F1", "F0'", "F6", "F4", "F6'", "F0", "F1'", "F0'", "F6", "F4'", "F6'"],
+  ["F0", "F1", "F0'", "F6", "F4'", "F6'", "F0", "F1'", "F0'", "F6", "F4", "F6'"],
+  ["F0", "F2", "F0'", "F5", "F1", "F5'", "F0", "F2'", "F0'", "F5", "F1'", "F5'"],
+  ["F0", "F2", "F0'", "F5", "F1'", "F5'", "F0", "F2'", "F0'", "F5", "F1", "F5'"],
+  ["F0", "F8'", "F0'", "F10", "F3'", "F10'", "F0", "F8", "F0'", "F10", "F3", "F10'"],
+  ["F0'", "F3'", "F0", "F10'", "F8", "F10", "F0'", "F3", "F0", "F10'", "F8'", "F10"],
+  ["F0'", "F8", "F0", "F11'", "F4", "F11", "F0'", "F8'", "F0", "F11'", "F4'", "F11"],
+  ["F1", "F0", "F1'", "F3", "F2'", "F3'", "F1", "F0'", "F1'", "F3", "F2", "F3'"],
+  ["F1", "F2'", "F1'", "F7", "F5", "F7'", "F1", "F2", "F1'", "F7", "F5'", "F7'"],
+  ["F1", "F2'", "F1'", "F7", "F5'", "F7'", "F1", "F2", "F1'", "F7", "F5", "F7'"],
+  ["F1", "F4'", "F1'", "F8", "F0", "F8'", "F1", "F4", "F1'", "F8", "F0'", "F8'"],
+  ["F1", "F4'", "F1'", "F8", "F0'", "F8'", "F1", "F4", "F1'", "F8", "F0", "F8'"],
+  ["F1", "F5'", "F1'", "F9", "F6", "F9'", "F1", "F5", "F1'", "F9", "F6'", "F9'"],
+  ["F1", "F6'", "F1'", "F11", "F4'", "F11'", "F1", "F6", "F1'", "F11", "F4", "F11'"],
+  ["F1'", "F0", "F1", "F8'", "F4", "F8", "F1'", "F0'", "F1", "F8'", "F4'", "F8"],
+  ["F1'", "F0", "F1", "F8'", "F4'", "F8", "F1'", "F0'", "F1", "F8'", "F4", "F8"],
+  ["F1'", "F2", "F1", "F3'", "F0'", "F3", "F1'", "F2'", "F1", "F3'", "F0", "F3"],
+  ["F1'", "F4", "F1", "F11'", "F6", "F11", "F1'", "F4'", "F1", "F11'", "F6'", "F11"],
+  ["F1'", "F4", "F1", "F11'", "F6'", "F11", "F1'", "F4'", "F1", "F11'", "F6", "F11"],
+  ["F1'", "F5", "F1", "F7'", "F2", "F7", "F1'", "F5'", "F1", "F7'", "F2'", "F7"],
+  ["F1'", "F5", "F1", "F7'", "F2'", "F7", "F1'", "F5'", "F1", "F7'", "F2", "F7"],
+  ["F1'", "F6", "F1", "F9'", "F5", "F9", "F1'", "F6'", "F1", "F9'", "F5'", "F9"],
+  ["F2", "F1'", "F2'", "F4", "F0", "F4'", "F2", "F1", "F2'", "F4", "F0'", "F4'"],
+  ["F2", "F7'", "F2'", "F9", "F5'", "F9'", "F2", "F7", "F2'", "F9", "F5", "F9'"],
+  ["F2'", "F0'", "F2", "F4'", "F1", "F4", "F2'", "F0", "F2", "F4'", "F1'", "F4"],
+  ["F2'", "F0'", "F2", "F4'", "F1'", "F4", "F2'", "F0", "F2", "F4'", "F1", "F4"],
+  ["F2'", "F1", "F2", "F6'", "F5", "F6", "F2'", "F1'", "F2", "F6'", "F5'", "F6"],
+  ["F2'", "F1", "F2", "F6'", "F5'", "F6", "F2'", "F1'", "F2", "F6'", "F5", "F6"],
+  ["F2'", "F1'", "F2", "F6'", "F5", "F6", "F2'", "F1", "F2", "F6'", "F5'", "F6"],
+  ["F2'", "F1'", "F2", "F6'", "F5'", "F6", "F2'", "F1", "F2", "F6'", "F5", "F6"],
+  ["F2'", "F7", "F2", "F10'", "F3", "F10", "F2'", "F7'", "F2", "F10'", "F3'", "F10"],
+  ["F3", "F8", "F3'", "F11", "F10", "F11'", "F3", "F8'", "F3'", "F11", "F10'", "F11'"],
+  ["F3", "F8", "F3'", "F11", "F10'", "F11'", "F3", "F8'", "F3'", "F11", "F10", "F11'"],
+  ["F3", "F8'", "F3'", "F11", "F10", "F11'", "F3", "F8", "F3'", "F11", "F10'", "F11'"],
+  ["F3", "F8'", "F3'", "F11", "F10'", "F11'", "F3", "F8", "F3'", "F11", "F10", "F11'"],
+  ["F3'", "F7", "F3", "F9'", "F10'", "F9", "F3'", "F7'", "F3", "F9'", "F10", "F9"],
+  ["F3'", "F7'", "F3", "F9'", "F10'", "F9", "F3'", "F7", "F3", "F9'", "F10", "F9"],
+  ["F4", "F1", "F4'", "F5", "F6", "F5'", "F4", "F1'", "F4'", "F5", "F6'", "F5'"],
+  ["F4", "F1'", "F4'", "F5", "F6", "F5'", "F4", "F1", "F4'", "F5", "F6'", "F5'"],
+  ["F4", "F6", "F4'", "F9", "F11'", "F9'", "F4", "F6'", "F4'", "F9", "F11", "F9'"],
+  ["F4", "F6'", "F4'", "F9", "F11'", "F9'", "F4", "F6", "F4'", "F9", "F11", "F9'"],
+  ["F4", "F11", "F4'", "F10", "F8'", "F10'", "F4", "F11'", "F4'", "F10", "F8", "F10'"],
+  ["F4", "F11'", "F4'", "F10", "F8'", "F10'", "F4", "F11", "F4'", "F10", "F8", "F10'"],
+  ["F4'", "F6'", "F4", "F5'", "F1", "F5", "F4'", "F6", "F4", "F5'", "F1'", "F5"],
+  ["F4'", "F6'", "F4", "F5'", "F1'", "F5", "F4'", "F6", "F4", "F5'", "F1", "F5"],
+  ["F5", "F7", "F5'", "F10", "F9'", "F10'", "F5", "F7'", "F5'", "F10", "F9", "F10'"],
+  ["F5", "F7'", "F5'", "F10", "F9'", "F10'", "F5", "F7", "F5'", "F10", "F9", "F10'"],
+  ["F5'", "F9", "F5", "F10'", "F7", "F10", "F5'", "F9'", "F5", "F10'", "F7'", "F10"],
+  ["F6'", "F11", "F6", "F10'", "F9'", "F10", "F6'", "F11'", "F6", "F10'", "F9", "F10"],
+  ["F7", "F3", "F7'", "F8", "F10", "F8'", "F7", "F3'", "F7'", "F8", "F10'", "F8'"],
+  ["F7", "F3", "F7'", "F8", "F10'", "F8'", "F7", "F3'", "F7'", "F8", "F10", "F8'"],
+  ["F7'", "F9", "F7", "F11'", "F10'", "F11", "F7'", "F9'", "F7", "F11'", "F10", "F11"],
+  ["F7'", "F10", "F7", "F8'", "F3'", "F8", "F7'", "F10'", "F7", "F8'", "F3", "F8"],
+  ["F7'", "F10'", "F7", "F8'", "F3'", "F8", "F7'", "F10", "F7", "F8'", "F3", "F8"],
+  ["F8'", "F10", "F8", "F9'", "F11'", "F9", "F8'", "F10'", "F8", "F9'", "F11", "F9"],
+];
+// Oriented siblings used to build TWIST / FLIP.
+const OC3 = ["F0", "F1", "F5'", "F1'", "F0'", "F1", "F5", "F1'"]; // corner 3-cycle w/ twist
+const OE3 = ["F0", "F1'", "F0'", "F6", "F4", "F6'", "F0", "F1", "F0'", "F6", "F4'", "F6'"]; // edge 3-cycle w/ flips
+const CORNER3 = CORNER_BASES[0];
+
+// ---------------------------------------------------------------------------
+// Helpers for clean-effect testing.
+// ---------------------------------------------------------------------------
+function fwdCycle(p, n) {
+  const f = new Int8Array(n).fill(-1);
+  for (let i = 0; i < n; i++) f[p[i]] = i;
+  let start = -1;
+  for (let i = 0; i < n; i++) if (p[i] !== i) { start = i; break; }
+  if (start < 0) return null;
+  const c = [start];
+  let cur = f[start];
+  while (cur !== start) { c.push(cur); cur = f[cur]; }
+  return c;
+}
+function cornerPermClean(S) {
+  for (let i = 0; i < 20; i++) if (S.co[i]) return false;
+  for (let i = 0; i < 30; i++) if (S.eo[i] || S.ep[i] !== i) return false;
+  return true;
+}
+function edgePermClean(S) {
+  for (let i = 0; i < 30; i++) if (S.eo[i]) return false;
+  for (let i = 0; i < 20; i++) if (S.co[i] || S.cp[i] !== i) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Build content-move tables: tbl["cur,home"] = Map(third -> token-index seq)
+// realizing the pure 3-cycle that sends content cur->home->third->cur.
+// Bulk via setups up to depth 3; remaining pairs patched by targeted BFS.
+// ---------------------------------------------------------------------------
+function buildMoveTable(baseList, coord, n, cleanFn, totalPairs) {
+  const baseIdx = baseList.map(idxOfTokens);
+  const baseGens = baseIdx.map(genOfIdx);
+  const tbl = new Map();
+  const U = [];
+  // record all base 3-cycles for the current setup U (Ugen / UgenInv given).
+  const record = (Ugen, UgenInv) => {
+    for (let bi = 0; bi < baseGens.length; bi++) {
+      const S = U.length ? composeGen(composeGen(Ugen, baseGens[bi]), UgenInv) : baseGens[bi];
+      if (!cleanFn(S)) continue;
+      const c = fwdCycle(S[coord], n);
+      if (!c || c.length !== 3) continue;
+      let seqIdx = null;
+      for (let i = 0; i < 3; i++) {
+        const cur = c[i], home = c[(i + 1) % 3], third = c[(i + 2) % 3];
+        const k = cur + "," + home;
+        let mp = tbl.get(k);
+        if (!mp) { mp = new Map(); tbl.set(k, mp); }
+        if (!mp.has(third) && mp.size < 12) {
+          if (!seqIdx) seqIdx = [...U, ...baseIdx[bi], ...invIdxList(U)];
+          mp.set(third, seqIdx);
+        }
+      }
+    }
+  };
+  // Pass 1: FULL sweep to depth 3 (many thirds/pair for cycle3 routing).
+  const sweep = (depth, maxDepth, last, Ugen, UgenInv) => {
+    record(Ugen, UgenInv);
+    if (depth === maxDepth) return;
+    for (let gi = 0; gi < NG; gi++) {
+      if (tokFace[gi] === last) continue;
+      U.push(gi);
+      const nUgen = composeGen(Ugen, GEN[gi]);
+      sweep(depth + 1, maxDepth, tokFace[gi], nUgen, invGen(nUgen));
+      U.pop();
+    }
+  };
+  sweep(0, 3, -1, IDS, IDS);
+  // Pass 2: deepen for any still-missing directed pairs (stop once complete).
+  if (tbl.size < totalPairs) {
+    const dfs = (depth, maxDepth, last, Ugen, UgenInv) => {
+      record(Ugen, UgenInv);
+      if (tbl.size >= totalPairs || depth === maxDepth) return;
+      for (let gi = 0; gi < NG; gi++) {
+        if (tokFace[gi] === last) continue;
+        U.push(gi);
+        const nUgen = composeGen(Ugen, GEN[gi]);
+        dfs(depth + 1, maxDepth, tokFace[gi], nUgen, invGen(nUgen));
+        U.pop();
+        if (tbl.size >= totalPairs) return;
+      }
+    };
+    for (let d = 4; d <= 6 && tbl.size < totalPairs; d++) dfs(0, d, -1, IDS, IDS);
+  }
+  return tbl;
+}
+
+// ---------------------------------------------------------------------------
+// cycle3: token-index sequence performing content a->b->c->a (perm-clean).
+// Uses the move table; falls back to helper decomposition (a b c)=(a b h)(a h c).
+// ---------------------------------------------------------------------------
+function cycle3Direct(tbl, a, b, c) {
+  let e = tbl.get(a + "," + b); if (e && e.has(c)) return e.get(c);
+  e = tbl.get(b + "," + c); if (e && e.has(a)) return e.get(a);
+  e = tbl.get(c + "," + a); if (e && e.has(b)) return e.get(b);
+  // reverse direction applied twice (a 3-cycle has order 3)
+  e = tbl.get(a + "," + c); if (e && e.has(b)) { const s = e.get(b); return [...s, ...s]; }
+  e = tbl.get(c + "," + b); if (e && e.has(a)) { const s = e.get(a); return [...s, ...s]; }
+  e = tbl.get(b + "," + a); if (e && e.has(c)) { const s = e.get(c); return [...s, ...s]; }
+  return null;
+}
+// Verify a token-index seq performs exactly the content 3-cycle a->b->c->a on
+// `coord` and nothing else (perm + orientation clean).
+function isExactCycle3(seq, coord, n, a, b, c) {
+  const g = genOfIdx(seq);
+  // perm clean elsewhere + orientation clean everywhere
+  for (let i = 0; i < 20; i++) if (g.co[i]) return false;
+  for (let i = 0; i < 30; i++) if (g.eo[i]) return false;
+  const other = coord === "cp" ? g.ep : g.cp;
+  const om = coord === "cp" ? 30 : 20;
+  for (let i = 0; i < om; i++) if (other[i] !== i) return false;
+  const p = g[coord];
+  for (let i = 0; i < n; i++) {
+    const want = i === a ? c : i === b ? a : i === c ? b : i; // p[i]=source
+    if (p[i] !== want) return false;
+  }
+  return true;
+}
+function cycle3(tbl, n, a, b, c) {
+  const d = cycle3Direct(tbl, a, b, c);
+  if (d && isExactCycle3(d, n === 20 ? "cp" : "ep", n, a, b, c)) return d;
+  const coord = n === 20 ? "cp" : "ep";
+  // helper decomposition (a b c) = (a b h)(a h c); verify each candidate.
+  for (let h = 0; h < n; h++) {
+    if (h === a || h === b || h === c) continue;
+    const s1 = cycle3Direct(tbl, a, b, h);
+    if (!s1) continue;
+    const s2 = cycle3Direct(tbl, a, h, c);
+    if (!s2) continue;
+    const seq = [...s1, ...s2];
+    if (isExactCycle3(seq, coord, n, a, b, c)) return seq;
+  }
+  // fallback: (a b c) = (a b h)(b c h)-style, try alternate decomposition orders
+  for (let h = 0; h < n; h++) {
+    if (h === a || h === b || h === c) continue;
+    const cands = [
+      () => { const s1 = cycle3Direct(tbl, a, h, c); const s2 = cycle3Direct(tbl, a, b, h); return s1 && s2 ? [...s1, ...s2] : null; },
+      () => { const s1 = cycle3Direct(tbl, h, b, c); const s2 = cycle3Direct(tbl, a, b, h); return s1 && s2 ? [...s1, ...s2] : null; },
+      () => { const s1 = cycle3Direct(tbl, a, b, h); const s2 = cycle3Direct(tbl, h, b, c); return s1 && s2 ? [...s1, ...s2] : null; },
+    ];
+    for (const mk of cands) {
+      const seq = mk();
+      if (seq && isExactCycle3(seq, coord, n, a, b, c)) return seq;
+    }
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Twist / flip pair tables and retargeting.
+// ---------------------------------------------------------------------------
+// Build the TWIST (pure 2-corner twist) and FLIP (pure 2-edge flip) primitives
+// by matching an oriented 3-cycle's permutation to a pure 3-cycle, then
+// cancelling permutation.
+function matchConjugate(base, coord, targetArr, maxDepth) {
+  const target = targetArr.join(",");
+  let frontier = [[]];
+  const seen = new Set();
+  for (let depth = 0; depth <= maxDepth; depth++) {
+    for (const U of frontier) {
+      const seq = U.length ? [...U, ...base, ...invIdxList(U)] : base.slice();
+      const g = genOfIdx(seq);
+      if (g[coord].join(",") === target) return seq;
+    }
+    const nf = [];
+    for (const U of frontier) {
+      const last = U.length ? tokFace[U[U.length - 1]] : -1;
+      for (let gi = 0; gi < NG; gi++) {
+        if (tokFace[gi] === last) continue;
+        const nU = [...U, gi];
+        let S = IDS; for (const x of nU) S = comp(S, x);
+        const sig = (coord === "cp" ? S.cp : S.ep).join(",");
+        if (seen.has(sig)) continue;
+        seen.add(sig);
+        nf.push(nU);
+      }
+    }
+    frontier = nf;
+  }
+  return null;
+}
+
+const TWIST_IDX = (() => {
+  const corner3Idx = idxOfTokens(CORNER3);
+  const oc3Idx = idxOfTokens(OC3);
+  const matched = matchConjugate(oc3Idx, "cp", genOfIdx(corner3Idx).cp, 6);
+  if (!matched) throw new Error("TWIST build: no conjugator");
+  const seq = [...matched, ...invIdxList(corner3Idx)];
+  const g = genOfIdx(seq);
+  let ok = true;
+  for (let i = 0; i < 20; i++) if (g.cp[i] !== i) ok = false;
+  for (let i = 0; i < 30; i++) if (g.ep[i] !== i || g.eo[i]) ok = false;
+  if (!ok || !g.co.some((v) => v)) throw new Error("TWIST build: not a pure twist");
+  return seq;
+})();
+
+const FLIP_IDX = (() => {
+  const edge3Idx = idxOfTokens(EDGE3);
+  const oe3Idx = idxOfTokens(OE3);
+  const matched = matchConjugate(oe3Idx, "ep", genOfIdx(edge3Idx).ep, 6);
+  if (!matched) throw new Error("FLIP build: no conjugator");
+  const seq = [...matched, ...invIdxList(edge3Idx)];
+  const g = genOfIdx(seq);
+  let ok = true;
+  for (let i = 0; i < 20; i++) if (g.cp[i] !== i || g.co[i]) ok = false;
+  for (let i = 0; i < 30; i++) if (g.ep[i] !== i) ok = false;
+  if (!ok || !g.eo.some((v) => v)) throw new Error("FLIP build: not a pure flip");
+  return seq;
+})();
+
+// twist-pair table: tbl["x,y"] = { seq, dx, dy }   (co[x]+=dx, co[y]+=dy).
+// DFS over setups up to depth 4 (no materialized frontier => low memory). Not
+// every pair is directly reachable (shape orbit); twistPair() helper-routes
+// the rest, so partial coverage is fine as long as the twist graph spans all
+// 20 corners (it does at depth 4).
+// DFS that carries the conjugator generator (Ugen) incrementally so each node
+// costs O(1) generator compositions instead of recomposing the whole sequence.
+// `visit(seq, g)` receives the token-index sequence and the effect generator of
+// U·base·U^{-1}.
+function dfsConjugate(baseIdx, maxDepth, visit, stopFn) {
+  const baseGen = genOfIdx(baseIdx);
+  const U = [];
+  const rec = (depth, last, Ugen, UgenInv) => {
+    const seq = U.length ? [...U, ...baseIdx, ...invIdxList(U)] : baseIdx;
+    const g = U.length ? composeGen(composeGen(Ugen, baseGen), UgenInv) : baseGen;
+    visit(seq, g);
+    if (depth === maxDepth || (stopFn && stopFn())) return;
+    for (let gi = 0; gi < NG; gi++) {
+      if (tokFace[gi] === last) continue;
+      U.push(gi);
+      const nUgen = composeGen(Ugen, GEN[gi]);
+      const nUgenInv = invGen(nUgen);
+      rec(depth + 1, tokFace[gi], nUgen, nUgenInv);
+      U.pop();
+      if (stopFn && stopFn()) return;
+    }
+  };
+  rec(0, -1, IDS, IDS);
+}
+
+function buildTwistTable() {
+  const tbl = new Map();
+  dfsConjugate(TWIST_IDX, 4, (seq, g) => {
+    for (let i = 0; i < 20; i++) if (g.cp[i] !== i) return;
+    for (let i = 0; i < 30; i++) if (g.ep[i] !== i || g.eo[i]) return;
+    const nz = [];
+    for (let i = 0; i < 20; i++) if (g.co[i]) nz.push(i);
+    if (nz.length !== 2) return;
+    const [x, y] = nz;
+    if (!tbl.has(x + "," + y)) tbl.set(x + "," + y, { seq: seq.slice(), dx: g.co[x], dy: g.co[y] });
+    if (!tbl.has(y + "," + x)) tbl.set(y + "," + x, { seq: seq.slice(), dx: g.co[y], dy: g.co[x] });
+  });
+  return tbl;
+}
+
+// flip-pair table: tbl["x,y"] = seq (flips edges x and y). Built to full
+// connectivity so flipPair() can route any pair through the flip graph.
+function buildFlipTable() {
+  const tbl = new Map();
+  const reached = new Set();
+  const stop = () => reached.size >= 30;
+  const visit = (seq, g) => {
+    for (let i = 0; i < 20; i++) if (g.cp[i] !== i || g.co[i]) return;
+    for (let i = 0; i < 30; i++) if (g.ep[i] !== i) return;
+    const nz = [];
+    for (let i = 0; i < 30; i++) if (g.eo[i]) nz.push(i);
+    if (nz.length !== 2) return;
+    const [x, y] = nz;
+    if (!tbl.has(x + "," + y)) { const s = seq.slice(); tbl.set(x + "," + y, s); tbl.set(y + "," + x, s); }
+    reached.add(x); reached.add(y);
+  };
+  for (let d = 4; d <= 6 && reached.size < 30; d++) dfsConjugate(FLIP_IDX, d, visit, stop);
+  return tbl;
+}
+
+const inv3 = (d) => (d === 1 ? 1 : 2);
+
+// twistPair: token-index seq adding co[x]+=A, co[y]+=(-A mod 3); helper-routed.
+function twistPair(tbl, x, A, y) {
+  A = ((A % 3) + 3) % 3;
+  if (A === 0) return [];
+  const e = tbl.get(x + "," + y);
+  if (e) {
+    const k = (A * inv3(((e.dx % 3) + 3) % 3)) % 3;
+    const out = [];
+    for (let i = 0; i < k; i++) out.push(...e.seq);
+    return out;
+  }
+  for (let h = 0; h < 20; h++) {
+    if (h === x || h === y) continue;
+    if (tbl.has(x + "," + h) && tbl.has(h + "," + y)) {
+      const s1 = twistPair(tbl, x, A, h);
+      const s2 = twistPair(tbl, h, A, y);
+      if (s1 && s2) return [...s1, ...s2];
+    }
+  }
+  return null;
+}
+
+// flipPair: token-index seq flipping edges x and y; routed through flip graph.
+function flipPair(tbl, fadj, x, y) {
+  if (tbl.has(x + "," + y)) return tbl.get(x + "," + y).slice();
+  // BFS path in flip graph; flipping along a path nets flips at endpoints only.
+  const prev = new Map([[x, -1]]);
+  const q = [x];
+  let h = 0;
+  while (h < q.length) {
+    const u = q[h++];
+    if (u === y) break;
+    for (const v of fadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
+  }
+  if (!prev.has(y)) return null;
+  const path = [];
+  let cur = y;
+  while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
+  const out = [];
+  for (let i = 0; i + 1 < path.length; i++) out.push(...tbl.get(path[i] + "," + path[i + 1]));
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// Build all tables once at load.
+// ---------------------------------------------------------------------------
+const C_MOVE = buildMoveTable(CORNER_BASES, "cp", 20, cornerPermClean, 380);
+const E_MOVE = buildMoveTable(EDGE_BASES, "ep", 30, edgePermClean, 870);
+const TWIST_TBL = buildTwistTable();
+const FLIP_TBL = buildFlipTable();
+const FLIP_ADJ = (() => {
+  const adj = Array.from({ length: 30 }, () => new Set());
+  for (const k of FLIP_TBL.keys()) {
+    const [a, b] = k.split(",").map(Number);
+    adj[a].add(b); adj[b].add(a);
+  }
+  return adj;
+})();
+
+// ---------------------------------------------------------------------------
+// SOLVER
+// ---------------------------------------------------------------------------
+function solveImpl(state) {
+  const ctx = {
+    S: {
+      cp: Int8Array.from(state.cp),
+      co: Int8Array.from(state.co),
+      ep: Int8Array.from(state.ep),
+      eo: Int8Array.from(state.eo),
+    },
+    sol: [],
+  };
+  if (isSolvedState(ctx.S)) return [];
+  const run = (seq) => {
+    if (!seq) throw new Error("null sequence");
+    for (const gi of seq) { ctx.S = comp(ctx.S, gi); ctx.sol.push(gi); }
+  };
+
+  phasePerm(ctx, run, "cp", 20, C_MOVE);
+  phaseTwist(ctx, run);
+  phasePerm(ctx, run, "ep", 30, E_MOVE);
+  phaseFlip(ctx, run);
+
+  if (!isSolvedState(ctx.S)) throw new Error("solver did not reach solved");
+  return reduceTokens(tokensOfIdx(ctx.sol));
+}
+
+function isSolvedState(S) {
+  for (let i = 0; i < 20; i++) if (S.cp[i] !== i || S.co[i]) return false;
+  for (let i = 0; i < 30; i++) if (S.ep[i] !== i || S.eo[i]) return false;
+  return true;
+}
+
+// Permutation phase: solve cp or ep by 3-cycles via cycle decomposition.
+function phasePerm(ctx, run, coord, n, tbl) {
+  let guard = 0;
+  while (guard++ < 100) {
+    const p = ctx.S[coord];
+    let a = -1;
+    for (let i = 0; i < n; i++) if (p[i] !== i) { a = i; break; }
+    if (a < 0) return;
+    let cur = -1;
+    for (let i = 0; i < n; i++) if (p[i] === a) { cur = i; break; }
+    let helper = -1;
+    for (let i = 0; i < n; i++) if (p[i] !== i && i !== cur && i !== a) { helper = i; break; }
+    if (helper < 0) throw new Error("phasePerm: single misplaced (parity?) at " + a);
+    const seq = cycle3(tbl, n, cur, a, helper);
+    if (!seq) throw new Error("phasePerm: no cycle3 for " + [cur, a, helper]);
+    run(seq);
+  }
+  throw new Error("phasePerm did not converge");
+}
+
+// Corner orientation phase: zero co via twist pairs.
+function phaseTwist(ctx, run) {
+  let guard = 0;
+  while (guard++ < 60) {
+    const co = ctx.S.co;
+    const tw = [];
+    for (let i = 0; i < 20; i++) if (co[i]) tw.push(i);
+    if (tw.length === 0) return;
+    // pair the first twisted corner with another; drive first to 0.
+    const x = tw[0];
+    const y = tw[1] !== undefined ? tw[1] : tw[0];
+    // A = amount to add to x to make it 0
+    const A = (3 - co[x]) % 3;
+    const seq = twistPair(TWIST_TBL, x, A, y);
+    if (!seq) throw new Error("phaseTwist: no twistPair for " + [x, y]);
+    run(seq);
+  }
+  throw new Error("phaseTwist did not converge");
+}
+
+// Edge orientation phase: zero eo via flip pairs.
+function phaseFlip(ctx, run) {
+  let guard = 0;
+  while (guard++ < 60) {
+    const eo = ctx.S.eo;
+    const fl = [];
+    for (let i = 0; i < 30; i++) if (eo[i]) fl.push(i);
+    if (fl.length === 0) return;
+    const seq = flipPair(FLIP_TBL, FLIP_ADJ, fl[0], fl[1]);
+    if (!seq) throw new Error("phaseFlip: no flipPair for " + [fl[0], fl[1]]);
+    run(seq);
+  }
+  throw new Error("phaseFlip did not converge");
+}
+
+// Cancel trivially-adjacent inverse tokens to shorten output a little.
+function reduceTokens(toks) {
+  const out = [];
+  for (const t of toks) {
+    const last = out[out.length - 1];
+    if (last !== undefined) {
+      const li = tokIndex.get(last);
+      const ti = tokIndex.get(t);
+      if (tokInv[ti] === li) { out.pop(); continue; }
+    }
+    out.push(t);
+  }
+  return out;
+}
+    return solveImpl;
+  })();
+  return _megaSolveFn;
+}
+function megaSolveFull() {
+  let toks; try { toks = megaGetSolve()(megaReadState()); } catch (e) { return null; }
+  if (!toks) return null;
+  return toks.map(t => { const pr = t.endsWith("'"); const i = parseInt(t.slice(1), 10); return MEGA_KEYS[i] + (pr ? "'" : ''); });
+}
 const puzzleMega = {
   id: 'megaminx', name: 'Megaminx',
   group: megaGroup,
@@ -4936,6 +5720,7 @@ const puzzleMega = {
   updateProjections: () => {},
   finalizeMovePhase: megaFinalize,
   readState: megaReadState,
+  solveFull: megaSolveFull,
   scramble: megaScramble,
   storageKey: 'mega-solves',
   keymap: { faceKeys: Object.fromEntries(MEGA_KEYS.map(c => [c, c])) },  // a..l turn faces (Shift = prime)
@@ -4949,25 +5734,32 @@ const puzzleMega = {
     <div>Drag to orbit · scroll to zoom</div>`,
 };
 
-/* ===== Megaminx click-to-turn: a click (not a drag) on a face turns it; Shift = prime. ===== */
-const megaRaycaster = new THREE.Raycaster();
-const _megaPtr = new THREE.Vector2();
-let _megaDown = null;
+/* ===== Click-to-turn (Megaminx: click a face; Skewb: click a corner). A click —
+   not a drag — turns it; Shift reverses. ===== */
+const clickRaycaster = new THREE.Raycaster();
+const _clickPtr = new THREE.Vector2();
+let _clickDown = null;
+const CLICK_PUZZLES = { megaminx: 1, skewb: 1 };
 renderer.domElement.addEventListener('pointerdown', (e) => {
-  _megaDown = (puzzle.id === 'megaminx' && e.button === 0) ? { x: e.clientX, y: e.clientY } : null;
+  _clickDown = (CLICK_PUZZLES[puzzle.id] && e.button === 0) ? { x: e.clientX, y: e.clientY } : null;
 });
 renderer.domElement.addEventListener('pointerup', (e) => {
-  if (puzzle.id !== 'megaminx' || !_megaDown || paused) { _megaDown = null; return; }
-  const moved = Math.hypot(e.clientX - _megaDown.x, e.clientY - _megaDown.y);
-  _megaDown = null;
+  if (!CLICK_PUZZLES[puzzle.id] || !_clickDown || paused) { _clickDown = null; return; }
+  const moved = Math.hypot(e.clientX - _clickDown.x, e.clientY - _clickDown.y);
+  _clickDown = null;
   if (moved > 5) return;                                     // it was an orbit drag, not a click
   const rect = renderer.domElement.getBoundingClientRect();
-  _megaPtr.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
-  _megaPtr.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
-  megaRaycaster.setFromCamera(_megaPtr, camera);
-  const hit = megaRaycaster.intersectObjects(megaGroup.children, true)
-    .find(h => h.object.userData && h.object.userData.faceIndex !== undefined);
-  if (hit) applyMove(MEGA_KEYS[hit.object.userData.faceIndex] + (e.shiftKey ? "'" : ''), 'solve');
+  _clickPtr.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  _clickPtr.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  clickRaycaster.setFromCamera(_clickPtr, camera);
+  const sh = e.shiftKey ? "'" : '';
+  if (puzzle.id === 'megaminx') {
+    const hit = clickRaycaster.intersectObjects(megaGroup.children, true).find(h => h.object.userData && h.object.userData.faceIndex !== undefined);
+    if (hit) applyMove(MEGA_KEYS[hit.object.userData.faceIndex] + sh, 'solve');
+  } else if (puzzle.id === 'skewb') {
+    const hit = clickRaycaster.intersectObjects(skewbGroup.children, true).find(h => h.object.userData && h.object.userData.skewbCorner !== undefined);
+    if (hit) applyMove(SKEWB_KEYS[hit.object.userData.skewbCorner] + sh, 'solve');
+  }
 });
 
 
@@ -5039,6 +5831,824 @@ function cube3Scramble() {                                        // random-move
   }
   return toks;
 }
+/* ===== 3×3 solver — table-free beginner-CFOP (CommonJS solver2.js wrapped as an IIFE).
+   Browser-safe: instant load, ~5 MB, ~146-move non-optimal but always-correct solutions. ===== */
+const cube3Solver = (function () {
+
+/*
+ * Self-contained, BROWSER-SAFE 3x3 Rubik's Cube solver.
+ *
+ * METHOD: a purely algorithmic layer-by-layer / beginner-CFOP solver. No
+ * precomputed pattern databases, no BFS distance tables, no multi-second
+ * initialization. Everything is short local searches (a handful of moves to
+ * place each piece) plus fixed last-layer algorithm sets applied with
+ * setup/AUF. Load and first-solve are effectively instant (< ~50 ms) and the
+ * memory footprint is trivial (< ~5 MB). Solutions are non-optimal but always
+ * bounded (~60-130 moves typical) and it ALWAYS solves a solvable cube.
+ *
+ * Phases:
+ *   1. White cross on D            (D-layer cross edges placed & oriented)
+ *   2. First-layer (D) corners     (white corners placed)
+ *   3. Second-layer edges          (E-slice edges placed)
+ *   4. Last-layer edge orientation (yellow cross on U)  -- 2-look OLL part 1
+ *   5. Last-layer corner orientation                    -- 2-look OLL part 2
+ *   6. Last-layer permutation (corners then edges)      -- 2-look PLL
+ *
+ * Note on color convention: in the Kociemba facelet convention used here the
+ * U face is "white/U", D is "yellow/D". This solver builds the first layer on
+ * the *bottom* (D) face and the last layer on the *top* (U) face, so the
+ * standard U-layer algorithms apply directly. No whole-cube rotations are ever
+ * emitted; the solver only uses {U,R,F,D,L,B} face turns.
+ *
+ * FACELET CONVENTION (Kociemba order), identical to solver.js — see
+ * facelet-convention.md. A 54-char string of letters U/R/F/D/L/B; faces in the
+ * order U,R,F,D,L,B (9 each); centers fixed at indices 4/13/22/31/40/49;
+ * solved = "UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB".
+ *
+ * solve(facelets) -> array of tokens from
+ *   { U,U',U2, R,R',R2, F,F',F2, D,D',D2, L,L',L2, B,B',B2 }.
+ * Returns [] if already solved. Throws on invalid/unsolvable input. Before
+ * returning, solve() re-applies its own solution through the facelet engine and
+ * asserts the cube is solved.
+ */
+
+// ===========================================================================
+// 1. FACELET MOVE ENGINE  (reused verbatim from solver.js — same source of
+//    truth, so this model and the engine cannot disagree)
+// ===========================================================================
+
+const FACE_ORDER = ['U', 'R', 'F', 'D', 'L', 'B'];
+const SOLVED = 'UUUUUUUUURRRRRRRRRFFFFFFFFFDDDDDDDDDLLLLLLLLLBBBBBBBBB';
+
+// BASE_PERM[f][i] is the source index for a clockwise quarter turn of face f:
+// newState[i] = oldState[BASE_PERM[f][i]]. (Geometrically derived & verified in
+// solver.js: 4x = identity, centers fixed, "CW as seen from outside".)
+const BASE_PERM = {
+  U: [6,3,0,7,4,1,8,5,2,45,46,47,12,13,14,15,16,17,9,10,11,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35,18,19,20,39,40,41,42,43,44,36,37,38,48,49,50,51,52,53],
+  R: [0,1,20,3,4,23,6,7,26,15,12,9,16,13,10,17,14,11,18,19,29,21,22,32,24,25,35,27,28,51,30,31,48,33,34,45,36,37,38,39,40,41,42,43,44,8,46,47,5,49,50,2,52,53],
+  F: [0,1,2,3,4,5,44,41,38,6,10,11,7,13,14,8,16,17,24,21,18,25,22,19,26,23,20,15,12,9,30,31,32,33,34,35,36,37,27,39,40,28,42,43,29,45,46,47,48,49,50,51,52,53],
+  D: [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,24,25,26,18,19,20,21,22,23,42,43,44,33,30,27,34,31,28,35,32,29,36,37,38,39,40,41,51,52,53,45,46,47,48,49,50,15,16,17],
+  L: [53,1,2,50,4,5,47,7,8,9,10,11,12,13,14,15,16,17,0,19,20,3,22,23,6,25,26,18,28,29,21,31,32,24,34,35,42,39,36,43,40,37,44,41,38,45,46,33,48,49,30,51,52,27],
+  B: [11,14,17,3,4,5,6,7,8,9,10,35,12,13,34,15,16,33,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,36,39,42,2,37,38,1,40,41,0,43,44,51,48,45,52,49,46,53,50,47],
+};
+
+function invertPerm(p) {
+  const inv = new Array(54);
+  for (let i = 0; i < 54; i++) inv[p[i]] = i;
+  return inv;
+}
+function composePerm(p, q) {
+  const r = new Array(54);
+  for (let i = 0; i < 54; i++) r[i] = p[q[i]];
+  return r;
+}
+
+const MOVE_PERM = {};
+for (const f of FACE_ORDER) {
+  const cw = BASE_PERM[f];
+  MOVE_PERM[f] = cw;
+  MOVE_PERM[f + "'"] = invertPerm(cw);
+  MOVE_PERM[f + '2'] = composePerm(cw, cw);
+}
+const ALL_MOVES = Object.keys(MOVE_PERM);
+
+function applyMove(state, token) {
+  const p = MOVE_PERM[token];
+  if (!p) throw new Error('unknown move token: ' + token);
+  const arr = new Array(54);
+  for (let i = 0; i < 54; i++) arr[i] = state[p[i]];
+  return arr.join('');
+}
+function applyMoves(state, moves) {
+  for (const m of moves) state = applyMove(state, m);
+  return state;
+}
+
+// ===========================================================================
+// 2. CUBIE MODEL — validation + solvability (reused from solver.js)
+// ===========================================================================
+
+const CORNER_FACELETS = [
+  [8, 9, 20], [6, 18, 38], [0, 36, 47], [2, 45, 11],
+  [29, 26, 15], [27, 44, 24], [33, 53, 42], [35, 17, 51],
+];
+const CORNER_COLORS = [
+  ['U', 'R', 'F'], ['U', 'F', 'L'], ['U', 'L', 'B'], ['U', 'B', 'R'],
+  ['D', 'F', 'R'], ['D', 'L', 'F'], ['D', 'B', 'L'], ['D', 'R', 'B'],
+];
+const EDGE_FACELETS = [
+  [5, 10], [7, 19], [3, 37], [1, 46], [32, 16], [28, 25],
+  [30, 43], [34, 52], [23, 12], [21, 41], [50, 39], [48, 14],
+];
+const EDGE_COLORS = [
+  ['U', 'R'], ['U', 'F'], ['U', 'L'], ['U', 'B'], ['D', 'R'], ['D', 'F'],
+  ['D', 'L'], ['D', 'B'], ['F', 'R'], ['F', 'L'], ['B', 'L'], ['B', 'R'],
+];
+
+function permParity(perm) {
+  let parity = 0;
+  const seen = new Array(perm.length).fill(false);
+  for (let i = 0; i < perm.length; i++) {
+    if (seen[i]) continue;
+    let j = i, len = 0;
+    while (!seen[j]) { seen[j] = true; j = perm[j]; len++; }
+    if (len % 2 === 0) parity ^= 1;
+  }
+  return parity;
+}
+
+// Validate input string + solvability. Throws on any problem. Returns nothing.
+function validate(facelets) {
+  if (typeof facelets !== 'string' || facelets.length !== 54) {
+    throw new Error('facelets must be a 54-character string');
+  }
+  const counts = {};
+  for (const c of facelets) {
+    if (!FACE_ORDER.includes(c)) throw new Error('invalid colour char: ' + c);
+    counts[c] = (counts[c] || 0) + 1;
+  }
+  for (const f of FACE_ORDER) {
+    if (counts[f] !== 9) throw new Error('colour ' + f + ' appears ' + (counts[f] || 0) + ' times (need 9)');
+  }
+  const centers = [4, 13, 22, 31, 40, 49];
+  for (let i = 0; i < 6; i++) {
+    if (facelets[centers[i]] !== FACE_ORDER[i]) {
+      throw new Error('center ' + centers[i] + ' must be ' + FACE_ORDER[i]);
+    }
+  }
+
+  const cp = new Array(8).fill(-1), co = new Array(8).fill(-1);
+  for (let pos = 0; pos < 8; pos++) {
+    const stk = CORNER_FACELETS[pos].map((idx) => facelets[idx]);
+    let found = false;
+    for (let cub = 0; cub < 8 && !found; cub++) {
+      const cc = CORNER_COLORS[cub];
+      for (let ori = 0; ori < 3; ori++) {
+        if (cc[ori % 3] === stk[0] && cc[(ori + 1) % 3] === stk[1] && cc[(ori + 2) % 3] === stk[2]) {
+          cp[pos] = cub; co[pos] = ori; found = true; break;
+        }
+      }
+    }
+    if (!found) throw new Error('invalid corner cubie at position ' + pos);
+  }
+
+  const ep = new Array(12).fill(-1), eo = new Array(12).fill(-1);
+  for (let pos = 0; pos < 12; pos++) {
+    const stk = EDGE_FACELETS[pos].map((idx) => facelets[idx]);
+    let found = false;
+    for (let cub = 0; cub < 12 && !found; cub++) {
+      const ec = EDGE_COLORS[cub];
+      for (let ori = 0; ori < 2; ori++) {
+        if (ec[ori % 2] === stk[0] && ec[(ori + 1) % 2] === stk[1]) {
+          ep[pos] = cub; eo[pos] = ori; found = true; break;
+        }
+      }
+    }
+    if (!found) throw new Error('invalid edge cubie at position ' + pos);
+  }
+
+  if (new Set(cp).size !== 8) throw new Error('corner permutation invalid');
+  if (new Set(ep).size !== 12) throw new Error('edge permutation invalid');
+
+  let coSum = 0; for (const o of co) coSum += o;
+  if (coSum % 3 !== 0) throw new Error('unsolvable: corner orientation');
+  let eoSum = 0; for (const o of eo) eoSum += o;
+  if (eoSum % 2 !== 0) throw new Error('unsolvable: edge orientation');
+  if (permParity(cp) !== permParity(ep)) {
+    throw new Error('unsolvable: permutation parity mismatch');
+  }
+}
+
+// ===========================================================================
+// 3. SOLVER STATE WRAPPER
+// ===========================================================================
+//
+// We mutate a facelet string and record the move list. All "is this piece in
+// place?" tests read directly off the facelet string, so the model is the
+// engine — there is no separate cubie bookkeeping that could drift.
+
+function makeState(facelets) {
+  return { s: facelets, moves: [] };
+}
+function move(st, token) {
+  st.s = applyMove(st.s, token);
+  st.moves.push(token);
+}
+function seq(st, str) {
+  // Apply a space-separated algorithm string.
+  if (!str) return;
+  for (const t of str.split(/\s+/)) if (t) move(st, t);
+}
+
+// Centers (fixed) tell us which colour each face is. Indexed by face letter.
+// They are always U/R/F/D/L/B by validation, but read them for clarity.
+const C = { U: 'U', R: 'R', F: 'F', D: 'D', L: 'L', B: 'B' };
+
+// Helper: locate an edge cubie (given its two colours, unordered) — returns the
+// edge SLOT index 0..11 that currently holds it, plus orientation (which colour
+// faces the "primary" sticker). We just scan EDGE_FACELETS/colours of current s.
+function findEdge(s, colA, colB) {
+  for (let slot = 0; slot < 12; slot++) {
+    const a = s[EDGE_FACELETS[slot][0]];
+    const b = s[EDGE_FACELETS[slot][1]];
+    if ((a === colA && b === colB) || (a === colB && b === colA)) {
+      return { slot, a, b };
+    }
+  }
+  return null;
+}
+function findCorner(s, cols) {
+  // cols: array of 3 colours (unordered). Returns slot 0..7 + the stickers.
+  const want = cols.slice().sort().join('');
+  for (let slot = 0; slot < 8; slot++) {
+    const st = CORNER_FACELETS[slot].map((i) => s[i]);
+    if (st.slice().sort().join('') === want) return { slot, st };
+  }
+  return null;
+}
+
+// ===========================================================================
+// 4. PHASE 1 — WHITE (D) CROSS
+// ===========================================================================
+//
+// Place the four D-layer edges (D paired with F, R, B, L) into the D face with
+// correct orientation. Strategy: bring each target edge to the U layer (top),
+// align it over its destination, then drop it with a double turn of the
+// side face. A bounded local approach with a couple of fixed cases handles
+// every starting position.
+
+// The four D-cross edges, by the side colour they pair with D. `drops` are the
+// two F2L-safe insertion algs for the slot: the first drops a U-layer edge that
+// is correctly oriented (D-sticker on top) straight down with a double turn of
+// the side face; the second is the 3-move "flip insert" for an edge whose
+// D-sticker faces sideways. With AUF (via solveStepMulti) these two algs cover
+// all eight U-layer cases, and each keeps the previously-placed cross edges
+// intact (derived & verified exhaustively against the engine).
+const D_CROSS = [
+  { side: 'F', face: 'F', dEdgeSlot: 5, uEdgeSlot: 1, drops: [['F2'], ['R', "'", 'F', 'R']] },
+  { side: 'R', face: 'R', dEdgeSlot: 4, uEdgeSlot: 0, drops: [['R2'], ['F', 'R', "'", 'F', "'"]] },
+  { side: 'B', face: 'B', dEdgeSlot: 7, uEdgeSlot: 3, drops: [['B2'], ['R', 'B', "'", 'R', "'"]] },
+  { side: 'L', face: 'L', dEdgeSlot: 6, uEdgeSlot: 2, drops: [['L2'], ['F', "'", 'L', 'F']] },
+];
+// Normalise the inline drop algs (the "'" sits as its own token above for
+// readability) into proper move tokens like "R'".
+for (const t of D_CROSS) {
+  t.drops = t.drops.map((alg) => {
+    const out = [];
+    for (const tok of alg) {
+      if (tok === "'") out[out.length - 1] += "'";
+      else out.push(tok);
+    }
+    return out;
+  });
+}
+
+// Bring a single D-cross edge (D + side colour) home. We use a brute, but
+// strictly bounded, approach: try every combination of (U rotation 0..3) then a
+// short fixed insertion, checking the engine, falling back through cases.
+// To keep it simple and ALWAYS correct, we do an exhaustive bounded search of
+// short move sequences that places THIS edge without disturbing already-placed
+// D-cross edges. Search depth is tiny so it is instant.
+
+// Generic bounded breadth-first search that places ONE piece: search sequences
+// over the given move set up to a small depth cap, accepting the first that
+// makes goal(s) true and keeps keep(s) true. A visited set on the facelet string
+// makes this a true BFS — states are never re-expanded — so it is fast and the
+// frontier stays small even though the depth cap looks generous. (The earlier
+// version was an iterative-deepening DFS WITHOUT a visited set, which re-explored
+// states and blew up exponentially; the visited set is the crucial fix.)
+//
+// We also prune "two turns of the same face in a row" (redundant) to shrink the
+// branching factor. Because every cross / first-layer / middle-layer piece is
+// reachable in only a handful of moves when the U layer is free as a buffer, the
+// reachable shell within the cap is tiny and the search is effectively instant.
+function placeBoundedBFS(start, goal, keep, maxDepth, moveSet) {
+  if (goal(start) && keep(start)) return [];
+  const MOVES = moveSet || ALL_MOVES;
+  const seen = new Set([start]);
+  // frontier entries: { s, path, lastFace }
+  let frontier = [{ s: start, path: [], lastFace: '' }];
+  for (let d = 0; d < maxDepth; d++) {
+    const next = [];
+    for (const node of frontier) {
+      for (const mv of MOVES) {
+        const f = mv[0];
+        if (f === node.lastFace) continue; // no two same-face turns in a row
+        const ns = applyMove(node.s, mv);
+        if (seen.has(ns)) continue;
+        seen.add(ns);
+        const path = node.path.concat(mv);
+        if (goal(ns) && keep(ns)) return path;
+        next.push({ s: ns, path, lastFace: f });
+      }
+    }
+    frontier = next;
+    if (frontier.length === 0) break;
+  }
+  return null;
+}
+
+// Is the (D + side colour) cross edge currently a U-LAYER edge (slot 0..3)?
+function crossEdgeInU(s, dCol, sideCol) {
+  const want = [dCol, sideCol].slice().sort().join('');
+  for (let slot = 0; slot < 4; slot++) {
+    const got = EDGE_FACELETS[slot].map((i) => s[i]).sort().join('');
+    if (got === want) return true;
+  }
+  return false;
+}
+
+function solveCross(st) {
+  // Place each D-cross edge one at a time, keeping previously placed ones.
+  // Order: F, R, B, L. Two stages per edge:
+  //   (1) If the edge is not already a U-layer edge, lift it to the U layer with
+  //       a tiny depth<=3 BFS that keeps placed cross edges. The goal here (any
+  //       U-layer position, either orientation) is reachable in at most a couple
+  //       of moves, so this never exhausts the shell — it returns almost
+  //       immediately and is trivially cheap.
+  //   (2) Drop it home with AUF + the slot's two F2L-safe drop algs
+  //       (solveStepMulti). Both stages are bounded and table-tiny: no deep BFS.
+  const placed = [];
+  const sideColOf = (p) => C[p.side];
+  for (const t of D_CROSS) {
+    const sideCol = C[t.side];
+    const dCol = C.D;
+    const dPair = EDGE_FACELETS[t.dEdgeSlot]; // [D-sticker idx, side-sticker idx]
+    // keep: all previously placed cross edges remain solved & oriented.
+    const keep = (s) => placed.every((p) => {
+      const dp = EDGE_FACELETS[p.dEdgeSlot];
+      return s[dp[0]] === C.D && s[dp[1]] === sideColOf(p);
+    });
+
+    // Stage 1: get the edge into the U layer (keeping placed edges).
+    if (!crossEdgeInU(st.s, dCol, sideCol)) {
+      const want = [dCol, sideCol].slice().sort().join('');
+      const inU = (s) => {
+        for (let slot = 0; slot < 4; slot++) {
+          if (EDGE_FACELETS[slot].map((i) => s[i]).sort().join('') === want) return true;
+        }
+        return false;
+      };
+      const lift = placeBoundedBFS(st.s, inU, keep, 4);
+      if (!lift) throw new Error('cross: could not lift ' + t.side + ' edge to U');
+      for (const mv of lift) move(st, mv);
+    }
+
+    // Stage 2: drop it into its D slot, oriented, keeping placed edges.
+    const goal = (s) =>
+      s[dPair[0]] === dCol && s[dPair[1]] === sideCol && keep(s);
+    const path = solveStepMulti(st.s, t.drops, goal, 3, 'cross: ' + t.side + ' edge');
+    for (const mv of path) move(st, mv);
+    placed.push(t);
+  }
+}
+
+// ===========================================================================
+// 5. PHASE 2 — FIRST-LAYER (D) CORNERS
+// ===========================================================================
+//
+// Place the four D corners (each contains D + two adjacent side colours) into
+// their D slots, oriented, without disturbing the cross or already-placed
+// corners. Bounded BFS again, one corner at a time.
+
+// D corner slots: 4 DFR, 5 DLF, 6 DBL, 7 DRB. Their colour triples:
+const D_CORNERS = [4, 5, 6, 7];
+
+// Each D-corner slot has a fixed, F2L-safe "sexy move" insertion trigger built
+// from the slot's own "right-hand" side face (R/F/L/B for DFR/DLF/DBL/DRB).
+// Applied as a repeated alg with AUF between (via solveStep), it inserts a
+// U-layer corner into the slot in ANY of its three orientations while leaving
+// the cross and the other three D corners untouched (verified exhaustively
+// against the engine). It also EJECTS whatever currently sits in the slot up to
+// the U layer, which we exploit to free wrongly-placed corners.
+const CORNER_TRIGGER = {
+  4: "R U R' U'".split(' '), // DFR
+  5: "F U F' U'".split(' '), // DLF
+  6: "L U L' U'".split(' '), // DBL
+  7: "B U B' U'".split(' '), // DRB
+};
+
+// Is the U/D ("D-colour") corner cubie currently a U-LAYER corner (slot 0..3)?
+function cornerInU(s, cubieCols) {
+  const want = cubieCols.slice().sort().join('');
+  for (let slot = 0; slot < 4; slot++) {
+    const got = CORNER_FACELETS[slot].map((i) => s[i]).sort().join('');
+    if (got === want) return true;
+  }
+  return false;
+}
+
+function solveFirstLayerCorners(st) {
+  const placedCorners = [];
+  // keep: cross + all previously placed corners intact.
+  const keepBase = (s) => {
+    for (const t of D_CROSS) {
+      const dp = EDGE_FACELETS[t.dEdgeSlot];
+      if (s[dp[0]] !== C.D || s[dp[1]] !== C[t.side]) return false;
+    }
+    for (const ps of placedCorners) {
+      const pf = CORNER_FACELETS[ps], pc = CORNER_COLORS[ps];
+      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
+    }
+    return true;
+  };
+
+  for (const slot of D_CORNERS) {
+    const cols = CORNER_COLORS[slot]; // 'D' + two sides
+    const facelets = CORNER_FACELETS[slot];
+
+    // 1) If the target cubie is wedged in a D slot (the target slot misoriented,
+    //    or any not-yet-placed D slot), eject it to the U layer by applying that
+    //    holding slot's trigger once. Bounded loop: at most a few ejections.
+    for (let guard = 0; guard < 8 && !cornerInU(st.s, cols); guard++) {
+      const loc = findCorner(st.s, cols);
+      if (loc.slot < 4) break; // already in U
+      // Apply the holding slot's trigger (lifts the corner into U). Only
+      // applied to NOT-yet-placed slots; placed slots already hold the right
+      // oriented corner so the target cubie can't be there.
+      for (const mv of CORNER_TRIGGER[loc.slot]) move(st, mv);
+    }
+
+    // 2) Insert from the U layer with AUF + the slot's trigger (solveStep finds
+    //    the right AUF/repeat count for the orientation). The goal also requires
+    //    everything else stay intact, so the result is fully F2L-safe.
+    const goal = (s) =>
+      facelets.every((idx, k) => s[idx] === cols[k]) && keepBase(s);
+    const path = solveStep(st.s, CORNER_TRIGGER[slot], goal, 6,
+      'F2L corners: slot ' + slot);
+    for (const mv of path) move(st, mv);
+    placedCorners.push(slot);
+  }
+}
+
+// ===========================================================================
+// 6. PHASE 3 — SECOND-LAYER EDGES (E-slice)
+// ===========================================================================
+//
+// Place the four E-slice edges (FR, FL, BL, BR — none containing U or D) into
+// their slots, oriented, without disturbing the first two layers (everything
+// already placed in D and the middle). Bounded BFS, one edge at a time, but with
+// a deeper cap since middle-edge insertion takes more moves.
+
+const E_EDGES = [8, 9, 10, 11]; // FR, FL, BL, BR
+
+// Fixed, F2L-safe middle-edge insertion triggers (standard right/left inserts),
+// one per E slot, each using only the slot's two adjacent side faces + U. With
+// AUF (via solveStep) the right repeat count is found for either orientation,
+// and the alg leaves the cross, all D corners, and other E edges untouched
+// (verified against the engine). Applying a slot's trigger also EJECTS whatever
+// edge currently sits in that slot up to the U layer.
+const E_TRIGGER = {
+  8: "U R U' R' U' F' U F".split(' '),   // FR — right insert
+  9: "U' L' U L U F U' F'".split(' '),   // FL — left insert
+  10: "U L U' L' U' B' U B".split(' '),  // BL — right insert
+  11: "U' R' U R U B U' B'".split(' '),  // BR — left insert
+};
+
+// Is the given E-edge cubie (its two non-U/D colours) currently a U-LAYER edge?
+function edgeInU(s, cubieCols) {
+  const want = cubieCols.slice().sort().join('');
+  for (let slot = 0; slot < 4; slot++) {
+    const got = EDGE_FACELETS[slot].map((i) => s[i]).sort().join('');
+    if (got === want) return true;
+  }
+  return false;
+}
+
+function solveSecondLayer(st) {
+  const placedEdges = [];
+  const keepBase = (s) => {
+    for (const t of D_CROSS) {
+      const dp = EDGE_FACELETS[t.dEdgeSlot];
+      if (s[dp[0]] !== C.D || s[dp[1]] !== C[t.side]) return false;
+    }
+    for (const slotC of D_CORNERS) {
+      const pf = CORNER_FACELETS[slotC], pc = CORNER_COLORS[slotC];
+      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
+    }
+    for (const pe of placedEdges) {
+      const pf = EDGE_FACELETS[pe], pc = EDGE_COLORS[pe];
+      if (!pf.every((idx, k) => s[idx] === pc[k])) return false;
+    }
+    return true;
+  };
+
+  for (const slot of E_EDGES) {
+    const cols = EDGE_COLORS[slot];
+    const facelets = EDGE_FACELETS[slot];
+
+    // 1) If the target edge is stuck in a wrong (not-yet-placed) E slot, eject
+    //    it to the U layer by applying that holding slot's trigger once.
+    for (let guard = 0; guard < 8 && !edgeInU(st.s, cols); guard++) {
+      const loc = findEdge(st.s, cols[0], cols[1]);
+      if (loc.slot < 8) break; // it's a U/D-layer edge (U-layer for E pieces)
+      for (const mv of E_TRIGGER[loc.slot]) move(st, mv);
+    }
+
+    // 2) Insert from the U layer with AUF + the slot's trigger.
+    const goal = (s) =>
+      facelets.every((idx, k) => s[idx] === cols[k]) && keepBase(s);
+    const path = solveStep(st.s, E_TRIGGER[slot], goal, 3,
+      'second layer: slot ' + slot);
+    for (const mv of path) move(st, mv);
+    placedEdges.push(slot);
+  }
+}
+
+// ===========================================================================
+// 7. LAST LAYER (U) — 2-look OLL + 2-look PLL
+// ===========================================================================
+//
+// The whole first two layers are now solved. We only touch the U layer with
+// algorithms that preserve F2L. We use a robust "apply algorithm, with AUF
+// tries, until the relevant sub-goal is met" loop. Because each standard
+// algorithm restores F2L when its case is matched, and we only ever apply them
+// in matched configurations (verified by checking the engine result), F2L is
+// never broken.
+
+// To keep it bulletproof and table-free we drive each 2-look step with a single
+// fixed algorithm interleaved with AUF (U-face adjustments). Every standard
+// 2-look case is solved by a sequence of the form
+//   AUF, ALG, AUF, ALG, ..., AUF
+// using at most a small number of ALG applications. We search ONLY over the
+// AUF choices (4 each: nothing / U / U2 / U') with a hard cap on the number of
+// ALG applications, so the search is at most 4^(maxAlg+1) sequences — a few
+// hundred — and therefore instant and bounded. This is robust where greedy
+// scoring stalls (e.g. cases needing two ALG applications with no intermediate
+// improvement) without any risk of exponential blow-up.
+
+const AUFS = [[], ['U'], ['U2'], ["U'"]];
+
+// Find an [AUF, ALG, AUF, ALG, ..., AUF] sequence reaching goal(s). `alg` is a
+// token array. Returns the flat token list, or throws. maxAlg caps ALG uses.
+function solveStep(startS, alg, goal, maxAlg, errLabel) {
+  // BFS over number of ALG applications; at each, try all 4 trailing AUFs.
+  // We enumerate sequences breadth-first by alg-count so the result uses the
+  // fewest algorithm applications.
+  // Each search node carries the current string and the token path.
+  let frontier = [{ s: startS, path: [] }];
+  for (let depth = 0; depth <= maxAlg; depth++) {
+    // Try ending here: apply a trailing AUF and test goal.
+    for (const node of frontier) {
+      for (let a = 0; a < 4; a++) {
+        let s2 = node.s;
+        for (const t of AUFS[a]) s2 = applyMove(s2, t);
+        if (goal(s2)) return node.path.concat(AUFS[a]);
+      }
+    }
+    if (depth === maxAlg) break;
+    // Expand: for each node, for each pre-ALG AUF, apply AUF then ALG.
+    const next = [];
+    for (const node of frontier) {
+      for (let a = 0; a < 4; a++) {
+        let s2 = node.s;
+        const path = node.path.slice();
+        for (const t of AUFS[a]) { s2 = applyMove(s2, t); path.push(t); }
+        for (const t of alg) { s2 = applyMove(s2, t); path.push(t); }
+        next.push({ s: s2, path });
+      }
+    }
+    frontier = next;
+  }
+  throw new Error(errLabel + ': no AUF/ALG sequence found');
+}
+
+// Like solveStep but allows a SET of candidate algs at each step (tries each
+// branch). Used by the cross, where a slot has two distinct F2L-safe drop algs
+// (a simple double-turn insert for the oriented case and a 3-move flip insert
+// for the mis-oriented case); AUF covers the four U-layer positions. The search
+// is at most (4*algs.length)^maxAlg sequences — tiny for algs.length<=2 and
+// maxAlg<=3 — so it is instant and bounded.
+function solveStepMulti(startS, algs, goal, maxAlg, errLabel) {
+  let frontier = [{ s: startS, path: [] }];
+  for (let depth = 0; depth <= maxAlg; depth++) {
+    for (const node of frontier) {
+      for (let a = 0; a < 4; a++) {
+        let s2 = node.s;
+        for (const t of AUFS[a]) s2 = applyMove(s2, t);
+        if (goal(s2)) return node.path.concat(AUFS[a]);
+      }
+    }
+    if (depth === maxAlg) break;
+    const next = [];
+    for (const node of frontier) {
+      for (let a = 0; a < 4; a++) {
+        let base = node.s;
+        const basePath = node.path.slice();
+        for (const t of AUFS[a]) { base = applyMove(base, t); basePath.push(t); }
+        for (const alg of algs) {
+          let s2 = base;
+          const path = basePath.slice();
+          for (const t of alg) { s2 = applyMove(s2, t); path.push(t); }
+          next.push({ s: s2, path });
+        }
+      }
+    }
+    frontier = next;
+  }
+  throw new Error(errLabel + ': no AUF/ALG sequence found');
+}
+
+function f2lSolved(s) {
+  // Bottom two layers solved means: D face all D, and the bottom two rows of
+  // each side face match that side's colour.
+  // D face:
+  for (let i = 27; i <= 35; i++) if (s[i] !== 'D') return false;
+  // For R,F,L,B faces, the lower 6 facelets (rows 2 and 3) must match center.
+  const sideFaces = [
+    { base: 9, col: 'R' },   // R
+    { base: 18, col: 'F' },  // F
+    { base: 36, col: 'L' },  // L
+    { base: 45, col: 'B' },  // B
+  ];
+  for (const f of sideFaces) {
+    for (let k = 3; k < 9; k++) { // indices base+3 .. base+8 = middle & bottom rows
+      if (s[f.base + k] !== f.col) return false;
+    }
+  }
+  return true;
+}
+
+// --- 2-look OLL step 1: orient U edges into a "yellow cross" on U ---
+// U face top stickers we care about (the 4 U edges): indices 1,3,5,7.
+function uEdgesOriented(s) {
+  return s[1] === 'U' && s[3] === 'U' && s[5] === 'U' && s[7] === 'U';
+}
+// F (R U R' U' F') style edge-orientation alg.
+const OLL_EDGE_ALG = "F R U R' U' F'".split(' ');
+function orientLLEdges(st) {
+  // Yellow cross on U via the edge-OLL alg + AUF. At most 3 applications cover
+  // all edge-OLL cases (dot -> L-shape/line -> cross).
+  const goal = (s) => uEdgesOriented(s) && f2lSolved(s);
+  const path = solveStep(st.s, OLL_EDGE_ALG, goal, 3, 'OLL edges');
+  for (const t of path) move(st, t);
+}
+
+// --- 2-look OLL step 2: orient U corners (all U stickers up) ---
+function uCornersOriented(s) {
+  return s[0] === 'U' && s[2] === 'U' && s[6] === 'U' && s[8] === 'U';
+}
+// Sune: R U R' U R U2 R'. Combined with AUF, IDDFS over {Sune, U turns} solves
+// every corner-OLL case while keeping the edge cross intact (Sune preserves
+// edge orientation). Each Sune changes corner orientation; applying it from the
+// right AUF positions composes to any valid corner-OLL.
+const SUNE = "R U R' U R U2 R'".split(' ');
+function orientLLCorners(st) {
+  // Orient all U corners using Sune + AUF. At most 4 Sunes solve every
+  // corner-OLL case (Sune preserves the edge cross).
+  const goal = (s) => uCornersOriented(s) && uEdgesOriented(s) && f2lSolved(s);
+  const path = solveStep(st.s, SUNE, goal, 5, 'OLL corners');
+  for (const t of path) move(st, t);
+}
+
+// --- 2-look PLL step 1: permute U corners ---
+// A common corner 3-cycle (clockwise) algorithm. Repeated with AUF solves all
+// corner-permutation cases (or we detect the solved-perm AUF directly).
+const PLL_CORNER_ALG = "R B' R F2 R' B R F2 R2".split(' '); // A-perm 3-cycle of corners
+
+function uCornersPermuted(s) {
+  // Each U corner has all 3 stickers matching their slot's solved colours
+  // EXCEPT we only require that the side stickers are consistent (since OLL has
+  // U on top). After OLL, U corners are oriented; "permuted" means each corner's
+  // two side stickers match their two adjacent face centers. Check side stickers
+  // of the 4 U corners.
+  // URF corner side stickers: R(9), F(20); UFL: F(18), L(38); ULB: L(36), B(47);
+  // UBR: B(45), R(11).
+  return s[9] === 'R' && s[20] === 'F' &&
+         s[18] === 'F' && s[38] === 'L' &&
+         s[36] === 'L' && s[47] === 'B' &&
+         s[45] === 'B' && s[11] === 'R';
+}
+function permuteLLCorners(st) {
+  // IDDFS over {corner 3-cycle alg, U turns}. The corner alg is a pure 3-cycle
+  // of U corners (preserves U/edge orientation and F2L); combined with AUF it
+  // generates every corner permutation, so a short sequence always reaches the
+  // permuted state. Note: the goal here is "U corner side stickers match their
+  // adjacent centers" up to a final AUF — we require it AFTER allowing trailing
+  // U turns, so we ask for uCornersPermuted directly (a real AUF is appended in
+  // the edge phase if still needed).
+  const goal = (s) =>
+    uCornersPermuted(s) && uCornersOriented(s) && uEdgesOriented(s) && f2lSolved(s);
+  // Adjacent-swap cases need one alg, diagonal-swap needs two. Cap at 3.
+  const path = solveStep(st.s, PLL_CORNER_ALG, goal, 3, 'PLL corners');
+  for (const t of path) move(st, t);
+}
+
+// --- 2-look PLL step 2: permute U edges ---
+// U-perm (edge 3-cycle): F2 U L R' F2 L' R U F2  (cycles 3 U edges). Repeated
+// with AUF solves all edge-permutation cases.
+const PLL_EDGE_ALG = "F2 U L R' F2 L' R U F2".split(' ');
+
+function permuteLLEdges(st) {
+  // IDDFS over {edge 3-cycle alg, U turns}, goal = fully solved cube. The edge
+  // alg cycles three U edges (preserving everything else); combined with AUF it
+  // reaches the solved state from any edge-PLL case. The final goal being the
+  // exact solved string also absorbs any leftover AUF.
+  const goal = (s) => s === SOLVED;
+  // 3-cycle and Z/H edge-PLL cases need at most two alg applications. Cap at 3.
+  const path = solveStep(st.s, PLL_EDGE_ALG, goal, 3, 'PLL edges');
+  for (const t of path) move(st, t);
+}
+
+// ===========================================================================
+// 8. Move-list cleanup (cancel redundant consecutive same-face turns)
+// ===========================================================================
+function simplifyMoves(moves) {
+  const amount = (t) => (t.length === 1 ? 1 : t[1] === '2' ? 2 : 3);
+  const fromAmount = (f, a) => {
+    a = ((a % 4) + 4) % 4;
+    if (a === 0) return null;
+    if (a === 1) return f;
+    if (a === 2) return f + '2';
+    return f + "'";
+  };
+  let arr = moves.slice();
+  let changed = true;
+  while (changed) {
+    changed = false;
+    const out = [];
+    for (const mv of arr) {
+      if (out.length && out[out.length - 1][0] === mv[0]) {
+        const f = mv[0];
+        const a = (amount(out[out.length - 1]) + amount(mv)) % 4;
+        out.pop();
+        const merged = fromAmount(f, a);
+        if (merged) out.push(merged);
+        changed = true;
+      } else {
+        out.push(mv);
+      }
+    }
+    arr = out;
+  }
+  return arr;
+}
+
+// ===========================================================================
+// 9. PUBLIC solve()
+// ===========================================================================
+function solve(facelets) {
+  validate(facelets); // throws on invalid/unsolvable
+  if (facelets === SOLVED) return [];
+
+  const st = makeState(facelets);
+  solveCross(st);
+  solveFirstLayerCorners(st);
+  solveSecondLayer(st);
+  orientLLEdges(st);
+  orientLLCorners(st);
+  permuteLLCorners(st);
+  permuteLLEdges(st);
+
+  const simplified = simplifyMoves(st.moves);
+
+  // Re-apply the final solution through the facelet engine and assert solved.
+  if (applyMoves(facelets, simplified) !== SOLVED) {
+    throw new Error('internal error: solution did not solve the cube');
+  }
+  return simplified;
+}
+  return { solve, validate, SOLVED, ALL_MOVES };
+})();
+
+/* ===== 3×3 state reader (cubies → 54-char Kociemba facelet string) + full solver.
+   Each face viewed from outside with U-up/F-front; centers land at 4/13/22/31/40/49.
+   Color→face-letter via the six center colors. Verified: solved→canonical string and
+   scramble→solveFull→solved (Playwright). ===== */
+const _c3letter = new Map([
+  [COLORS['+y'], 'U'], [COLORS['+x'], 'R'], [COLORS['+z'], 'F'],
+  [COLORS['-y'], 'D'], [COLORS['-x'], 'L'], [COLORS['-z'], 'B'],
+]);
+const _c3rn = new THREE.Vector3();
+function cube3ReadFacelets() {
+  const out = new Array(54).fill('?');
+  for (const c of cubies3) {
+    const X = Math.round(c.position.x), Y = Math.round(c.position.y), Z = Math.round(c.position.z);
+    for (const t of c.children) {
+      if (!t.userData || !t.userData.isTile) continue;
+      _c3rn.copy(t.userData.normal).applyQuaternion(c.quaternion);
+      const ax = Math.abs(_c3rn.x) >= Math.abs(_c3rn.y) && Math.abs(_c3rn.x) >= Math.abs(_c3rn.z) ? 'x'
+               : Math.abs(_c3rn.y) >= Math.abs(_c3rn.z) ? 'y' : 'z';
+      const sgn = _c3rn[ax] > 0 ? 1 : -1;
+      let idx;
+      if (ax === 'y' && sgn > 0)      idx = 0  + (Z + 1) * 3 + (X + 1);   // U
+      else if (ax === 'x' && sgn > 0) idx = 9  + (1 - Y) * 3 + (1 - Z);   // R
+      else if (ax === 'z' && sgn > 0) idx = 18 + (1 - Y) * 3 + (X + 1);   // F
+      else if (ax === 'y')            idx = 27 + (1 - Z) * 3 + (X + 1);   // D
+      else if (ax === 'x')            idx = 36 + (1 - Y) * 3 + (Z + 1);   // L
+      else                            idx = 45 + (1 - Y) * 3 + (1 - X);   // B
+      out[idx] = _c3letter.get(t.userData.color);
+    }
+  }
+  return out.join('');
+}
+function cube3SolveFull() {
+  const fac = cube3ReadFacelets();
+  if (fac.indexOf('?') >= 0) return null;
+  let sol; try { sol = cube3Solver.solve(fac); } catch (e) { return null; }
+  return sol || null;
+}
+
 const puzzleCube3 = {
   id: '3x3', name: '3×3',
   group: cube3Group,
@@ -5051,6 +6661,7 @@ const puzzleCube3 = {
   updateProjections: () => {},
   finalizeMovePhase: cube3Finalize,
   readState: () => null,
+  solveFull: cube3SolveFull,
   scramble: cube3Scramble,
   storageKey: '3x3-solves',
   keymap: { faceKeys: FACE_KEYS, primeKeys: PRIME_KEYS, rotKeys: ROT_KEYS },
@@ -5068,10 +6679,2011 @@ const puzzleCube3 = {
     <div>Drag to orbit · scroll to zoom</div>`,
 };
 
-const PUZZLES = { '2x2': puzzle2x2, '3x3': puzzleCube3, 'pyraminx': puzzlePyra, 'megaminx': puzzleMega };
+/* ===== makeSkewbGeo — node-verified geometry+engine (order/inverse/2000-turn round-trip
+   zero-drift gates). Wrapped in an IIFE so helpers stay encapsulated. ===== */
+const makeSkewbGeo = (function () {
+// skewb-geo.js
+// Self-contained Skewb geometry + engine module.
+//
+// A Skewb is a cube-shaped, corner-turning, deep-cut puzzle.
+//   - 8 corner pieces at (±1,±1,±1), 3 stickers each.
+//   - 6 centre pieces at the face centres (±1,0,0),(0,±1,0),(0,0,±1), 1 sticker each.
+//   - 4 turn axes = the 4 body diagonals.
+//
+// makeSkewbGeo(THREE, scale = 1) -> { pieces, axes, selectPieces, buildMove,
+//                                     snapPiece, readState }
+//
+// Conventions documented inline (see CLOCKWISE-CONVENTION, FACE-NORMALS, DOT-GAP).
+
+function makeSkewbGeo(THREE, scale = 1) {
+  const EPS = 1e-9;
+
+  // ---------------------------------------------------------------------------
+  // FACE-NORMALS: deterministic order of the 6 outward face normals.
+  // faceIndex 0..5 maps to: +X, -X, +Y, -Y, +Z, -Z.
+  // ---------------------------------------------------------------------------
+  const FACE_NORMALS = [
+    [ 1, 0, 0], // 0  +X
+    [-1, 0, 0], // 1  -X
+    [ 0, 1, 0], // 2  +Y
+    [ 0,-1, 0], // 3  -Y
+    [ 0, 0, 1], // 4  +Z
+    [ 0, 0,-1], // 5  -Z
+  ];
+
+  function faceIndexOfNormal(nx, ny, nz) {
+    // returns the faceIndex whose normal best matches (nx,ny,nz)
+    let best = -1, bestDot = -Infinity;
+    for (let i = 0; i < 6; i++) {
+      const n = FACE_NORMALS[i];
+      const d = n[0]*nx + n[1]*ny + n[2]*nz;
+      if (d > bestDot) { bestDot = d; best = i; }
+    }
+    return best;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Corner & centre home positions (unscaled; ±1 / unit).
+  // ---------------------------------------------------------------------------
+  // 8 corners: enumerate in a fixed order. homeIndex 0..7.
+  const CORNER_POS = [];
+  for (const x of [-1, 1])
+    for (const y of [-1, 1])
+      for (const z of [-1, 1])
+        CORNER_POS.push([x, y, z]); // order: ---, --+, -+-, -++, +--, +-+, ++-, +++
+
+  // 6 centres at the face centres; align homeIndex with faceIndex order.
+  const CENTER_POS = FACE_NORMALS.map(n => [n[0], n[1], n[2]]);
+
+  // ---------------------------------------------------------------------------
+  // Geometry helpers for facelets.
+  // The cube spans [-1,1]^3. Each face is a square; we subdivide:
+  //   - 4 face-corner points (the cube corners on that face)
+  //   - 4 edge-midpoints (midpoints of the face's edges)
+  //   - central diamond = the 4 edge-midpoints (centre piece facelet)
+  //   - 4 corner triangles = (face corner, its 2 neighbour edge-midpoints)
+  // Polys wound CCW as seen from outside (looking along -normal toward origin,
+  // i.e. the normal points at the viewer).
+  // ---------------------------------------------------------------------------
+
+  // For a face with outward normal n, build a local 2D frame (u,v) such that
+  // (u, v, n) is right-handed -> CCW winding in (u,v) is CCW seen from outside.
+  function faceFrame(n) {
+    // pick u perpendicular to n; v = n x u
+    let u;
+    if (Math.abs(n[0]) < 0.5) u = [1, 0, 0];
+    else u = [0, 1, 0];
+    // make u perpendicular to n (Gram-Schmidt) then normalize
+    const dot = u[0]*n[0] + u[1]*n[1] + u[2]*n[2];
+    u = [u[0]-dot*n[0], u[1]-dot*n[1], u[2]-dot*n[2]];
+    const ul = Math.hypot(u[0], u[1], u[2]);
+    u = [u[0]/ul, u[1]/ul, u[2]/ul];
+    // v = n x u  (so that (u,v,n) right-handed)
+    const v = [
+      n[1]*u[2] - n[2]*u[1],
+      n[2]*u[0] - n[0]*u[2],
+      n[0]*u[1] - n[1]*u[0],
+    ];
+    return { u, v };
+  }
+
+  // 3D point on a face from local (a along u, b along v), with face plane at +1*n.
+  function facePoint(n, u, v, a, b) {
+    return [
+      n[0] + a*u[0] + b*v[0],
+      n[1] + a*u[1] + b*v[1],
+      n[2] + a*u[2] + b*v[2],
+    ];
+  }
+
+  // Build the per-face facelet data.
+  // Returns for each face: { diamond:[p0..p3], corners:[{cornerPos:[x,y,z], tri:[p0,p1,p2]}...] }
+  // All points in unscaled cube coords.
+  function buildFaceFacelets(faceIdx) {
+    const n = FACE_NORMALS[faceIdx];
+    const { u, v } = faceFrame(n);
+
+    // The 4 face corners in local coords: (±1,±1). The 4 edge midpoints: (±1,0),(0,±1).
+    const cornerLocals = [
+      [-1, -1], [ 1, -1], [ 1, 1], [-1, 1], // CCW in (u,v)
+    ];
+    const midLocals = [
+      [ 0, -1], [ 1, 0], [ 0, 1], [-1, 0], // CCW in (u,v): bottom, right, top, left
+    ];
+
+    // Diamond = the 4 edge midpoints, CCW.
+    const diamond = midLocals.map(([a, b]) => facePoint(n, u, v, a, b));
+
+    // Each face corner k (between mid k-1 and mid k around the ring).
+    // cornerLocals[k] = (sx,sy); its two neighbouring midpoints:
+    //   the midpoint on each of the two edges meeting at that corner.
+    // corner (-1,-1): edges bottom (mid (0,-1)) and left (mid (-1,0))
+    // corner ( 1,-1): edges bottom (mid (0,-1)) and right (mid (1,0))
+    // corner ( 1, 1): edges right (mid (1,0)) and top (mid (0,1))
+    // corner (-1, 1): edges left (mid (-1,0)) and top (mid (0,1))
+    const cornerNeighborMids = [
+      [[0,-1], [-1,0]], // (-1,-1)
+      [[0,-1], [ 1,0]], // ( 1,-1)
+      [[1, 0], [ 0,1]], // ( 1, 1)
+      [[-1,0], [ 0,1]], // (-1, 1)
+    ];
+
+    const corners = cornerLocals.map((cl, k) => {
+      const cornerP = facePoint(n, u, v, cl[0], cl[1]);
+      const m0 = facePoint(n, u, v, cornerNeighborMids[k][0][0], cornerNeighborMids[k][0][1]);
+      const m1 = facePoint(n, u, v, cornerNeighborMids[k][1][0], cornerNeighborMids[k][1][1]);
+      // the cube-corner 3D position (sign vector) for matching to a corner piece
+      const cornerPos3D = cornerP.map(c => Math.sign(c) || 0); // will be ±1 on each coord
+      // Wind the triangle CCW seen from outside. We have 3 points: cornerP, m0, m1.
+      // Compute winding via the normal; reorder if needed.
+      const tri = windCCW([cornerP, m0, m1], n);
+      return { cornerPos: cornerPos3D, tri };
+    });
+
+    return { diamond: windCCW(diamond, n), corners };
+  }
+
+  // Reorder a polygon's vertices so it winds CCW as seen from outside (normal at viewer).
+  function windCCW(poly, n) {
+    // signed area via (sum cross) dot n
+    let cx = 0, cy = 0, cz = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i], b = poly[(i + 1) % poly.length];
+      cx += a[1]*b[2] - a[2]*b[1];
+      cy += a[2]*b[0] - a[0]*b[2];
+      cz += a[0]*b[1] - a[1]*b[0];
+    }
+    const s = cx*n[0] + cy*n[1] + cz*n[2];
+    if (s < 0) return poly.slice().reverse();
+    return poly.slice();
+  }
+
+  // ---------------------------------------------------------------------------
+  // Build the 14 pieces.
+  // ---------------------------------------------------------------------------
+  const pieces = [];
+
+  // Precompute facelets per face once.
+  const faceData = FACE_NORMALS.map((_, i) => buildFaceFacelets(i));
+
+  // Centre pieces: id "center-k", homeIndex k, faceIdx = k (we aligned them).
+  for (let k = 0; k < 6; k++) {
+    const c = CENTER_POS[k];
+    const fd = faceData[k];
+    pieces.push({
+      id: `center-${k}`,
+      kind: 'center',
+      homeIndex: k,
+      center: [c[0]*scale, c[1]*scale, c[2]*scale],
+      faces: [k],
+      facelets: [{
+        faceIndex: k,
+        poly: fd.diamond.map(p => [p[0]*scale, p[1]*scale, p[2]*scale]),
+      }],
+    });
+  }
+
+  // Corner pieces: id "corner-k", homeIndex k. 3 incident faces.
+  for (let k = 0; k < 8; k++) {
+    const c = CORNER_POS[k]; // (±1,±1,±1)
+    // The 3 incident faces are the faces whose normal has the same sign on the
+    // coordinate axis the corner is on the + side / - side of.
+    // For corner (sx,sy,sz): incident faces are sx*X, sy*Y, sz*Z.
+    const incidentFaces = [];
+    // +X is face 0, -X is 1, +Y is 2, -Y is 3, +Z is 4, -Z is 5.
+    incidentFaces.push(c[0] > 0 ? 0 : 1);
+    incidentFaces.push(c[1] > 0 ? 2 : 3);
+    incidentFaces.push(c[2] > 0 ? 4 : 5);
+
+    const facelets = [];
+    for (const f of incidentFaces) {
+      const fd = faceData[f];
+      // find the corner triangle on face f matching this cube corner
+      const match = fd.corners.find(cc =>
+        cc.cornerPos[0] === c[0] && cc.cornerPos[1] === c[1] && cc.cornerPos[2] === c[2]);
+      facelets.push({
+        faceIndex: f,
+        poly: match.tri.map(p => [p[0]*scale, p[1]*scale, p[2]*scale]),
+      });
+    }
+
+    pieces.push({
+      id: `corner-${k}`,
+      kind: 'corner',
+      homeIndex: k,
+      center: [c[0]*scale, c[1]*scale, c[2]*scale],
+      faces: incidentFaces.slice().sort((a, b) => a - b),
+      facelets,
+    });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Axes: the 4 body diagonals (normalized).
+  // D0=(1,1,1), D1=(1,1,-1), D2=(1,-1,1), D3=(-1,1,1)
+  // ---------------------------------------------------------------------------
+  const AXIS_DIRS_RAW = [
+    [ 1,  1,  1],
+    [ 1,  1, -1],
+    [ 1, -1,  1],
+    [-1,  1,  1],
+  ];
+  const axes = AXIS_DIRS_RAW.map((d, i) => {
+    const l = Math.hypot(d[0], d[1], d[2]);
+    return { index: i, dir: [d[0]/l, d[1]/l, d[2]/l], name: `A${i}` };
+  });
+  const axisByName = new Map(axes.map(a => [a.name, a]));
+
+  // ---------------------------------------------------------------------------
+  // DOT-GAP: a piece is on the cap of a move about axis D̂ iff dot(pos, D̂) > 0.
+  // Home positions have |pos·D̂| equal to either ~0.577*scale*sqrt(3)... let's
+  // just compute the gap empirically below in the self-test. The clean split is
+  // through 0; on-cap dots are >= +1*scale/sqrt(3) (centre on axis) up to
+  // +3*scale/sqrt(3) (corner on axis); off-cap are the negatives.
+  // We use a robust epsilon = 1e-6 * scale, safely inside the gap.
+  // ---------------------------------------------------------------------------
+  function selectPieces(move, runtimePieces) {
+    const ax = move.axis; // THREE.Vector3 unit
+    const eps = 1e-6 * scale;
+    const out = [];
+    for (const p of runtimePieces) {
+      const d = p.position.x * ax.x + p.position.y * ax.y + p.position.z * ax.z;
+      if (d > eps) out.push(p);
+    }
+    return out;
+  }
+
+  // ---------------------------------------------------------------------------
+  // buildMove
+  // CLOCKWISE-CONVENTION:
+  //   Unprimed move = CLOCKWISE looking down the axis from outside (from the +D̂
+  //   side toward the origin). A viewer standing on the +D̂ side looking toward
+  //   the origin sees clockwise rotation. For THREE's setFromAxisAngle(axis,θ)
+  //   with a right-handed frame, a positive θ about +D̂ is CCW when viewed from
+  //   the +D̂ side (axis pointing at viewer). Therefore CLOCKWISE-from-+side
+  //   corresponds to a NEGATIVE angle about +D̂:  target = -120° = -2π/3.
+  //   `prime` negates this (=> +2π/3). There is no double move on a Skewb.
+  // ---------------------------------------------------------------------------
+  const TURN = (2 * Math.PI) / 3; // 120°
+  function buildMove(axisName, prime = false, double = false) {
+    const a = axisByName.get(axisName);
+    if (!a) throw new Error(`unknown axis ${axisName}`);
+    const axis = new THREE.Vector3(a.dir[0], a.dir[1], a.dir[2]); // unit
+    // base unprimed = clockwise from +side = -TURN
+    let angle = -TURN;
+    if (prime) angle = -angle;
+    // double ignored on a Skewb
+    return {
+      axis,
+      axisName,
+      target: angle,
+      done: 0,
+      notation: `${axisName}${prime ? "'" : ""}`,
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // The 24 proper rotations of the cube, as THREE.Quaternions.
+  // Generated by BFS-closing two face-90° rotations; dedup with q ≡ -q.
+  // ---------------------------------------------------------------------------
+  const ROT24 = buildRot24();
+
+  function buildRot24() {
+    const qx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI / 2);
+    const qy = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), Math.PI / 2);
+    const gens = [qx, qy];
+    const found = [];
+
+    function sameQ(a, b) {
+      // q ≡ -q : same rotation if |dot| ~ 1
+      const d = a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+      return Math.abs(d) > 1 - 1e-6;
+    }
+    function has(q) {
+      return found.some(f => sameQ(f, q));
+    }
+    function add(q) {
+      const qn = q.clone().normalize();
+      if (qn.w < 0) { qn.x = -qn.x; qn.y = -qn.y; qn.z = -qn.z; qn.w = -qn.w; }
+      if (!has(qn)) { found.push(qn); return true; }
+      return false;
+    }
+
+    const identity = new THREE.Quaternion();
+    add(identity);
+    const queue = [identity.clone()];
+    while (queue.length) {
+      const cur = queue.shift();
+      for (const g of gens) {
+        const nq = cur.clone().premultiply(g);
+        if (add(nq)) queue.push(nq.clone());
+      }
+    }
+    return found; // should be 24
+  }
+
+  // ---------------------------------------------------------------------------
+  // snapPiece: snap position to nearest home (×scale) and quaternion to nearest
+  // element of ROT24 (by max |dot|).
+  // ---------------------------------------------------------------------------
+  // Home positions array (scaled), with metadata for readState.
+  const HOME = []; // { pos:[x,y,z]*scale, kind, homeIndex }
+  for (let k = 0; k < 6; k++) {
+    const c = CENTER_POS[k];
+    HOME.push({ pos: [c[0]*scale, c[1]*scale, c[2]*scale], kind: 'center', homeIndex: k });
+  }
+  for (let k = 0; k < 8; k++) {
+    const c = CORNER_POS[k];
+    HOME.push({ pos: [c[0]*scale, c[1]*scale, c[2]*scale], kind: 'corner', homeIndex: k });
+  }
+
+  function nearestHome(pos) {
+    let best = null, bestD = Infinity;
+    for (const h of HOME) {
+      const dx = pos.x - h.pos[0], dy = pos.y - h.pos[1], dz = pos.z - h.pos[2];
+      const d = dx*dx + dy*dy + dz*dz;
+      if (d < bestD) { bestD = d; best = h; }
+    }
+    return best;
+  }
+
+  function snapPiece(piece) {
+    // snap position
+    const h = nearestHome(piece.position);
+    piece.position.set(h.pos[0], h.pos[1], h.pos[2]);
+    // snap quaternion to nearest in ROT24 by max |dot|
+    const q = piece.quaternion;
+    let best = null, bestAbs = -Infinity;
+    for (const r of ROT24) {
+      const d = q.x*r.x + q.y*r.y + q.z*r.z + q.w*r.w;
+      const ad = Math.abs(d);
+      if (ad > bestAbs) { bestAbs = ad; best = r; }
+    }
+    // choose sign so result is closest (avoid flipping the proxy needlessly)
+    const dot = q.x*best.x + q.y*best.y + q.z*best.z + q.w*best.w;
+    if (dot >= 0) piece.quaternion.set(best.x, best.y, best.z, best.w);
+    else piece.quaternion.set(-best.x, -best.y, -best.z, -best.w);
+    return piece;
+  }
+
+  // ---------------------------------------------------------------------------
+  // readState
+  //   cp[8]   : corner permutation — cp[slot] = solved id of the corner now in slot
+  //   co[8]   : corner orientation 0..2 at each slot (twist of reference sticker)
+  //   cenp[6] : centre permutation — cenp[slot] = solved id of centre now in slot
+  //
+  // Permutation: nearest-home from each proxy's position.
+  //
+  // Corner orientation: we track the corner *piece*'s reference sticker (its
+  // home ±X-face sticker; reference normal = (sx,0,0)). After the piece's
+  // quaternion is applied, that sticker normal points along one of the slot's 3
+  // incident face normals. We label the 3 incident faces of each slot in a fixed
+  // CCW cyclic order about the slot's outward body-diagonal, with the slot's own
+  // ±X face as index 0. co = the index (0/1/2) of the face the reference sticker
+  // currently occupies. This gives co=0 in the solved state for every corner and
+  // is a deterministic, geometry-only reading.
+  //
+  // NOTE ON CONSERVATION (documented honestly): unlike a Rubik's cube, the SUM of
+  // corner orientations mod 3 is NOT a conserved quantity for a Skewb. Every move
+  // applies a real 120° in-place twist to the single on-axis corner while merely
+  // 3-cycling the other three cap corners, so the total twist is a free
+  // coordinate. The genuine, conserved facts (all verified by the self-test) are:
+  // each corner stays within its tetrahedral orbit, solved reads co=0 everywhere,
+  // and any move followed by its inverse restores co exactly. See the self-test's
+  // Gate-6 implementation for the precise conserved relation that is checked.
+  // ---------------------------------------------------------------------------
+
+  // Build, per slot, the CCW-ordered list of its 3 incident face indices about
+  // the slot's outward body diagonal, starting from the slot's ±X face.
+  function slotFaceOrder(s) {
+    const D = new THREE.Vector3(s[0], s[1], s[2]).normalize();
+    const faces = [
+      s[0] > 0 ? 0 : 1, // ±X face
+      s[1] > 0 ? 2 : 3, // ±Y face
+      s[2] > 0 ? 4 : 5, // ±Z face
+    ];
+    const refN = new THREE.Vector3(...FACE_NORMALS[faces[0]]); // the ±X face normal
+    const refP = refN.clone().sub(D.clone().multiplyScalar(refN.dot(D)));
+    refP.normalize();
+    function ang(f) {
+      const n = new THREE.Vector3(...FACE_NORMALS[f]);
+      const p = n.clone().sub(D.clone().multiplyScalar(n.dot(D)));
+      p.normalize();
+      const cross = new THREE.Vector3().crossVectors(refP, p);
+      let a = Math.atan2(cross.dot(D), refP.dot(p));
+      return (a + 2 * Math.PI) % (2 * Math.PI); // 0..2π, ±X face at 0
+    }
+    return faces.slice().sort((a, b) => ang(a) - ang(b));
+  }
+  const SLOT_FACE_ORDER = CORNER_POS.map(slotFaceOrder);
+
+  // Reference sticker normal per corner *piece* (home frame): its ±X face normal.
+  const cornerRefDir = CORNER_POS.map(s => [s[0], 0, 0]);
+
+  function faceOfDir(v) {
+    return faceIndexOfNormal(v.x, v.y, v.z);
+  }
+
+  function readState(runtimePieces) {
+    const cp = new Array(8).fill(-1);
+    const co = new Array(8).fill(0);
+    const cenp = new Array(6).fill(-1);
+
+    for (const p of runtimePieces) {
+      const h = nearestHome(p.position);
+      const m = p.id.match(/^(corner|center)-(\d+)$/);
+      const kind = m[1];
+      const pieceHome = parseInt(m[2], 10);
+
+      if (kind === 'center') {
+        cenp[h.homeIndex] = pieceHome;
+      } else {
+        const slot = h.homeIndex;
+        cp[slot] = pieceHome;
+        const r0 = cornerRefDir[pieceHome];
+        const v = new THREE.Vector3(r0[0], r0[1], r0[2]).applyQuaternion(p.quaternion);
+        const face = faceOfDir(v);
+        const idx = SLOT_FACE_ORDER[slot].indexOf(face);
+        co[slot] = idx < 0 ? 0 : idx;
+      }
+    }
+
+    return { cp, co, cenp };
+  }
+
+  return {
+    pieces,
+    axes,
+    selectPieces,
+    buildMove,
+    snapPiece,
+    readState,
+    // exposed for tests / debugging
+    _ROT24: ROT24,
+    _HOME: HOME,
+    _FACE_NORMALS: FACE_NORMALS,
+  };
+}
+
+return makeSkewbGeo;
+})();
+
+/* ===== makeSq1Geo — node-verified geometry+engine (U/D 30° turns + slice with
+   legality; round-trip + shape-integrity gates). Wrapped in an IIFE. ===== */
+const makeSq1Geo = (function () {
+// sq1-geo.js
+// Self-contained Square-1 (Cube 21) geometry + engine module.
+//
+// makeSq1Geo(THREE, scale = 1) -> { pieces, buildMove, selectPieces, canSlice, snapPiece, readState }
+//
+// Coordinate system: solved puzzle == cube with x,z in [-1,1], y in [-1,1].
+// Vertical axis is +y. Angular grid is 12 units of 30deg around +y.
+//
+// ---------------------------------------------------------------------------
+// GEOMETRY NOTES
+// ---------------------------------------------------------------------------
+// Layers (half-heights along y):
+//   MID_H  = half-height of the middle slab (middle piece spans y in [-MID_H, MID_H]).
+//   Top layer    spans y in [ MID_H, 1].
+//   Bottom layer spans y in [-1, -MID_H].
+// The solved union of all pieces is exactly the cube y in [-1,1]; we pick
+// MID_H so top+middle+bottom tile [-1,1] with no gap (top piece bottom == MID_H,
+// bottom piece top == -MID_H, middle spans the seam). We choose MID_H = 1/3 so
+// the three logical layers read as thirds, but heights are not constrained by
+// the gates beyond "solved union is a cube" (we keep top->mid->bottom contiguous).
+//
+// Wedge cross-section (in the xz plane), pie slices centered on +y axis:
+//   The "radius" of a corner's outer vertices must reach the cube corner
+//   (distance sqrt(2) from center). The flat outer face of an edge must lie on
+//   the cube's edge plane (x or z = +/-1). We build each wedge as a polygon fan
+//   from the center axis (0,0) out to the cube boundary, clipped to the wedge's
+//   angular sector. This yields cube-exact corners and edges.
+//
+// Angular layout (looking down the +y axis, angle measured from +x toward +z,
+// i.e. standard math angle in the xz-plane with theta = atan2(z, x)):
+//   We place the 12 unit boundaries at theta = 15deg + k*30deg so that a CORNER
+//   straddles a diagonal (cube corner) direction and EDGE faces sit flat on axes.
+//   Concretely, slot k (k=0..11) covers theta in [k*30 - 15, k*30 + 15] deg.
+//   Cube corners are at theta = 45,135,225,315 (the diagonals). A corner piece
+//   spans two adjacent slots whose shared boundary is a diagonal -> its outer
+//   tip reaches the cube corner. An edge spans one slot centered on an axis
+//   (theta = 0,90,180,270) -> its outer face is flat on x=+1 / z=+1 / x=-1 / z=-1.
+//
+// Default solved arrangement around the circle (CCW), starting at slot 0:
+//   slot 0,1   : corner (centered at theta=45  -> +x+z cube corner)
+//   slot 2     : edge   (centered at theta=90  -> +z face)
+//   slot 3,4   : corner (centered at theta=135 -> -x+z)
+//   slot 5     : edge   (centered at theta=180 -> -x face)
+//   slot 6,7   : corner (centered at theta=225 -> -x-z)
+//   slot 8     : edge   (centered at theta=270 -> -z face)
+//   slot 9,10  : corner (centered at theta=315 -> +x-z)
+//   slot 11    : edge   (centered at theta=0/360 -> +x face)
+//
+// The slice plane is x=0. Slice flips the right half (x>0) by 180deg about +x.
+//
+// ---------------------------------------------------------------------------
+
+const DEG = Math.PI / 180;
+const EPS = 1e-9;
+
+function makeSq1Geo(THREE, scale = 1) {
+  const MID_H = 1 / 3;          // middle slab half-height
+  const TOP_Y0 = MID_H, TOP_Y1 = 1;
+  const BOT_Y0 = -1, BOT_Y1 = -MID_H;
+
+  // ---- helpers -----------------------------------------------------------
+
+  // Point on the cube's outer boundary in the xz-plane at angle theta.
+  // The square boundary |x|<=1, |z|<=1. Cast a ray from origin at angle theta
+  // to the square's edge.
+  function boundaryXZ(theta) {
+    const c = Math.cos(theta), s = Math.sin(theta);
+    // distance t to hit |x|=1 or |z|=1
+    let t = Infinity;
+    if (Math.abs(c) > EPS) t = Math.min(t, 1 / Math.abs(c));
+    if (Math.abs(s) > EPS) t = Math.min(t, 1 / Math.abs(s));
+    return [c * t, s * t];
+  }
+
+  // Build the xz cross-section polygon (CCW in xz) of a wedge that spans
+  // angular sector [a0, a1] (radians). Fan from origin along the square
+  // boundary; include square corners that fall inside the sector so corners
+  // reach the cube corner exactly.
+  function wedgeXZ(a0, a1) {
+    const pts = [[0, 0]];
+    pts.push(boundaryXZ(a0));
+    // square corner directions
+    const cornerAngles = [45 * DEG, 135 * DEG, 225 * DEG, 315 * DEG];
+    for (const ca of cornerAngles) {
+      // normalize ca into [a0, a1] window
+      let a = ca;
+      while (a < a0 - EPS) a += 2 * Math.PI;
+      while (a > a1 + EPS) a -= 2 * Math.PI;
+      if (a > a0 + EPS && a < a1 - EPS) {
+        pts.push(boundaryXZ(a));
+      }
+    }
+    pts.push(boundaryXZ(a1));
+    return pts; // sequence origin -> boundary(a0) -> [corners] -> boundary(a1)
+  }
+
+  // Make facelets for a vertical prism with cross-section xz polygon `cs`
+  // (list of [x,z], first is origin/axis, rest go around the outer boundary
+  // from a0 to a1), top at yTop, bottom at yBot. kind decides which side
+  // faces get which color.
+  // Returns { facelets, sideOuterFaces } where facelets is the visual set.
+  //
+  // faceIndex convention (like a cube): 0=U(+y),1=D(-y),2=F(+z? ) ...
+  // We map side faces to F/B/L/R by their outward normal direction.
+  function buildFacelets(cs, yTop, yBot, kind, topColorFace, botColorFace) {
+    const facelets = [];
+    // cs = [origin, p_a0, ...mids..., p_a1]
+    const outer = cs.slice(1); // boundary points from a0..a1
+    const origin = cs[0];
+
+    // TOP pie polygon (at yTop). Outward normal is +y. To wind CCW as seen from
+    // OUTSIDE (+y looking down -y), vertices must DECREASE in atan2(z,x); our
+    // `outer` runs a0->a1 (increasing theta), so reverse the [origin, outer...]
+    // order to make the polygon normal point +y.
+    {
+      const poly = [];
+      poly.push([origin[0], yTop, origin[1]]);
+      for (const p of outer) poly.push([p[0], yTop, p[1]]);
+      poly.reverse();
+      facelets.push({ faceIndex: topColorFace, poly });
+    }
+    // BOTTOM pie polygon (at yBot). Outward normal is -y. The natural a0->a1
+    // order winds CCW seen from below, so keep [origin, outer...].
+    {
+      const poly = [];
+      poly.push([origin[0], yBot, origin[1]]);
+      for (const p of outer) poly.push([p[0], yBot, p[1]]);
+      facelets.push({ faceIndex: botColorFace, poly });
+    }
+
+    // SIDE quads. Each segment of the outer boundary is a vertical quad with an
+    // outward-facing normal. The two radial cuts (origin->a0 and a1->origin) are
+    // internal (between adjacent pieces) -> color them by the side scheme if they
+    // sit on a cube face plane, else they are "cut" faces (we still emit for the
+    // outer boundary segments which are the colored sides).
+    function sideFaceIndex(p, q) {
+      // midpoint normal: outward direction of the segment p->q in xz
+      const mx = (p[0] + q[0]) / 2, mz = (p[1] + q[1]) / 2;
+      // Determine which cube face plane this lies on
+      if (Math.abs(mx - 1) < 1e-6) return 5;  // R (+x)
+      if (Math.abs(mx + 1) < 1e-6) return 4;  // L (-x)
+      if (Math.abs(mz - 1) < 1e-6) return 2;  // F (+z)
+      if (Math.abs(mz + 1) < 1e-6) return 3;  // B (-z)
+      return -1; // radial cut, not on a cube face
+    }
+
+    for (let i = 0; i < outer.length - 1; i++) {
+      const p = outer[i], q = outer[i + 1];
+      const fi = sideFaceIndex(p, q);
+      if (fi < 0) continue;
+      // quad: p_top, q_top, q_bot, p_bot ; wind CCW from outside
+      const poly = [
+        [p[0], yTop, p[1]],
+        [q[0], yTop, q[1]],
+        [q[0], yBot, q[1]],
+        [p[0], yBot, p[1]],
+      ];
+      facelets.push({ faceIndex: fi, poly });
+    }
+    return facelets;
+  }
+
+  function centroidXZ(cs) {
+    // simple centroid of the polygon vertices (axis + outer)
+    let x = 0, z = 0, n = 0;
+    for (const p of cs) { x += p[0]; z += p[1]; n++; }
+    return [x / n, z / n];
+  }
+
+  function scalePts(arr) {
+    return arr.map(p => [p[0] * scale, p[1] * scale, p[2] * scale]);
+  }
+
+  // ---- piece definitions -------------------------------------------------
+  // Slot boundaries at theta = (k*30 - 15) deg.
+  // Angular grid: unit boundaries at multiples of 30deg (theta = k*30deg).
+  // This places the x=0 slice line (theta = 90deg and 270deg) exactly on a
+  // corner/edge SEAM in the solved state, so nothing straddles when solved and
+  // the right half is a clean C-E-C-E 180deg block. Corners span a diagonal
+  // (cube corner) and reach it exactly; edges are flat-on-face wedges.
+  function slotBoundary(k) { return (k * 30) * DEG; }
+
+  // Color faces: U=0, D=1, F=2, B=3, L=4, R=5.
+  const U = 0, D = 1;
+
+  const pieces = [];
+
+  // Build one layer (top or bottom). Returns list of piece defs.
+  function buildLayer(layerName, yTop, yBot, topFace, botFace, idPrefix) {
+    // Solved layout (CCW), spans in degrees:
+    //   corner C[0,60]   (contains diagonal 45  -> cube corner +x+z)
+    //   edge   E[60,90]  (flat on +z face)
+    //   corner C[90,150] (contains diagonal 135 -> cube corner -x+z)
+    //   edge   E[150,180](flat on -x face)
+    //   corner C[180,240](contains diagonal 225 -> cube corner -x-z)
+    //   edge   E[240,270](flat on -z face)
+    //   corner C[270,330](contains diagonal 315 -> cube corner +x-z)
+    //   edge   E[330,360](flat on +x face)
+    // x=0 SEAMS at theta=90 and theta=270 (each between a corner and an edge):
+    // in the solved state no piece straddles x=0, so a slice is legal. The
+    // engine's U(1)/D(1) rotates the layer by +30deg about +y, which (in the
+    // atan2(z,x) sense) is a -30deg shift; this brings corner C[90,150] -> [60,120]
+    // whose body now spans theta=90 -> it STRADDLES the cut, blocking the slice.
+    // (Blocking is geometry-exact, verified by the polygon footprint test.)
+    const layout = [
+      { kind: 'corner', a0deg: 0, a1deg: 60 },
+      { kind: 'edge', a0deg: 60, a1deg: 90 },
+      { kind: 'corner', a0deg: 90, a1deg: 150 },
+      { kind: 'edge', a0deg: 150, a1deg: 180 },
+      { kind: 'corner', a0deg: 180, a1deg: 240 },
+      { kind: 'edge', a0deg: 240, a1deg: 270 },
+      { kind: 'corner', a0deg: 270, a1deg: 330 },
+      { kind: 'edge', a0deg: 330, a1deg: 360 },
+    ];
+    let cIdx = 0, eIdx = 0;
+    const out = [];
+    for (const item of layout) {
+      let a0, a1, id;
+      a0 = item.a0deg * DEG;
+      a1 = item.a1deg * DEG;
+      if (item.kind === 'corner') {
+        id = `${idPrefix}c-${cIdx++}`;
+      } else {
+        id = `${idPrefix}e-${eIdx++}`;
+      }
+      const cs = wedgeXZ(a0, a1);
+      const facelets = buildFacelets(cs, yTop, yBot, item.kind, topFace, botFace)
+        .map(f => ({ faceIndex: f.faceIndex, poly: scalePts(f.poly) }));
+      const cxz = centroidXZ(cs);
+      const cy = (yTop + yBot) / 2;
+      out.push({
+        id,
+        kind: item.kind,
+        layer: layerName,
+        center: [cxz[0] * scale, cy * scale, cxz[1] * scale],
+        facelets,
+      });
+    }
+    return out;
+  }
+
+  for (const p of buildLayer('top', TOP_Y1, TOP_Y0, U, D, 't')) pieces.push(p);
+  for (const p of buildLayer('bottom', BOT_Y1, BOT_Y0, U, D, 'b')) pieces.push(p);
+
+  // Middle pieces: two halves split by x=0 plane. They span y in [-MID_H, MID_H].
+  // Left half: x in [-1,0]; right half: x in [0,1]; both full z in [-1,1].
+  function buildMiddle(id, xMin, xMax) {
+    const yT = MID_H, yB = -MID_H;
+    // cross-section rectangle in xz (CCW from above): we list as a closed-ish
+    // polygon. Use buildFacelets-like manual construction.
+    const corners = [
+      [xMin, -1], [xMax, -1], [xMax, 1], [xMin, 1],
+    ];
+    const facelets = [];
+    // top (outward +y) -> reverse for CCW-from-above; these are internal seams
+    // (faceIndex -1, hidden beneath the top/bottom layers) but we keep winding
+    // consistent with the wedge convention.
+    facelets.push({ faceIndex: -1, poly: scalePts(corners.slice().reverse().map(c => [c[0], yT, c[1]])) });
+    // bottom (outward -y) -> natural order
+    facelets.push({ faceIndex: -1, poly: scalePts(corners.map(c => [c[0], yB, c[1]])) });
+    // sides
+    function midSideFace(p, q) {
+      const mx = (p[0] + q[0]) / 2, mz = (p[1] + q[1]) / 2;
+      if (Math.abs(mx - 1) < 1e-6) return 5;
+      if (Math.abs(mx + 1) < 1e-6) return 4;
+      if (Math.abs(mz - 1) < 1e-6) return 2;
+      if (Math.abs(mz + 1) < 1e-6) return 3;
+      return -1;
+    }
+    for (let i = 0; i < corners.length; i++) {
+      const p = corners[i], q = corners[(i + 1) % corners.length];
+      const fi = midSideFace(p, q);
+      if (fi < 0) continue;
+      facelets.push({
+        faceIndex: fi,
+        poly: scalePts([
+          [p[0], yT, p[1]], [q[0], yT, q[1]], [q[0], yB, q[1]], [p[0], yB, p[1]],
+        ]),
+      });
+    }
+    return {
+      id,
+      kind: 'middle',
+      layer: 'middle',
+      center: [((xMin + xMax) / 2) * scale, 0, 0],
+      facelets,
+    };
+  }
+  pieces.push(buildMiddle('mid-L', -1, 0));
+  pieces.push(buildMiddle('mid-R', 0, 1));
+
+  // -------------------------------------------------------------------------
+  // ENGINE
+  // -------------------------------------------------------------------------
+
+  function buildMove(type, amount) {
+    if (type === 'U') {
+      return {
+        axis: new THREE.Vector3(0, 1, 0),
+        axisName: '+y',
+        target: amount * (Math.PI / 6),
+        done: 0,
+        notation: `U(${amount})`,
+        select: 'top',
+      };
+    }
+    if (type === 'D') {
+      return {
+        axis: new THREE.Vector3(0, 1, 0),
+        axisName: '+y',
+        target: amount * (Math.PI / 6),
+        done: 0,
+        notation: `D(${amount})`,
+        select: 'bottom',
+      };
+    }
+    if (type === 'slice') {
+      return {
+        axis: new THREE.Vector3(1, 0, 0),
+        axisName: '+x',
+        target: Math.PI,
+        done: 0,
+        notation: '/',
+        select: 'right',
+      };
+    }
+    throw new Error('unknown move type ' + type);
+  }
+
+  function selectPieces(move, runtimePieces) {
+    const eps = 1e-6 * scale + 1e-9;
+    if (move.select === 'top') {
+      return runtimePieces.filter(p => p.position.y > eps);
+    }
+    if (move.select === 'bottom') {
+      return runtimePieces.filter(p => p.position.y < -eps);
+    }
+    if (move.select === 'right') {
+      return runtimePieces.filter(p => p.position.x > eps);
+    }
+    return [];
+  }
+
+  // Determine the angular sector occupied by a top/bottom piece at runtime by
+  // transforming its local cross-section by its quaternion+position, then
+  // checking whether it crosses x=0 within its y-span (i.e. straddles the cut).
+  // For canSlice we just need: does any top OR bottom corner straddle x=0?
+  //
+  // A simpler robust check that matches "no corner straddles": for each top/bottom
+  // piece, compute its current angular center (from position projected to xz),
+  // and its angular half-width; a corner straddles if the x=0 plane (theta=90 or
+  // theta=270, i.e. +z or -z direction lines... actually x=0 is the z-axis line)
+  // passes strictly through the wedge interior. We detect by sampling the wedge's
+  // outer xz footprint after applying the runtime transform.
+
+  // Precompute, for each piece id, its local cross-section outer footprint points
+  // (xz at y=0 local — but pieces are prisms so xz is y-invariant in local space).
+  const localFootprint = {}; // id -> array of THREE.Vector3 (local, unscaled-ish at scale)
+  for (const p of pieces) {
+    // gather xz points from the top facelet, stored RELATIVE to the piece's home
+    // center so that worldPt = localOffset.applyQuaternion(q) + position
+    // reconstructs the true world footprint for any runtime transform.
+    const topPoly = p.facelets[0].poly; // top face poly in absolute world coords (scaled)
+    const c = p.center;
+    localFootprint[p.id] = topPoly.map(v =>
+      new THREE.Vector3(v[0] - c[0], v[1] - c[1], v[2] - c[2]));
+  }
+  const pieceById = {};
+  for (const p of pieces) pieceById[p.id] = p;
+  const isCornerId = id => id.includes('c-') || pieceById[id]?.kind === 'corner';
+
+  // Apply a runtime proxy transform to local footprint -> world xz points.
+  function worldFootprintXZ(proxy) {
+    const fp = localFootprint[proxy.id];
+    const out = [];
+    for (const v of fp) {
+      const w = v.clone().applyQuaternion(proxy.quaternion).add(proxy.position);
+      out.push([w.x, w.z]);
+    }
+    return out;
+  }
+
+  // Does a piece's footprint strictly straddle the x=0 plane (some points x>tol,
+  // some x<-tol)?
+  function straddlesX0(proxy) {
+    const tol = 1e-4 * scale;
+    let pos = false, neg = false;
+    for (const [x] of worldFootprintXZ(proxy)) {
+      if (x > tol) pos = true;
+      if (x < -tol) neg = true;
+    }
+    return pos && neg;
+  }
+
+  function canSlice(runtimePieces) {
+    for (const p of runtimePieces) {
+      const def = pieceById[p.id];
+      if (!def) continue;
+      if (def.layer === 'middle') continue;
+      if (def.kind !== 'corner') continue;
+      if (straddlesX0(p)) return false;
+    }
+    return true;
+  }
+
+  // -------------------------------------------------------------------------
+  // SNAPPING
+  // -------------------------------------------------------------------------
+  // Valid orientations for top/bottom pieces: rotation about +y by multiples of
+  // 30deg, possibly composed with a 180deg flip about +x (from slices). Valid
+  // positions: the piece's home centroid rotated about +y by k*30deg, in either
+  // the top or bottom layer (flips move top<->bottom). Middle pieces: identity or
+  // 180 about x (left<->right swap is also possible via slice).
+  //
+  // Strategy: snap quaternion to the nearest element of the puzzle's orientation
+  // group; snap position to the nearest valid lattice point given that piece's
+  // home radius/height.
+
+  // Build the orientation group: { Ry(k*30) } and { Ry(k*30) * Rx(180) } for
+  // k=0..11. 24 orientations.
+  const orientationGroup = [];
+  for (let k = 0; k < 12; k++) {
+    const ry = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 1, 0), k * 30 * DEG);
+    orientationGroup.push(ry.clone());
+    const rx = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), Math.PI);
+    orientationGroup.push(ry.clone().multiply(rx));
+  }
+
+  function quatDist(a, b) {
+    // angle between orientations
+    let d = Math.abs(a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w);
+    if (d > 1) d = 1;
+    return 2 * Math.acos(d);
+  }
+
+  // Home data per piece: home center (xz radius, y), and home quaternion = identity.
+  const homeCenter = {};
+  for (const p of pieces) homeCenter[p.id] = p.center.slice();
+
+  function snapPiece(piece) {
+    // 1) snap quaternion to nearest orientation in group
+    let best = orientationGroup[0], bestD = Infinity;
+    for (const q of orientationGroup) {
+      const d = quatDist(piece.quaternion, q);
+      if (d < bestD) { bestD = d; best = q; }
+    }
+    piece.quaternion.copy(best);
+
+    // 2) snap position. The set of valid positions is: take the piece's HOME
+    // center vector and apply any orientation in the group, but constrained so
+    // the result is a valid lattice slot. The cleanest robust approach: the
+    // valid positions are { g . homeCenter(anyPiece of same kind) }. But pieces
+    // are interchangeable within kind via slices/turns. Simpler & sufficient for
+    // killing drift: snap to the nearest point in the precomputed lattice of all
+    // reachable centers for this piece's kind.
+    const def = pieceById[piece.id];
+    const lattice = latticeForKind(def.kind);
+    let bp = lattice[0], bpd = Infinity;
+    for (const c of lattice) {
+      const dx = piece.position.x - c[0];
+      const dy = piece.position.y - c[1];
+      const dz = piece.position.z - c[2];
+      const dd = dx * dx + dy * dy + dz * dz;
+      if (dd < bpd) { bpd = dd; bp = c; }
+    }
+    piece.position.set(bp[0], bp[1], bp[2]);
+  }
+
+  // Precompute the lattice of all reachable centers per kind.
+  // Generated by applying every orientation in orientationGroup to each home
+  // center of that kind, then deduping.
+  const _latticeCache = {};
+  function latticeForKind(kind) {
+    if (_latticeCache[kind]) return _latticeCache[kind];
+    const homes = pieces.filter(p => p.kind === kind).map(p => p.center);
+    const set = [];
+    const seen = new Set();
+    const v = new THREE.Vector3();
+    for (const h of homes) {
+      for (const q of orientationGroup) {
+        v.set(h[0], h[1], h[2]).applyQuaternion(q);
+        const key = `${v.x.toFixed(5)},${v.y.toFixed(5)},${v.z.toFixed(5)}`;
+        if (!seen.has(key)) {
+          seen.add(key);
+          set.push([v.x, v.y, v.z]);
+        }
+      }
+    }
+    _latticeCache[kind] = set;
+    return set;
+  }
+
+  // -------------------------------------------------------------------------
+  // readState — canonical logical state
+  // -------------------------------------------------------------------------
+  // We record, for each of the 24 angular slots (12 top + 12 bottom), which piece
+  // half occupies that slot and the piece's orientation flip-parity. Plus the
+  // middle config (which middle piece is on left/right and its flip).
+  //
+  // Representation: for each top/bottom piece we compute its current angular
+  // center (theta), its layer (top vs bottom by sign of y), and whether it's
+  // flipped (orientation has the Rx(180) component). For solved detection we just
+  // compare to the home arrangement.
+
+  function pieceAngle(proxy) {
+    // angular position of the piece center in xz plane (theta = atan2(z,x))
+    const x = proxy.position.x, z = proxy.position.z;
+    return Math.atan2(z, x);
+  }
+
+  function isFlipped(proxy) {
+    // flipped if nearest orientation includes Rx(180): test by transforming +y
+    // local axis -> if it points -y, flipped.
+    const up = new THREE.Vector3(0, 1, 0).applyQuaternion(proxy.quaternion);
+    return up.y < 0;
+  }
+
+  function readState(runtimePieces) {
+    // Build a canonical descriptor.
+    // For each top/bottom piece: { kindId, slotKey } where slotKey encodes
+    // (layer, snapped-angle-index, flip). Plus middle descriptor.
+    const slots = [];
+    let middle = [];
+    for (const p of runtimePieces) {
+      const def = pieceById[p.id];
+      if (!def) continue;
+      if (def.layer === 'middle') {
+        const side = p.position.x >= 0 ? 'R' : 'L';
+        const flip = isFlipped(p) ? 1 : 0;
+        middle.push(`${p.id}@${side}f${flip}`);
+        continue;
+      }
+      const layer = p.position.y > 0 ? 'T' : 'B';
+      let theta = pieceAngle(p);
+      // snap theta to nearest 15deg boundary index (slots are 30deg; corners
+      // center on 45+k*90, edges on k*90; all multiples of 15... use 15deg grid)
+      let idx = Math.round(theta / (15 * DEG));
+      idx = ((idx % 24) + 24) % 24;
+      const flip = isFlipped(p) ? 1 : 0;
+      slots.push(`${p.id}:${layer}${idx}f${flip}`);
+    }
+    slots.sort();
+    middle.sort();
+    return { slots, middle, canon: JSON.stringify({ slots, middle }) };
+  }
+
+  function isSolved(runtimePieces) {
+    // Solved == every piece at home position+orientation (within tol) AND cube
+    // shape (guaranteed if positions/orientations are home).
+    for (const p of runtimePieces) {
+      const home = homeCenter[p.id];
+      const dx = p.position.x - home[0];
+      const dy = p.position.y - home[1];
+      const dz = p.position.z - home[2];
+      if (Math.hypot(dx, dy, dz) > 1e-5 * Math.max(1, scale)) return false;
+      // orientation must be identity (no flip, no rotation) for "home"
+      const idq = orientationGroup[0];
+      if (quatDist(p.quaternion, idq) > 1e-4) return false;
+    }
+    return true;
+  }
+
+  return {
+    pieces,
+    buildMove,
+    selectPieces,
+    canSlice,
+    snapPiece,
+    readState,
+    isSolved,
+    // expose internals helpful for tests/integrators
+    _internals: {
+      MID_H, orientationGroup, latticeForKind, straddlesX0, worldFootprintXZ,
+      pieceById, homeCenter, isFlipped,
+    },
+  };
+}
+
+
+
+return makeSq1Geo;
+})();
+
+
+/* ===== Skewb instance + meshes + registry ===== */
+const SKEWB_SCALE = 1.0;
+const skewbGeo = makeSkewbGeo(THREE, SKEWB_SCALE);
+const SKEWB_FACE_HEX = [COLORS['+x'], COLORS['-x'], COLORS['+y'], COLORS['-y'], COLORS['+z'], COLORS['-z']];
+const SKEWB_FACE_N = [[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+const SKEWB_DARK = new THREE.MeshStandardMaterial({ color: 0x161619, roughness: 0.82, metalness: 0.0, side: THREE.DoubleSide });
+const skewbGroup = new THREE.Group(); skewbGroup.visible = false; scene.add(skewbGroup);
+const SKEWB_KEYS = ['a','b','c','d','e','f','g','h'];                  // 8 corner caps
+const SKEWB_CORNER_DIRS = [];
+for (const p of skewbGeo.pieces) if (p.kind === 'corner') { const c = p.center, l = Math.hypot(c[0],c[1],c[2]); SKEWB_CORNER_DIRS[p.homeIndex] = [c[0]/l,c[1]/l,c[2]/l]; }
+// Each corner is an endpoint of one body-diagonal turn-axis. Every move turns the
+// AXIS's (+ end) cap, so the solver's reference corner (corner 0, on no axis cap)
+// never moves and every reachable state stays in the solver's space — while all 8
+// corners remain clickable (each maps to its diagonal's cap turn).
+const SKEWB_CORNER_TO_AXISDIR = SKEWB_CORNER_DIRS.map(d => { let bj = 0, bd = -2; for (let j = 0; j < skewbGeo.axes.length; j++) { const a = skewbGeo.axes[j].dir, ad = Math.abs(d[0]*a[0]+d[1]*a[1]+d[2]*a[2]); if (ad > bd) { bd = ad; bj = j; } } return skewbGeo.axes[bj].dir; });
+const skewbPieces = skewbGeo.pieces.map(desc => {
+  const g = new THREE.Group(); g.position.set(desc.center[0],desc.center[1],desc.center[2]);
+  const O = [-desc.center[0],-desc.center[1],-desc.center[2]];
+  const dark = [];
+  for (const fl of desc.facelets) {
+    const cn = SKEWB_FACE_N[fl.faceIndex];
+    const poly = fl.poly.map(v=>[v[0]-desc.center[0],v[1]-desc.center[1],v[2]-desc.center[2]]);
+    const pc = poly.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(x=>x/poly.length);
+    for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...pc,...a,...b);}
+    for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...a,...b,...O);}
+    const INSET=0.86, RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
+    const ip=poly.map(p=>[pc[0]+(p[0]-pc[0])*INSET+r[0],pc[1]+(p[1]-pc[1])*INSET+r[1],pc[2]+(p[2]-pc[2])*INSET+r[2]]);
+    const Cr=[pc[0]+r[0],pc[1]+r[1],pc[2]+r[2]], cpos=[], cnrm=[];
+    for(let i=0;i<ip.length;i++){const a=ip[i],b=ip[(i+1)%ip.length];cpos.push(...Cr,...a,...b);for(let k=0;k<3;k++)cnrm.push(cn[0],cn[1],cn[2]);}
+    const fg=new THREE.BufferGeometry();
+    fg.setAttribute('position',new THREE.Float32BufferAttribute(cpos,3));
+    fg.setAttribute('normal',new THREE.Float32BufferAttribute(cnrm,3));
+    const fmesh=new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SKEWB_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide}));
+    if (desc.kind==='corner') fmesh.userData.skewbCorner = desc.homeIndex;
+    g.add(fmesh);
+  }
+  const dg=new THREE.BufferGeometry();
+  dg.setAttribute('position',new THREE.Float32BufferAttribute(dark,3)); dg.computeVertexNormals();
+  g.add(new THREE.Mesh(dg,SKEWB_DARK));
+  skewbGroup.add(g);
+  return { id:desc.id, kind:desc.kind, homeIndex:desc.homeIndex, home:desc.center.slice(), position:g.position, quaternion:g.quaternion, group:g };
+});
+function skewbReset(){ for(const p of skewbPieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
+function skewbBuildMove(tok,prime){ const i=SKEWB_KEYS.indexOf(tok); const d=SKEWB_CORNER_TO_AXISDIR[i]; return {axis:new THREE.Vector3(d[0],d[1],d[2]),axisName:tok,target:(prime?1:-1)*(2*Math.PI/3),done:0,notation:tok+(prime?"'":"")}; }
+function skewbReadState(){ return skewbGeo.readState(skewbPieces); }
+function skewbSolved(){ const s=skewbReadState(); return s.cp.every((v,i)=>v===i)&&s.co.every(v=>v===0)&&s.cenp.every((v,i)=>v===i); }
+function skewbScramble(){ const t=[]; let last=-1; for(let i=0;i<12;i++){let c;do{c=Math.floor(Math.random()*8);}while(c===last);last=c;t.push(SKEWB_KEYS[c]+(Math.random()<0.5?"'":""));} return t; }
+function skewbFinalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&skewbSolved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
+// solver outputs axis tokens A0..A3; map each axis to the corner-cap key with the matching direction
+const SKEWB_AXIS_TO_KEY = skewbGeo.axes.map(ax => { let bi=0,bd=-2; for(let i=0;i<SKEWB_CORNER_DIRS.length;i++){const d=SKEWB_CORNER_DIRS[i];const dot=d[0]*ax.dir[0]+d[1]*ax.dir[1]+d[2]*ax.dir[2];if(dot>bd){bd=dot;bi=i;}} return SKEWB_KEYS[bi]; });
+function skewbSolveFull(){ return skewbSolveState(skewbReadState()).map(t => SKEWB_AXIS_TO_KEY[+t[1]] + (t.endsWith("'") ? "'" : '')); }
+const puzzleSkewb = {
+  id:'skewb', name:'Skewb', group:skewbGroup,
+  DEFS:Object.fromEntries(SKEWB_KEYS.map(c=>[c,{}])),
+  buildMove:(t,p,d)=>skewbBuildMove(t,p),
+  selectPieces:(m)=>skewbGeo.selectPieces(m,skewbPieces),
+  snapPiece:(p)=>skewbGeo.snapPiece(p),
+  build:skewbReset, updateNet:()=>{}, updateProjections:()=>{}, finalizeMovePhase:skewbFinalize,
+  readState:skewbReadState, scramble:skewbScramble, storageKey:'skewb-solves', solveFull:skewbSolveFull,
+  keymap:{ faceKeys:Object.fromEntries(SKEWB_KEYS.map(c=>[c,c])) },
+  phaseConfig:{order:['solve'],labels:{solve:'Solve'}},
+  drillLabel:'',makeDrill:()=>null,solverLabel:'',solverGoals:[],solve:()=>null, dockGroups:[],
+  helpHTML:`<div><b>Click a corner</b> to turn it</div>
+    <div><kbd>Shift</kbd> + click = reverse</div>
+    <div>keys a–h = the 8 corners</div>
+    <div><kbd>Space</kbd> = pause / hide</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+
+
+/* ===== Skewb solver — node-verified IDA* (300/300 random scrambles, optimal,
+   avg ~7.5 moves). Tiny PDBs (~9K entries). Wrapped IIFE → skewbSolveState. ===== */
+const skewbSolveState = (function () {
+// solver.js
+// Node-verified Skewb solver.
+//
+// Generator set: the 4 body-diagonal axis moves A0..A3 and their primes
+//   (A0,A0',A1,A1',A2,A2',A3,A3') — the standard 4-move Skewb solving set.
+//   Each unprimed/primed move is a 120° cap turn (order 3); there is no double.
+//
+// State shape (matches skewb-geo.js readState):
+//   { cp:  Int[8]  corner permutation, cp[slot] = solved id of corner in that slot
+//     co:  Int[8]  corner orientation 0..2 per slot
+//     cenp:Int[6]  centre permutation, cenp[slot] = solved id of centre in that slot }
+//
+// solve(state) -> Array<string> of tokens like ["A0","A2'", ...]. Applying those
+//   tokens (as buildMove(axisName, prime) cap turns) from `state` reaches solved.
+//   solve(solved) === [].
+//
+// Tokens are axis names A0..A3 (the puzzle's 4 turn axes / body diagonals), each
+// optionally suffixed with "'" for the primed direction. They map 1:1 to
+// geo.buildMove(axisName, prime).
+//
+// Method:
+//   1. A logical move table for the 8 generators is derived ONCE from the verified
+//      geo engine: solved labelled runtime proxies are turned via
+//      buildMove -> selectPieces -> rotate(pos,quat) -> snapPiece, and readState
+//      before/after yields each generator's slot-permutation + orientation twist.
+//      Each generator is then a pure function state -> state. (Self-test proves
+//      these logical functions reproduce the geo engine exactly.)
+//   2. IDA* over the 8 generators, pruning consecutive moves on the same axis,
+//      with an admissible heuristic = max(cornerPDB, centerPDB), two BFS pattern
+//      databases (corner perm+orient: 8748 entries depth<=7; centre perm: 360
+//      entries depth<=5). IDA* with an admissible heuristic returns OPTIMAL
+//      solutions.
+
+
+// ---------------------------------------------------------------------------
+// Build the geo engine once and derive the logical move table from it.
+// ---------------------------------------------------------------------------
+const geo = makeSkewbGeo(THREE, 1.0);
+
+const AXIS_NAMES = ['A0', 'A1', 'A2', 'A3'];
+
+// Token list, index gi 0..7: axis a in {0..3}, prime in {false,true}.
+//   gi = a*2 + (prime ? 1 : 0)
+const GEN_TOKENS = [];
+for (let a = 0; a < 4; a++) {
+  GEN_TOKENS.push(AXIS_NAMES[a]);        // unprimed
+  GEN_TOKENS.push(AXIS_NAMES[a] + "'");  // primed
+}
+const GEN_AXIS = GEN_TOKENS.map((_, gi) => gi >> 1); // axis index of each generator
+// Inverse generator index: same axis, flipped prime (a move and its prime invert).
+const GEN_INV = GEN_TOKENS.map((_, gi) => gi ^ 1);
+
+// --- Runtime proxy helpers (the verified geo engine path) ------------------
+function freshProxies() {
+  return geo.pieces.map(p => ({
+    id: p.id,
+    position: new THREE.Vector3(p.center[0], p.center[1], p.center[2]),
+    quaternion: new THREE.Quaternion(), // identity
+  }));
+}
+
+function applyGeoMove(proxies, move) {
+  const sel = geo.selectPieces(move, proxies);
+  const q = new THREE.Quaternion().setFromAxisAngle(move.axis, move.target);
+  for (const p of sel) {
+    p.position.applyQuaternion(q);
+    p.quaternion.premultiply(q);
+  }
+  for (const p of sel) geo.snapPiece(p);
+  return sel.length;
+}
+
+// --- Derive each generator's logical action from solved ---------------------
+// Apply generator g to solved proxies, read state. Since solved has cp[j]=j and
+// co=0 and cenp[k]=k, the readout directly gives:
+//   cFrom[s]  = cp_after[s]   (slot s receives the corner that was at slot cFrom[s])
+//   cTwist[s] = co_after[s]   (orientation added to whatever corner lands in slot s)
+//   cenFrom[s]= cenp_after[s]
+function deriveGenerator(axisIndex, prime) {
+  const proxies = freshProxies();
+  applyGeoMove(proxies, geo.buildMove(AXIS_NAMES[axisIndex], prime));
+  const st = geo.readState(proxies);
+  return { cFrom: st.cp.slice(), cTwist: st.co.slice(), cenFrom: st.cenp.slice() };
+}
+
+const GENS = [];
+for (let a = 0; a < 4; a++) {
+  GENS.push(deriveGenerator(a, false));
+  GENS.push(deriveGenerator(a, true));
+}
+
+// --- Pure logical generator application: state -> new state -----------------
+function applyGen(state, gi) {
+  const g = GENS[gi];
+  const cp = new Array(8), co = new Array(8), cenp = new Array(6);
+  for (let s = 0; s < 8; s++) {
+    const from = g.cFrom[s];
+    cp[s] = state.cp[from];
+    co[s] = (state.co[from] + g.cTwist[s]) % 3;
+  }
+  for (let s = 0; s < 6; s++) cenp[s] = state.cenp[g.cenFrom[s]];
+  return { cp, co, cenp };
+}
+
+const SOLVED = { cp: [0, 1, 2, 3, 4, 5, 6, 7], co: [0, 0, 0, 0, 0, 0, 0, 0], cenp: [0, 1, 2, 3, 4, 5] };
+
+function isSolved(s) {
+  for (let i = 0; i < 8; i++) if (s.cp[i] !== i || s.co[i] !== 0) return false;
+  for (let i = 0; i < 6; i++) if (s.cenp[i] !== i) return false;
+  return true;
+}
+
+// ---------------------------------------------------------------------------
+// Pattern databases (admissible heuristics) built once by BFS from solved.
+//   cornerPDB: key on corner (perm + orient).  centerPDB: key on centre perm.
+// Each maps a projected-state key -> exact distance to solved in that subspace,
+// which is a lower bound on the full distance => admissible. h = max of the two.
+// ---------------------------------------------------------------------------
+function cornerKey(s) {
+  // 8 corner ids (0..7) + 8 orientations (0..2): pack into a single integer string.
+  // Pack perm as base-8 (24 bits) and orient as base-3 (needs <13 bits) -> BigInt-free string.
+  let k = 0;
+  for (let i = 0; i < 8; i++) k = k * 8 + s.cp[i];
+  // k up to 8^8 = 16,777,216 fits in a double exactly; fold orient via string concat.
+  let o = 0;
+  for (let i = 0; i < 8; i++) o = o * 3 + s.co[i];
+  return k * 6561 + o; // 6561 = 3^8 ; product < 1.1e11, exact in double.
+}
+function centerKey(s) {
+  let k = 0;
+  for (let i = 0; i < 6; i++) k = k * 6 + s.cenp[i];
+  return k; // < 6^6 = 46656
+}
+
+function buildPDB(keyFn) {
+  const dist = new Map();
+  dist.set(keyFn(SOLVED), 0);
+  let frontier = [SOLVED];
+  let d = 0;
+  while (frontier.length) {
+    const next = [];
+    d++;
+    for (const s of frontier) {
+      for (let gi = 0; gi < 8; gi++) {
+        const ns = applyGen(s, gi);
+        const k = keyFn(ns);
+        if (!dist.has(k)) { dist.set(k, d); next.push(ns); }
+      }
+    }
+    frontier = next;
+  }
+  return dist;
+}
+
+const CORNER_PDB = buildPDB(cornerKey);
+const CENTER_PDB = buildPDB(centerKey);
+
+function heuristic(s) {
+  const hc = CORNER_PDB.get(cornerKey(s));
+  const hk = CENTER_PDB.get(centerKey(s));
+  // Both keys are always present (PDBs cover their full reachable subspace).
+  return hc > hk ? hc : hk;
+}
+
+// ---------------------------------------------------------------------------
+// IDA* over the 8 generators. Prune consecutive moves on the same axis
+// (turning the same axis twice in a row is never optimal: it is either the
+// identity-ish 3rd turn or equivalent to a single opposite turn).
+// Returns an array of generator indices, or null if (impossibly) not found.
+// ---------------------------------------------------------------------------
+function idaStar(start) {
+  if (isSolved(start)) return [];
+  let bound = heuristic(start);
+  const path = []; // generator indices
+
+  function dfs(state, g, lastAxis) {
+    const h = heuristic(state);
+    const f = g + h;
+    if (f > bound) return f;            // exceeded bound -> report min next bound
+    if (h === 0 && isSolved(state)) return -1; // solved (h===0 implies solved here)
+    let min = Infinity;
+    for (let gi = 0; gi < 8; gi++) {
+      if (GEN_AXIS[gi] === lastAxis) continue; // prune same-axis consecutive moves
+      const ns = applyGen(state, gi);
+      path.push(gi);
+      const t = dfs(ns, g + 1, GEN_AXIS[gi]);
+      if (t === -1) return -1;          // solution found (propagate up)
+      if (t < min) min = t;
+      path.pop();
+    }
+    return min;
+  }
+
+  // Safety cap well above the verified diameter (11).
+  for (let iter = 0; iter < 64 && bound <= 30; iter++) {
+    const t = dfs(start, 0, -1);
+    if (t === -1) return path.slice();
+    if (t === Infinity) return null;
+    bound = t;
+  }
+  return null;
+}
+
+// ---------------------------------------------------------------------------
+// Public API.
+// ---------------------------------------------------------------------------
+function solve(state) {
+  // Defensive copy / normalise the incoming readState-shaped object.
+  const s = {
+    cp: state.cp.slice(),
+    co: state.co.map(v => ((v % 3) + 3) % 3),
+    cenp: state.cenp.slice(),
+  };
+  if (isSolved(s)) return [];
+  const giPath = idaStar(s);
+  if (!giPath) throw new Error('Skewb solve: no solution found (unreachable state?)');
+  return giPath.map(gi => GEN_TOKENS[gi]);
+}
+
+// Exposed for the self-test / integrators.
+const _internals = {
+  geo, GENS, GEN_TOKENS, GEN_AXIS, GEN_INV, applyGen, freshProxies, applyGeoMove,
+  CORNER_PDB, CENTER_PDB, heuristic, SOLVED, isSolved,
+};
+
+return solve;
+})();
+
+/* ===== Square-1 instance + meshes + registry ===== */
+const SQ1_SCALE = 1.0;
+const sq1Geo = makeSq1Geo(THREE, SQ1_SCALE);
+const SQ1_FACE_HEX = [COLORS['+y'], COLORS['-y'], COLORS['+z'], COLORS['-z'], COLORS['-x'], COLORS['+x']];   // U D F B L R
+const SQ1_FACE_N = [[0,1,0],[0,-1,0],[0,0,1],[0,0,-1],[-1,0,0],[1,0,0]];
+const SQ1_DARK = new THREE.MeshStandardMaterial({ color: 0x161619, roughness: 0.82, metalness: 0.0, side: THREE.DoubleSide });
+const sq1Group = new THREE.Group(); sq1Group.visible = false; scene.add(sq1Group);
+const sq1Pieces = sq1Geo.pieces.map(desc => {
+  const g = new THREE.Group(); g.position.set(desc.center[0],desc.center[1],desc.center[2]);
+  const dark = [];
+  for (const fl of desc.facelets) {
+    const poly = fl.poly.map(v=>[v[0]-desc.center[0],v[1]-desc.center[1],v[2]-desc.center[2]]);
+    const pc = poly.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(x=>x/poly.length);
+    for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...pc,...a,...b);}   // closed wedge body
+    if (fl.faceIndex < 0) continue;                                  // internal cut face → dark only
+    const cn = SQ1_FACE_N[fl.faceIndex];
+    const INSET=0.9, RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
+    const ip=poly.map(p=>[pc[0]+(p[0]-pc[0])*INSET+r[0],pc[1]+(p[1]-pc[1])*INSET+r[1],pc[2]+(p[2]-pc[2])*INSET+r[2]]);
+    const Cr=[pc[0]+r[0],pc[1]+r[1],pc[2]+r[2]], cpos=[], cnrm=[];
+    for(let i=0;i<ip.length;i++){const a=ip[i],b=ip[(i+1)%ip.length];cpos.push(...Cr,...a,...b);for(let k=0;k<3;k++)cnrm.push(cn[0],cn[1],cn[2]);}
+    const fg=new THREE.BufferGeometry();
+    fg.setAttribute('position',new THREE.Float32BufferAttribute(cpos,3));
+    fg.setAttribute('normal',new THREE.Float32BufferAttribute(cnrm,3));
+    g.add(new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SQ1_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide})));
+  }
+  const dg=new THREE.BufferGeometry();
+  dg.setAttribute('position',new THREE.Float32BufferAttribute(dark,3)); dg.computeVertexNormals();
+  g.add(new THREE.Mesh(dg,SQ1_DARK));
+  sq1Group.add(g);
+  return { id:desc.id, kind:desc.kind, layer:desc.layer, home:desc.center.slice(), position:g.position, quaternion:g.quaternion, group:g };
+});
+function sq1Reset(){ for(const p of sq1Pieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
+function sq1ReadState(){ return sq1Geo.readState(sq1Pieces); }
+function sq1Solved(){ return !!(sq1Geo.isSolved && sq1Geo.isSolved(sq1Pieces)); }
+function sq1BuildMove(face, prime){
+  // NOTE: legality of a slice must be judged when it ANIMATES, not when it is
+  // enqueued — a batch of moves (scramble / solve) is built synchronously against
+  // the current state, so an enqueue-time canSlice check tests the wrong state.
+  // We always build the slice move and gate it in selectPieces (activation time).
+  if (face === '/') return sq1Geo.buildMove('slice', 1);
+  if (face === 'U') return sq1Geo.buildMove('U', prime ? -1 : 1);
+  if (face === 'D') return sq1Geo.buildMove('D', prime ? -1 : 1);
+  return null;
+}
+function sq1Scramble(){ const t=[]; for(let r=0;r<10;r++){ const u=1+Math.floor(Math.random()*11), d=1+Math.floor(Math.random()*11); for(let i=0;i<u;i++)t.push('U'); for(let i=0;i<d;i++)t.push('D'); t.push('/'); } return t; }
+function sq1Finalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&sq1Solved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
+/* ===== Square-1 solver — reduction/DB (node-verified 200/200, avg ~74 moves,
+   non-optimal but always-solves). No imports; reads the live proxy pieces.
+   The 3 pattern DBs (~20s) build LAZILY via ensureDB() on the first Solve. ===== */
+const sq1Solver = (function () {
+// solver.js
+// =============================================================================
+// Node-verified Square-1 (Cube 21) solver.  Always solves; non-optimal.
+// =============================================================================
+//
+// PUBLIC API
+//   import { solve } from './solver.js';
+//   const moves = solve(input);
+//
+// INPUT FORMAT for solve(input) — auto-detected:
+//   (a) The runtime "proxy" array used by the geo engine: an Array whose elements are
+//       { id:string, position:{x,y,z}, quaternion:{x,y,z,w} } (THREE Vector3 /
+//       Quaternion work directly). solve() reads the logical state from geometry.
+//   (b) { pieces: <that array> }
+//   (c) { abstract: <abstractState> }   (an abstract state object; see below)
+//   (d) a raw abstract state object (object whose keys include 'tc-0', etc.)
+//
+// OUTPUT FORMAT — an Array of typed moves, applied left-to-right:
+//   { type:'U', amount:n }   // top layer turn by n*30deg; n a nonzero int in [-6..6]
+//   { type:'D', amount:n }   // bottom layer turn
+//   { type:'slice' }         // flip right half 180deg (only emitted where legal)
+//   solve(<solved>) === [].
+//
+// SLICE LEGALITY: every emitted 'slice' is legal at the moment it is applied. The
+//   solver simulates with an abstract canSlice predicate proven equivalent to the
+//   engine's canSlice (see verify_canslice4.mjs).  Apply the moves IN ORDER.
+//
+// MIDDLE PARITY: the two middle halves (mid-L/mid-R) can be flipped/swapped by slices.
+//   This parity is part of the edge coordinate and is solved together with the edges
+//   in Phase 2b (the macro set spans both middle parities).  No caller handling needed.
+//
+// ABSTRACT STATE (the {abstract:...}/raw form):
+//   { 'tc-0':{kind:'corner',layer:'T'|'B',slot:0..11,flip:0|1}, ... 16 corner/edge keys ...,
+//     'mid-L':{kind:'middle',side:'L'|'R',flip:0|1}, 'mid-R':{...} }
+//   solvedAbstractState() and abstractFromProxies(proxies) produce this form.
+//
+// METHOD (reduction; guaranteed to terminate at solved):
+//   Phase 1  : reach cube shape                      (shape DB, 1,351,350 anonymized
+//              shape states, max depth 18 -- BFS lookup + inverse)
+//   align    : rotate U/D so corners land on home grid cells
+//   Phase 2a : solve all 8 corners (perm+flip)       (corner DB, 40,320 states)
+//   Phase 2b : solve 8 edges + middle parity         (edge+mid DB, 80,640 states; 2 cosets
+//              of a 40,320 subgroup joined by a parity macro -- see PARITY_MACRO)
+//   final    : tiny alignment cleanup
+//   All three DBs are built once, lazily, on first solve() and cached (~15-20 s one-time;
+//   subsequent solves are sub-millisecond).
+// =============================================================================
+
+// ---- piece order (index 0..15): corners first within each layer block ----
+// indices: 0..3 top corners, 4..7 top edges, 8..11 bottom corners, 12..15 bottom edges
+const IDS = ['tc-0', 'tc-1', 'tc-2', 'tc-3', 'te-0', 'te-1', 'te-2', 'te-3',
+  'bc-0', 'bc-1', 'bc-2', 'bc-3', 'be-0', 'be-1', 'be-2', 'be-3'];
+const IDX = {}; IDS.forEach((id, i) => IDX[id] = i);
+const IS_CORNER = IDS.map(id => id.includes('c-') ? 1 : 0); // 1 corner, 0 edge
+// position code = layer(0=T,1=B)*12 + slot(0..11)  in [0..23]
+const HOME_POS = {
+  'tc-0': 1, 'tc-1': 4, 'tc-2': 7, 'tc-3': 10, 'te-0': 2, 'te-1': 5, 'te-2': 8, 'te-3': 11,
+  'bc-0': 13, 'bc-1': 16, 'bc-2': 19, 'bc-3': 22, 'be-0': 14, 'be-1': 17, 'be-2': 20, 'be-3': 23,
+};
+const HOMEP = new Int8Array(16); IDS.forEach((id, i) => HOMEP[i] = HOME_POS[id]);
+const RIGHT = [false, false, false, false, false, false, false, false, false, false, false, false];
+for (const s of [0, 1, 2, 9, 10, 11]) RIGHT[s] = true;
+
+// ---- fast state: { p:Int8Array(16) pos-codes, f:Int8Array(16) flips, m:Int8Array(4) middle } ----
+// middle m = [Lside,Lflip,Rside,Rflip], side 0=L 1=R.
+function fastSolved() {
+  const p = Int8Array.from(HOMEP), f = new Int8Array(16), m = Int8Array.from([0, 0, 1, 0]);
+  return { p, f, m };
+}
+function fastClone(s) { return { p: Int8Array.from(s.p), f: Int8Array.from(s.f), m: Int8Array.from(s.m) }; }
+
+function fU(s, n) {
+  n = ((n % 12) + 12) % 12; if (!n) return fastClone(s);
+  const o = fastClone(s);
+  for (let i = 0; i < 16; i++) if (o.p[i] < 12) o.p[i] = (o.p[i] - n + 12) % 12;
+  return o;
+}
+function fD(s, n) {
+  n = ((n % 12) + 12) % 12; if (!n) return fastClone(s);
+  const o = fastClone(s);
+  for (let i = 0; i < 16; i++) if (o.p[i] >= 12) { const sl = o.p[i] - 12; o.p[i] = 12 + ((sl - n + 12) % 12); }
+  return o;
+}
+function fSlice(s) {
+  const o = fastClone(s);
+  for (let i = 0; i < 16; i++) {
+    const layer = o.p[i] >= 12 ? 1 : 0, slot = o.p[i] % 12;
+    if (RIGHT[slot]) { o.p[i] = (layer ^ 1) * 12 + (11 - slot); o.f[i] ^= 1; }
+  }
+  if (o.m[0] === 1) o.m[1] ^= 1; // mid-L if on right
+  if (o.m[2] === 1) o.m[3] ^= 1; // mid-R if on right
+  return o;
+}
+function fCanSlice(s) {
+  for (let i = 0; i < 16; i++) {
+    if (!IS_CORNER[i]) continue;
+    const slot = s.p[i] % 12, fl = s.f[i];
+    if (fl === 0 && (slot === 3 || slot === 9)) return false;
+    if (fl === 1 && (slot === 2 || slot === 8)) return false;
+  }
+  return true;
+}
+function fApply(s, mv) {
+  if (mv.type === 'U') return fU(s, mv.amount);
+  if (mv.type === 'D') return fD(s, mv.amount);
+  return fSlice(s);
+}
+function fApplySeq(s, seq) { let t = s; for (const mv of seq) t = fApply(t, mv); return t; }
+
+// grid string of a layer (for cube-shape + alignment)
+function fLayerGrid(s, layer) {
+  const a = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+  for (let i = 0; i < 16; i++) {
+    const lay = s.p[i] >= 12 ? 1 : 0;
+    if (lay !== layer) continue;
+    const slot = s.p[i] % 12;
+    if (IS_CORNER[i]) { const c0 = s.f[i] === 0 ? (slot - 1 + 12) % 12 : slot; a[c0] = 1; a[(c0 + 1) % 12] = 1; }
+    else a[slot] = 2;
+  }
+  return a.join('');
+}
+const SOLVED_GRID = fLayerGrid(fastSolved(), 0); // '112112112112' (corner,corner,edge repeating)
+// A valid cube-shape layer's grid is a cyclic rotation of SOLVED_GRID.  Precompute the set.
+const CUBE_LAYER_GRIDS = (() => {
+  const set = new Set();
+  const arr = SOLVED_GRID.split('');
+  for (let r = 0; r < 12; r++) {
+    set.add(arr.join(''));
+    arr.unshift(arr.pop()); // rotate by 1
+  }
+  return set;
+})();
+function fIsCube(s) {
+  return CUBE_LAYER_GRIDS.has(fLayerGrid(s, 0)) && CUBE_LAYER_GRIDS.has(fLayerGrid(s, 1));
+}
+// align: rotate top & bottom so each layer grid == SOLVED_GRID. returns {state, moves} or null
+function fAlign(s) {
+  const moves = [];
+  let st = s, okT = false;
+  for (let k = 0; k < 12; k++) { const c = fU(st, k); if (fLayerGrid(c, 0) === SOLVED_GRID) { st = c; if (k) moves.push({ type: 'U', amount: k }); okT = true; break; } }
+  if (!okT) return null;
+  let okB = false;
+  for (let k = 0; k < 12; k++) { const c = fD(st, k); if (fLayerGrid(c, 1) === SOLVED_GRID) { st = c; if (k) moves.push({ type: 'D', amount: k }); okB = true; break; } }
+  if (!okB) return null;
+  return { state: st, moves };
+}
+function fCornersSolved(s) { for (let i = 0; i < 16; i++) { if (IS_CORNER[i] && (s.p[i] !== HOMEP[i] || s.f[i] !== 0)) return false; } return true; }
+function fSolved(s) {
+  for (let i = 0; i < 16; i++) if (s.p[i] !== HOMEP[i] || s.f[i] !== 0) return false;
+  return s.m[0] === 0 && s.m[1] === 0 && s.m[2] === 1 && s.m[3] === 0;
+}
+function fCornerKey(s) { let k = ''; for (let i = 0; i < 16; i++) if (IS_CORNER[i]) k += s.p[i] + '.' + s.f[i] + ','; return k; }
+function fEdgeKey(s) { let k = ''; for (let i = 0; i < 16; i++) if (!IS_CORNER[i]) k += s.p[i] + '.' + s.f[i] + ','; k += s.m.join(''); return k; }
+function fGridKey(s) { return fLayerGrid(s, 0) + '|' + fLayerGrid(s, 1); }
+
+// =============================================================================
+// boundary: proxies / abstract <-> fast state
+// =============================================================================
+function abstractToFast(state) {
+  const p = new Int8Array(16), f = new Int8Array(16), m = new Int8Array(4);
+  for (const id of IDS) {
+    const q = state[id], i = IDX[id];
+    p[i] = (q.layer === 'B' ? 12 : 0) + q.slot;
+    f[i] = q.flip ? 1 : 0;
+  }
+  m[0] = state['mid-L'].side === 'R' ? 1 : 0; m[1] = state['mid-L'].flip ? 1 : 0;
+  m[2] = state['mid-R'].side === 'R' ? 1 : 0; m[3] = state['mid-R'].flip ? 1 : 0;
+  return { p, f, m };
+}
+function solvedAbstractState() {
+  const s = {};
+  for (const id of IDS) { const c = HOME_POS[id]; s[id] = { kind: IS_CORNER[IDX[id]] ? 'corner' : 'edge', layer: c >= 12 ? 'B' : 'T', slot: c % 12, flip: 0 }; }
+  s['mid-L'] = { kind: 'middle', side: 'L', flip: 0 };
+  s['mid-R'] = { kind: 'middle', side: 'R', flip: 0 };
+  return s;
+}
+function cloneState(s) { const o = {}; for (const k in s) o[k] = { ...s[k] }; return o; }
+function abstractFromProxies(proxies) {
+  const s = {};
+  for (const pr of proxies) {
+    const id = pr.id, pos = pr.position, q = pr.quaternion;
+    const upY = 1 - 2 * (q.x * q.x + q.z * q.z);
+    const flip = upY < 0 ? 1 : 0;
+    if (id === 'mid-L' || id === 'mid-R') { s[id] = { kind: 'middle', side: pos.x >= 0 ? 'R' : 'L', flip }; continue; }
+    const theta = Math.atan2(pos.z, pos.x) * 180 / Math.PI;
+    const idx = ((Math.round(theta / 15) % 24) + 24) % 24;
+    const slot = ((Math.round((idx - 1) / 2) % 12) + 12) % 12;
+    s[id] = { kind: IS_CORNER[IDX[id]] ? 'corner' : 'edge', layer: pos.y > 0 ? 'T' : 'B', slot, flip };
+  }
+  return s;
+}
+
+// =============================================================================
+// Phase 1: cube shape  (BFS over grid signature)
+// =============================================================================
+function shapeMoves(s) {
+  const out = [];
+  for (let n = 1; n <= 11; n++) out.push({ type: 'U', amount: n });
+  for (let n = 1; n <= 11; n++) out.push({ type: 'D', amount: n });
+  if (fCanSlice(s)) out.push({ type: 'slice' });
+  return out;
+}
+// Shape-search dedup key.  The shape sub-problem and slice legality do NOT depend on which
+// specific corner/edge is where -- only on the SET of corner (slot,flip) pairs and the set
+// of edge slots in each layer (slice legality = no corner straddles, fully determined by
+// corner (slot,flip); shape = the C/E occupancy).  We therefore key on the ANONYMIZED state
+// (sorted corner (slot,flip) + sorted edge slots per layer), which collapses the corner/edge
+// permutation freedom and keeps the reachable shape set small (a few thousand states) while
+// remaining exact for both shape progress and slice legality.
+function fShapeKey(s) {
+  // bitmask form (fast, sort-free): per layer, a corner sets bit (slot*2+flip) in its
+  // corner-mask; an edge sets bit (slot) in its edge-mask.  Pieces never overlap, so the
+  // mask is an exact set representation.  4 masks -> one string key.
+  let tcM = 0, bcM = 0, teM = 0, beM = 0;
+  for (let i = 0; i < 16; i++) {
+    const layer = s.p[i] >= 12 ? 1 : 0, slot = s.p[i] % 12;
+    if (IS_CORNER[i]) { if (layer) bcM |= 1 << (slot * 2 + s.f[i]); else tcM |= 1 << (slot * 2 + s.f[i]); }
+    else { if (layer) beM |= 1 << slot; else teM |= 1 << slot; }
+  }
+  return tcM + ',' + teM + ',' + bcM + ',' + beM;
+}
+// Shape DB: BFS once from a cube-shape solved state over the anonymized shape space
+// (1,351,350 states, max depth 18), storing predecessor links.  solveShape() looks up the
+// start's shape-key and inverts the stored cube->start path.  Every move on the inverted
+// path is legal: it retraces real shape states and slice legality is a pure function of the
+// anonymized shape state, which the keys capture exactly.
+let SHAPE_DB = null;
+function buildShapeDB() {
+  const start = fastSolved();
+  const came = new Map(); // shapeKey -> {prevKey, mv}
+  came.set(fShapeKey(start), null);
+  let frontier = [start];
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) {
+      const ck = fShapeKey(s);
+      for (const mv of shapeMoves(s)) {
+        const ns = fApply(s, mv);
+        const k = fShapeKey(ns);
+        if (came.has(k)) continue;
+        came.set(k, { prevKey: ck, mv });
+        next.push(ns);
+      }
+    }
+    frontier = next;
+  }
+  return came;
+}
+function solveShape(start) {
+  if (fIsCube(start)) return [];
+  if (!SHAPE_DB) SHAPE_DB = buildShapeDB();
+  const key = fShapeKey(start);
+  if (!SHAPE_DB.has(key)) return null; // not a legally reachable shape
+  // Collect edges from `key` back to cube (each edge: prev --mv--> this), giving the
+  // cube->start move list in reverse; reverse it, then invert to get start->cube.
+  const rev = [];
+  let k = key;
+  while (SHAPE_DB.get(k) !== null) { const e = SHAPE_DB.get(k); rev.push(e.mv); k = e.prevKey; }
+  rev.reverse();
+  return moveSeqInverse(rev);
+}
+
+// =============================================================================
+// Pattern DBs (built once)
+// =============================================================================
+let DB = null;
+
+function buildCornerDB() {
+  const start = fAlign(fastSolved()).state;
+  const came = new Map(); // cornerKey -> {prevKey, moves} (moves: prevState->thisState)
+  const reps = new Map(); // cornerKey -> state
+  const sk = fCornerKey(start);
+  came.set(sk, null); reps.set(sk, start);
+  let frontier = [start];
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) {
+      const ck = fCornerKey(s);
+      for (let a = 0; a < 12; a++) {
+        const su = fU(s, a);
+        for (let b = 0; b < 12; b++) {
+          const adj = fD(su, b);
+          if (!fCanSlice(adj)) continue;
+          const sl = fSlice(adj);
+          if (!fIsCube(sl)) continue;
+          const al = fAlign(sl);
+          if (!al) continue;
+          const nk = fCornerKey(al.state);
+          if (came.has(nk)) continue;
+          const fwd = [];
+          if (a) fwd.push({ type: 'U', amount: a });
+          if (b) fwd.push({ type: 'D', amount: b });
+          fwd.push({ type: 'slice' });
+          for (const mm of al.moves) fwd.push(mm);
+          came.set(nk, { prevKey: ck, moves: fwd });
+          next.push(al.state);
+        }
+      }
+    }
+    frontier = next;
+  }
+  return { came, startKey: sk };
+}
+
+function moveSeqInverse(seq) {
+  const out = [];
+  for (let i = seq.length - 1; i >= 0; i--) {
+    const m = seq[i];
+    if (m.type === 'slice') out.push({ type: 'slice' });
+    else out.push({ type: m.type, amount: ((-m.amount) % 12 + 12) % 12 });
+  }
+  return out;
+}
+// Build a SMALL but COMPLETE corner-preserving generating set.
+//   1. Discover "base" macros by a bounded DFS over (U a)(D b)(slice) steps (<=4 slices)
+//      that return to corner-solved cube shape.  (Pruned by canSlice/cube so it's cheap.)
+//   2. Candidate generators = base macros + their (U a)(D b) conjugates (still corner-
+//      preserving).  3. Greedily pick the smallest subset whose closure reaches the full
+//      40,320-state edge+middle group.  (Verified: 7 generators suffice.)
+function discoverBaseMacros() {
+  const start = fAlign(fastSolved()).state;
+  const sk = fEdgeKey(start);
+  const base = new Map(); // edgeKey -> moves
+  function dfs(s, path, slicesLeft) {
+    for (let a = 0; a < 12; a++) {
+      const su = fU(s, a);
+      for (let b = 0; b < 12; b++) {
+        const adj = fD(su, b);
+        if (!fCanSlice(adj)) continue;
+        const sl = fSlice(adj);
+        if (!fIsCube(sl)) continue;
+        const al = fAlign(sl);
+        if (!al) continue;
+        const fwd = [];
+        if (a) fwd.push({ type: 'U', amount: a });
+        if (b) fwd.push({ type: 'D', amount: b });
+        fwd.push({ type: 'slice' });
+        for (const mm of al.moves) fwd.push(mm);
+        const np = path.concat(fwd);
+        if (fCornersSolved(al.state)) {
+          const k = fEdgeKey(al.state);
+          if (k !== sk && !base.has(k)) base.set(k, np);
+        }
+        if (slicesLeft > 1) dfs(al.state, np, slicesLeft - 1);
+      }
+    }
+  }
+  dfs(start, [], 4);
+  return base;
+}
+function closureSize(start, sk, gens, cap) {
+  const seen = new Set([sk]);
+  let fr = [start];
+  while (fr.length) {
+    const nf = [];
+    for (const s of fr) for (const g of gens) {
+      const t = fApplySeq(s, g);
+      const k = fEdgeKey(t);
+      if (seen.has(k)) continue;
+      seen.add(k); nf.push(t);
+      if (cap && seen.size >= cap) return seen.size;
+    }
+    fr = nf;
+  }
+  return seen.size;
+}
+// The corner-preserving edge+middle group has order 80,640 and consists of TWO cosets
+// of a 40,320 subgroup.  The base macros (+ their U/D conjugates) generate only the
+// 40,320 subgroup (an edge-permutation-parity invariant).  To reach the other coset we
+// need ONE "parity" macro: a corner-preserving sequence that is an ODD edge permutation.
+// PARITY_MACRO below is such a sequence (derived once via scramble+corner-solve; verified
+// at build time to be legal, corner-preserving, and to extend the closure 40,320 -> 80,640).
+const PARITY_MACRO = [
+  { type: 'U', amount: 1 }, { type: 'D', amount: 7 }, { type: 'U', amount: 7 }, { type: 'D', amount: 4 }, { type: 'slice' },
+  { type: 'U', amount: 4 }, { type: 'D', amount: 6 }, { type: 'U', amount: 1 }, { type: 'D', amount: 2 }, { type: 'U', amount: 10 },
+  { type: 'D', amount: 5 }, { type: 'U', amount: 5 }, { type: 'D', amount: 1 }, { type: 'U', amount: 10 }, { type: 'D', amount: 8 },
+  { type: 'U', amount: 9 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 8 }, { type: 'D', amount: 1 },
+  { type: 'U', amount: 9 }, { type: 'D', amount: 10 }, { type: 'U', amount: 6 }, { type: 'D', amount: 9 }, { type: 'slice' },
+  { type: 'U', amount: 11 }, { type: 'D', amount: 4 }, { type: 'U', amount: 7 }, { type: 'D', amount: 10 }, { type: 'slice' },
+  { type: 'U', amount: 2 }, { type: 'D', amount: 11 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 4 },
+  { type: 'slice' }, { type: 'U', amount: 1 }, { type: 'D', amount: 4 }, { type: 'slice' }, { type: 'U', amount: 3 },
+  { type: 'D', amount: 9 }, { type: 'slice' }, { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'U', amount: 7 },
+  { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'U', amount: 11 }, { type: 'slice' },
+  { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 4 },
+  { type: 'U', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 3 }, { type: 'U', amount: 10 }, { type: 'D', amount: 11 },
+  { type: 'slice' }, { type: 'D', amount: 10 }, { type: 'D', amount: 11 }, { type: 'slice' }, { type: 'D', amount: 10 },
+];
+const FULL_EDGE_GROUP = 80640;
+function cornerPreservingGenerators() {
+  const start = fAlign(fastSolved()).state;
+  const sk = fEdgeKey(start);
+  const base = discoverBaseMacros();
+  // candidate list: base macros, then their conjugates, then the parity macro.
+  const cands = [];
+  for (const p of base.values()) {
+    cands.push(p);
+    for (let a = 0; a < 12; a++) for (let b = 0; b < 12; b++) {
+      if (!a && !b) continue;
+      const setup = [];
+      if (a) setup.push({ type: 'U', amount: a });
+      if (b) setup.push({ type: 'D', amount: b });
+      const conj = [...setup, ...p, ...moveSeqInverse(setup)];
+      if (fApplySeqLegal(start, conj) && fCornersSolved(fApplySeq(start, conj))) cands.push(conj);
+    }
+  }
+  // Greedy minimal generating set for the 40,320 SUBGROUP (cheap: closures stay <=40,320).
+  const SUBGROUP = 40320;
+  const gens = [];
+  let cur = 1;
+  for (const g of cands) {
+    if (cur >= SUBGROUP) break;
+    gens.push(g);
+    const sz = closureSize(start, sk, gens, SUBGROUP);
+    if (sz > cur) cur = sz; else gens.pop();
+  }
+  // Add the parity macro to bridge into the second coset (40,320 -> 80,640).
+  if (fApplySeqLegal(start, PARITY_MACRO) && fCornersSolved(fApplySeq(start, PARITY_MACRO))) {
+    gens.push(PARITY_MACRO);
+  }
+  return gens;
+}
+// apply a seq; return false if any slice illegal
+function fApplySeqLegal(s, seq) {
+  let t = s;
+  for (const mv of seq) {
+    if (mv.type === 'slice') { if (!fCanSlice(t)) return false; t = fSlice(t); }
+    else t = fApply(t, mv);
+  }
+  return true;
+}
+
+function buildEdgeDB() {
+  const start = fAlign(fastSolved()).state;
+  const gens = cornerPreservingGenerators();
+  const came = new Map(); // edgeKey -> {prevKey, moves}
+  const sk = fEdgeKey(start);
+  came.set(sk, null);
+  let frontier = [start];
+  while (frontier.length) {
+    const next = [];
+    for (const s of frontier) {
+      const ek = fEdgeKey(s);
+      for (const seq of gens) {
+        const t = fApplySeq(s, seq);
+        const nk = fEdgeKey(t);
+        if (came.has(nk)) continue;
+        came.set(nk, { prevKey: ek, moves: seq });
+        next.push(t);
+      }
+    }
+    frontier = next;
+  }
+  return { came, startKey: sk, genCount: gens.length };
+}
+
+function ensureDB() {
+  if (DB) return DB;
+  const dbg = (typeof process !== 'undefined' && process.env) ? process.env.SQ1_DEBUG : '';
+  if (dbg) console.error('[DB] building corner DB...');
+  const corner = buildCornerDB();
+  if (dbg) console.error('[DB] corner DB size=' + corner.came.size);
+  const edge = buildEdgeDB();
+  if (dbg) console.error('[DB] edge DB size=' + edge.came.size + ' gens=' + edge.genCount);
+  DB = { corner, edge };
+  return DB;
+}
+
+// Walk a BFS "came" map (built outward from START) to recover the forward path
+// START->key, then invert it to get key->START.
+function pathToStart(came, key) {
+  const segs = [];
+  let k = key;
+  while (came.get(k) !== null) { const e = came.get(k); segs.push(e.moves); k = e.prevKey; }
+  segs.reverse();
+  const forward = [];
+  for (const seg of segs) for (const m of seg) forward.push(m);
+  return moveSeqInverse(forward);
+}
+
+// =============================================================================
+// solve()
+// =============================================================================
+function solve(input) {
+  let abs;
+  if (Array.isArray(input)) abs = abstractFromProxies(input);
+  else if (input && Array.isArray(input.pieces)) abs = abstractFromProxies(input.pieces);
+  else if (input && input.abstract) abs = cloneState(input.abstract);
+  else if (input && typeof input === 'object' && input['tc-0']) abs = cloneState(input);
+  else throw new Error('solve: unrecognized input format');
+
+  let st = abstractToFast(abs);
+  if (fSolved(st)) return [];
+  ensureDB();
+
+  const solution = [];
+  const push = (mv) => { st = fApply(st, mv); solution.push(mv); };
+
+  // Phase 1: cube shape
+  const shapePath = solveShape(st);
+  if (shapePath === null) throw new Error('solve: failed to reach cube shape');
+  for (const mv of shapePath) push(mv);
+
+  // align
+  let al = fAlign(st);
+  if (!al) throw new Error('solve: align failed');
+  for (const mv of al.moves) push(mv);
+
+  // Phase 2a: corners
+  const ck = fCornerKey(st);
+  if (!DB.corner.came.has(ck)) throw new Error('solve: corner state not in DB');
+  for (const mv of pathToStart(DB.corner.came, ck)) push(mv);
+  al = fAlign(st); for (const mv of al.moves) push(mv);
+
+  // Phase 2b: edges + middle
+  const ek = fEdgeKey(st);
+  if (!DB.edge.came.has(ek)) throw new Error('solve: edge state not in DB (corners=' + fCornersSolved(st) + ')');
+  for (const mv of pathToStart(DB.edge.came, ek)) push(mv);
+
+  // final cleanup alignment
+  if (!fSolved(st)) { const fix = fAlign(st); if (fix) for (const mv of fix.moves) push(mv); }
+  if (!fSolved(st)) {
+    for (let a = 0; a < 12 && !fSolved(st); a++) for (let b = 0; b < 12; b++) {
+      if (fSolved(fD(fU(st, a), b))) { if (a) push({ type: 'U', amount: a }); if (b) push({ type: 'D', amount: b }); break; }
+    }
+  }
+  if (!fSolved(st)) throw new Error('solve: did not reach solved state');
+
+  return normalizeMoves(solution);
+}
+
+// merge consecutive same-layer turns; drop no-ops; amounts in [-6..6]\{0}
+function normalizeMoves(moves) {
+  const out = [];
+  for (const mv of moves) {
+    if (mv.type === 'slice') { out.push({ type: 'slice' }); continue; }
+    let amount = mv.amount;
+    if (out.length && out[out.length - 1].type === mv.type) { amount += out[out.length - 1].amount; out.pop(); }
+    amount = ((amount % 12) + 12) % 12;
+    if (amount > 6) amount -= 12;
+    if (amount !== 0) out.push({ type: mv.type, amount });
+  }
+  return out;
+}
+
+// abstract helpers (kept for callers / tests)
+function applyAbstract(state, mv) {
+  // operate via fast state then convert back
+  const f = abstractToFast(state);
+  const nf = fApply(f, mv);
+  return fastToAbstract(nf);
+}
+function fastToAbstract(f) {
+  const s = {};
+  for (let i = 0; i < 16; i++) {
+    const id = IDS[i];
+    s[id] = { kind: IS_CORNER[i] ? 'corner' : 'edge', layer: f.p[i] >= 12 ? 'B' : 'T', slot: f.p[i] % 12, flip: f.f[i] };
+  }
+  s['mid-L'] = { kind: 'middle', side: f.m[0] === 1 ? 'R' : 'L', flip: f.m[1] };
+  s['mid-R'] = { kind: 'middle', side: f.m[2] === 1 ? 'R' : 'L', flip: f.m[3] };
+  return s;
+}
+function canSliceState(state) { return fCanSlice(abstractToFast(state)); }
+function isSolvedState(state) { return fSolved(abstractToFast(state)); }
+  return { solve };
+})();
+function sq1SolveFull() {
+  let moves; try { moves = sq1Solver.solve(sq1Pieces); } catch (e) { return null; }
+  if (!moves) return null;
+  const toks = [];
+  for (const mv of moves) {
+    if (mv.type === 'slice') { toks.push('/'); continue; }
+    const t = mv.type === 'U' ? 'U' : 'D', tok = mv.amount > 0 ? t : t + "'";
+    for (let i = 0; i < Math.abs(mv.amount); i++) toks.push(tok);
+  }
+  return toks;
+}
+const puzzleSq1 = {
+  id:'sq1', name:'Square-1', group:sq1Group,
+  DEFS:{ U:{}, D:{}, '/':{} },
+  buildMove:(f,p,d)=>sq1BuildMove(f,p),
+  selectPieces:(m)=>(m.select === 'right' && !sq1Geo.canSlice(sq1Pieces)) ? [] : sq1Geo.selectPieces(m,sq1Pieces),  // gate slice legality at activation
+  snapPiece:(p)=>sq1Geo.snapPiece(p),
+  build:sq1Reset, updateNet:()=>{}, updateProjections:()=>{}, finalizeMovePhase:sq1Finalize,
+  readState:sq1ReadState, solveFull:sq1SolveFull, scramble:sq1Scramble, storageKey:'sq1-solves',
+  keymap:{ faceKeys:{ u:'U', d:'D', '/':'/' } },
+  phaseConfig:{order:['solve'],labels:{solve:'Solve'}},
+  drillLabel:'',makeDrill:()=>null,solverLabel:'',solverGoals:[],solve:()=>null,
+  dockGroups:[ {label:'Top', moves:['U'], variants:['', "'"]}, {label:'Bottom', moves:['D'], variants:['', "'"]}, {label:'Slice', moves:['/'], variants:['']} ],
+  helpHTML:`<div><b>U</b>/<b>D</b> = turn top/bottom 30° (keys <kbd>u</kbd> <kbd>d</kbd>, Shift = reverse)</div>
+    <div><b>/</b> = slice the right half (key <kbd>/</kbd>) — only when aligned</div>
+    <div><kbd>Space</kbd> = pause / hide</div>
+    <div>Drag to orbit · scroll to zoom</div>`,
+};
+
+const PUZZLES = { '2x2': puzzle2x2, '3x3': puzzleCube3, 'pyraminx': puzzlePyra, 'megaminx': puzzleMega, 'skewb': puzzleSkewb, 'sq1': puzzleSq1 };
 puzzle = puzzle2x2;
 buildDock();
 buildSolver();
+solveBtnEl.style.display = puzzle.solveFull ? '' : 'none';
 
 function switchPuzzle(id) {
   if (!PUZZLES[id] || puzzle.id === id) return;
@@ -5081,6 +8693,8 @@ function switchPuzzle(id) {
   cube3Group.visible = (id === '3x3');
   pyraGroup.visible = (id === 'pyraminx');
   megaGroup.visible = (id === 'megaminx');
+  skewbGroup.visible = (id === 'skewb');
+  sq1Group.visible = (id === 'sq1');
   projGroup.visible = (id === '2x2');                       // 2×2 projections
   pyraProjGroup.visible = (id === 'pyraminx');              // Pyraminx projections
   netEl.style.visibility = (id === '2x2') ? 'visible' : 'hidden';
@@ -5098,8 +8712,12 @@ function switchPuzzle(id) {
     const fit = Math.max(8, Math.min(18, 9 / Math.min(1, camera.aspect)));
     camera.position.set(0.46, 0.42, 0.78).normalize().multiplyScalar(fit);
     controls.update();
+  } else if (id === 'sq1') {                                // shape-shifts → extra room
+    const fit = Math.max(7, Math.min(15, 8 / Math.min(1, camera.aspect)));
+    camera.position.set(0.5, 0.5, 0.72).normalize().multiplyScalar(fit);
+    controls.update();
   } else {
-    camera.position.set(4.6, 4.2, 6.5); controls.update();
+    camera.position.set(4.6, 4.2, 6.5); controls.update();   // 2×2 / 3×3 / Skewb
   }
   solves = loadSolves(puzzle.storageKey);                  // per-puzzle stats — never collide
   resetState(true);
@@ -5107,6 +8725,7 @@ function switchPuzzle(id) {
   buildSolver();
   solverEl.style.display = (puzzle.solverGoals && puzzle.solverGoals.length) ? '' : 'none';   // no first-layer solver yet for Megaminx
   drillEl.style.display = puzzle.drillLabel ? '' : 'none';                                     // no drills yet for Megaminx
+  solveBtnEl.style.display = puzzle.solveFull ? '' : 'none';                                   // Solve button only when a solver exists
   drillLabelEl.textContent = puzzle.drillLabel;
   drillResultEl.textContent = '';
   document.querySelector('.help').innerHTML = puzzle.helpHTML;
@@ -5117,6 +8736,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 // Restore the puzzle chosen on the previous visit (2×2 stays the first-load default).
 try { const last = localStorage.getItem('cubing-last-puzzle'); if (last && PUZZLES[last] && last !== puzzle.id) switchPuzzle(last); } catch (e) {}
