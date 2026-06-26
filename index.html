@@ -307,6 +307,7 @@
   .pyra-net.on { display: block; }
   .pyra-net svg { display: block; width: 172px; height: 156px; overflow: visible; }
   .pyra-net path { stroke: #15151b; stroke-width: 0.8; stroke-linejoin: round; }
+  .pyra-net .face-outline { fill: none; stroke: #e7e7ef; stroke-width: 1.6; stroke-linejoin: round; stroke-opacity: 0.85; }
 
   .help {
     font-size: 11.5px; color: var(--text-dim); line-height: 1.7;
@@ -5570,6 +5571,13 @@ const pyraNetPolys = [[], [], [], []];
       pyraNetSvg.appendChild(path);
       pyraNetPolys[f][si] = path;
     });
+  }
+  // Face-boundary outlines (drawn on top) so adjacent faces are easy to tell apart.
+  for (let f = 0; f < 4; f++) {
+    const out = document.createElementNS(PYRA_NET_NS, 'polygon');
+    out.setAttribute('points', Object.values(faceCorners[f]).map(a => P[a].join(',')).join(' '));
+    out.setAttribute('class', 'face-outline');
+    pyraNetSvg.appendChild(out);
   }
 }
 
