@@ -942,7 +942,7 @@ function applyMove(tok, phase = 'solve', force = false) {
   const face = eng[0];
   const prime = eng.includes("'");
   const double = eng.includes('2');
-  const move = puzzle.buildMove(face, prime, double);
+  const move = puzzle.buildMove(face, prime, double, eng);
   if (!move) return;
   // A move is "tracked" (recorded to history, phased, timed) only inside an attempt: scramble moves
   // always; anything while running; a face turn during inspection (which starts the timer). A
@@ -958,7 +958,7 @@ function applyMove(tok, phase = 'solve', force = false) {
 // minutes to animate. Mirrors the engine's per-move math in one step.
 const _instQ = new THREE.Quaternion();
 function applyMoveInstant(tok) {
-  const move = puzzle.buildMove(tok[0], tok.includes("'"), tok.includes('2'));
+  const move = puzzle.buildMove(tok[0], tok.includes("'"), tok.includes('2'), tok);
   if (!move) return;
   const cubies = puzzle.selectPieces(move);
   _instQ.setFromAxisAngle(move.axis, move.target);
@@ -7749,6 +7749,29 @@ for (const p of skewbGeo.pieces) if (p.kind === 'corner') { const c = p.center, 
 // never moves and every reachable state stays in the solver's space — while all 8
 // corners remain clickable (each maps to its diagonal's cap turn).
 const SKEWB_CORNER_TO_AXISDIR = SKEWB_CORNER_DIRS.map(d => { let bj = 0, bd = -2; for (let j = 0; j < skewbGeo.axes.length; j++) { const a = skewbGeo.axes[j].dir, ad = Math.abs(d[0]*a[0]+d[1]*a[1]+d[2]*a[2]); if (ad > bd) { bd = ad; bj = j; } } return skewbGeo.axes[bj].dir; });
+// Offset every edge of a convex planar polygon inward by a CONSTANT distance g
+// (true polygon erosion), so the black grout is the same width on every piece —
+// scaling toward the centroid by a fixed fraction instead makes big facelets
+// (face centres) get fat grout and small ones (corner triangles) get thin grout.
+function skewbInset(poly, n, g) {
+  const N = poly.length;
+  const sub=(a,b)=>[a[0]-b[0],a[1]-b[1],a[2]-b[2]], add=(a,b)=>[a[0]+b[0],a[1]+b[1],a[2]+b[2]], scl=(a,s)=>[a[0]*s,a[1]*s,a[2]*s];
+  const cross=(a,b)=>[a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]], dot=(a,b)=>a[0]*b[0]+a[1]*b[1]+a[2]*b[2];
+  const norm=a=>{const L=Math.hypot(a[0],a[1],a[2])||1;return [a[0]/L,a[1]/L,a[2]/L];};
+  const pc = poly.reduce((s,p)=>add(s,p),[0,0,0]).map(x=>x/N);
+  const lines = poly.map((a,i)=>{
+    const b=poly[(i+1)%N], ed=norm(sub(b,a)); let inN=norm(cross(n,ed));
+    const mid=scl(add(a,b),0.5); if (dot(inN,sub(pc,mid))<0) inN=scl(inN,-1);
+    return { p: add(a,scl(inN,g)), d: ed };
+  });
+  return poly.map((_,i)=>{
+    const L1=lines[(i-1+N)%N], L2=lines[i];
+    const denom=dot(cross(L1.d,L2.d),n) || 1e-9;
+    const t=dot(cross(sub(L2.p,L1.p),L2.d),n)/denom;
+    return add(L1.p, scl(L1.d,t));
+  });
+}
+const SKEWB_GROUT = 0.045;
 const skewbPieces = skewbGeo.pieces.map(desc => {
   const g = new THREE.Group(); g.position.set(desc.center[0],desc.center[1],desc.center[2]);
   const O = [-desc.center[0],-desc.center[1],-desc.center[2]];
@@ -7759,8 +7782,8 @@ const skewbPieces = skewbGeo.pieces.map(desc => {
     const pc = poly.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(x=>x/poly.length);
     for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...pc,...a,...b);}
     for (let i=0;i<poly.length;i++){const a=poly[i],b=poly[(i+1)%poly.length];dark.push(...a,...b,...O);}
-    const INSET=0.86, RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
-    const ip=poly.map(p=>[pc[0]+(p[0]-pc[0])*INSET+r[0],pc[1]+(p[1]-pc[1])*INSET+r[1],pc[2]+(p[2]-pc[2])*INSET+r[2]]);
+    const RAISE=0.012, r=[cn[0]*RAISE,cn[1]*RAISE,cn[2]*RAISE];
+    const ip=skewbInset(poly, cn, SKEWB_GROUT).map(p=>[p[0]+r[0],p[1]+r[1],p[2]+r[2]]);
     const Cr=[pc[0]+r[0],pc[1]+r[1],pc[2]+r[2]], cpos=[], cnrm=[];
     for(let i=0;i<ip.length;i++){const a=ip[i],b=ip[(i+1)%ip.length];cpos.push(...Cr,...a,...b);for(let k=0;k<3;k++)cnrm.push(cn[0],cn[1],cn[2]);}
     const fg=new THREE.BufferGeometry();
@@ -8069,17 +8092,31 @@ const sq1Pieces = sq1Geo.pieces.map(desc => {
 function sq1Reset(){ for(const p of sq1Pieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
 function sq1ReadState(){ return sq1Geo.readState(sq1Pieces); }
 function sq1Solved(){ return !!(sq1Geo.isSolved && sq1Geo.isSolved(sq1Pieces)); }
-function sq1BuildMove(face, prime){
+function sq1BuildMove(face, prime, tok){
   // NOTE: legality of a slice must be judged when it ANIMATES, not when it is
   // enqueued — a batch of moves (scramble / solve) is built synchronously against
   // the current state, so an enqueue-time canSlice check tests the wrong state.
   // We always build the slice move and gate it in selectPieces (activation time).
   if (face === '/') return sq1Geo.buildMove('slice', 1);
-  if (face === 'U') return sq1Geo.buildMove('U', prime ? -1 : 1);
-  if (face === 'D') return sq1Geo.buildMove('D', prime ? -1 : 1);
+  if (face === 'U' || face === 'D') {                              // amount-bearing token e.g. U3, D4', U' (=1)
+    const m = tok && String(tok).match(/(\d+)/);
+    let amt = m ? parseInt(m[1], 10) : 1;
+    if (prime) amt = -amt;
+    return sq1Geo.buildMove(face, amt);
+  }
   return null;
 }
-function sq1Scramble(){ const t=[]; for(let r=0;r<10;r++){ const u=1+Math.floor(Math.random()*11), d=1+Math.floor(Math.random()*11); for(let i=0;i<u;i++)t.push('U'); for(let i=0;i<d;i++)t.push('D'); t.push('/'); } return t; }
+// One token per turn (real Square-1 notation): U/D + magnitude (omitted when 1) + ' for negative; slice = /
+function sq1MovesToToks(moves){
+  const toks = [];
+  for (const mv of moves) {
+    if (mv.type === 'slice') { toks.push('/'); continue; }
+    const mag = Math.abs(mv.amount);
+    toks.push(mv.type + (mag === 1 ? '' : mag) + (mv.amount < 0 ? "'" : ''));
+  }
+  return toks;
+}
+function sq1Scramble(){ return sq1MovesToToks(sq1Solver.scramble(Math.random)); }
 function sq1Finalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&sq1Solved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
 /* ===== Square-1 solver — reduction/DB (node-verified 200/200, avg ~74 moves,
    non-optimal but always-solves). No imports; reads the live proxy pieces.
@@ -8648,23 +8685,38 @@ function fastToAbstract(f) {
 }
 function canSliceState(state) { return fCanSlice(abstractToFast(state)); }
 function isSolvedState(state) { return fSolved(abstractToFast(state)); }
-  return { solve };
+  // Generate a clean, always-legal scramble in the solver's own model: pick a
+  // top/bottom amount per round such that the slice is legal, so no slice is ever
+  // skipped and each turn is a single move (not a run of 30° unit turns).
+  function scramble(rnd) {
+    let st = fastSolved();
+    const out = [];
+    for (let r = 0; r < 13; r++) {
+      let a = 0, b = 0, su = null;
+      for (let t = 0; t < 80; t++) {
+        a = Math.floor(rnd() * 12); b = Math.floor(rnd() * 12);
+        const cand = fD(fU(st, a), b);
+        if (fCanSlice(cand)) { su = cand; break; }
+      }
+      if (!su) continue;
+      st = fSlice(su);
+      const za = (a > 6 ? a - 12 : a), zb = (b > 6 ? b - 12 : b);   // reduce to [-5,6]
+      if (za) out.push({ type: 'U', amount: za });
+      if (zb) out.push({ type: 'D', amount: zb });
+      out.push({ type: 'slice' });
+    }
+    return out;
+  }
+  return { solve, scramble };
 })();
 function sq1SolveFull() {
   let moves; try { moves = sq1Solver.solve(sq1Pieces); } catch (e) { return null; }
-  if (!moves) return null;
-  const toks = [];
-  for (const mv of moves) {
-    if (mv.type === 'slice') { toks.push('/'); continue; }
-    const t = mv.type === 'U' ? 'U' : 'D', tok = mv.amount > 0 ? t : t + "'";
-    for (let i = 0; i < Math.abs(mv.amount); i++) toks.push(tok);
-  }
-  return toks;
+  return moves ? sq1MovesToToks(moves) : null;
 }
 const puzzleSq1 = {
   id:'sq1', name:'Square-1', group:sq1Group,
   DEFS:{ U:{}, D:{}, '/':{} },
-  buildMove:(f,p,d)=>sq1BuildMove(f,p),
+  buildMove:(f,p,d,tok)=>sq1BuildMove(f,p,tok),
   selectPieces:(m)=>(m.select === 'right' && !sq1Geo.canSlice(sq1Pieces)) ? [] : sq1Geo.selectPieces(m,sq1Pieces),  // gate slice legality at activation
   snapPiece:(p)=>sq1Geo.snapPiece(p),
   build:sq1Reset, updateNet:()=>{}, updateProjections:()=>{}, finalizeMovePhase:sq1Finalize,
