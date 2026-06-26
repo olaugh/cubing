@@ -5054,19 +5054,20 @@ function megaFinalize() {
   renderHistory();
 }
 
-/* ===== Megaminx solver — reduction/commutator (node-verified 200/200, ~1700-move
-   non-optimal but always-solves). Imports stripped; reuses the app's THREE +
-   makeMegaGeo. Table build (~5s) is LAZY — deferred to the first Megaminx Solve. ===== */
+/* ===== Megaminx solver — reduction via oriented 3-cycles (node-verified 200/200,
+   avg ~400 moves — ~4× shorter than the old commutator solver). Imports stripped;
+   reuses the app's THREE + makeMegaGeo. Table build (~9s) is LAZY — deferred to the
+   first Megaminx Solve. solve() returns [{face,amount}], amount in {-2,-1,1,2}. ===== */
 let _megaSolveFn = null;
 function megaGetSolve() {
   if (_megaSolveFn) return _megaSolveFn;
   _megaSolveFn = (function () {
-// ---------------------------------------------------------------------------
-// Geometry engine + logical generators
-// ---------------------------------------------------------------------------
 const geo = makeMegaGeo(THREE, 1.0);
 const { pieces, selectPieces, buildMove, snapPiece, readState } = geo;
 
+// ---------------------------------------------------------------------------
+// Engine -> logical generators (24 single 72 deg turns). gi = face*2 + prime.
+// ---------------------------------------------------------------------------
 function makeProxies() {
   return pieces.map((p) => ({
     id: p.id,
@@ -5078,10 +5079,7 @@ function engineApply(proxies, faceName, prime) {
   const m = buildMove(faceName, prime, false);
   const sel = selectPieces(m, proxies);
   const q = new THREE.Quaternion().setFromAxisAngle(m.axis, m.target);
-  for (const p of sel) {
-    p.position.applyQuaternion(q);
-    p.quaternion.premultiply(q);
-  }
+  for (const p of sel) { p.position.applyQuaternion(q); p.quaternion.premultiply(q); }
   for (const p of sel) snapPiece(p);
 }
 function deriveGen(faceName, prime) {
@@ -5090,35 +5088,22 @@ function deriveGen(faceName, prime) {
   return readState(px);
 }
 
-const SOLVED = readState(makeProxies());
-
-// Token <-> generator index. 24 single-turn tokens.
-const TOKENS = [];
-const GEN = []; // index -> {cp,co,ep,eo} (typed)
-const tokFace = [];
-const tokInv = [];
-const tokIndex = new Map();
+const GEN = [];
+const genFace = [];
+const genPrime = [];
 for (let f = 0; f < 12; f++) {
   for (const pr of [false, true]) {
-    const tok = "F" + f + (pr ? "'" : "");
     const g = deriveGen("F" + f, pr);
-    tokIndex.set(tok, TOKENS.length);
-    TOKENS.push(tok);
     GEN.push({
-      cp: Int8Array.from(g.cp),
-      co: Int8Array.from(g.co),
-      ep: Int8Array.from(g.ep),
-      eo: Int8Array.from(g.eo),
+      cp: Int8Array.from(g.cp), co: Int8Array.from(g.co),
+      ep: Int8Array.from(g.ep), eo: Int8Array.from(g.eo),
     });
-    tokFace.push(f);
+    genFace.push(f); genPrime.push(pr);
   }
 }
-const NG = TOKENS.length;
-for (let i = 0; i < NG; i++) {
-  const t = TOKENS[i];
-  const inv = t.endsWith("'") ? t.slice(0, -1) : t + "'";
-  tokInv.push(tokIndex.get(inv));
-}
+const NG = GEN.length;
+const ginv = [];
+for (let f = 0; f < 12; f++) { ginv[f * 2] = f * 2 + 1; ginv[f * 2 + 1] = f * 2; }
 
 const IDS = {
   cp: Int8Array.from({ length: 20 }, (_, i) => i),
@@ -5127,46 +5112,26 @@ const IDS = {
   eo: new Int8Array(30),
 };
 
-// Compose state with one generator index.
+// state composition: (S then move gi)
 function comp(S, gi) {
   const g = GEN[gi];
   const cp = new Int8Array(20), co = new Int8Array(20);
   const ep = new Int8Array(30), eo = new Int8Array(30);
-  for (let i = 0; i < 20; i++) {
-    const s = g.cp[i];
-    cp[i] = S.cp[s];
-    co[i] = (S.co[s] + g.co[i]) % 3;
-  }
-  for (let i = 0; i < 30; i++) {
-    const s = g.ep[i];
-    ep[i] = S.ep[s];
-    eo[i] = (S.eo[s] + g.eo[i]) % 2;
-  }
+  for (let i = 0; i < 20; i++) { const s = g.cp[i]; cp[i] = S.cp[s]; co[i] = (S.co[s] + g.co[i]) % 3; }
+  for (let i = 0; i < 30; i++) { const s = g.ep[i]; ep[i] = S.ep[s]; eo[i] = (S.eo[s] + g.eo[i]) % 2; }
   return { cp, co, ep, eo };
 }
-// Generator (effect-on-solved) for a list of token indices.
-function genOfIdx(idxList) {
-  let S = IDS;
-  for (const gi of idxList) S = comp(S, gi);
-  return S;
-}
-// Compose two generators: result = (apply A, then B). result.cp[i] = A.cp[B.cp[i]] ...
-function composeGen(A, B) {
+function applySeqState(S, seq) { let X = S; for (const gi of seq) X = comp(X, gi); return X; }
+function genOf(seq) { return applySeqState(IDS, seq); }
+
+// generator algebra on effect-states
+function composeGen(A, B) { // result = A then B
   const cp = new Int8Array(20), co = new Int8Array(20);
   const ep = new Int8Array(30), eo = new Int8Array(30);
-  for (let i = 0; i < 20; i++) {
-    const s = B.cp[i];
-    cp[i] = A.cp[s];
-    co[i] = (A.co[s] + B.co[i]) % 3;
-  }
-  for (let i = 0; i < 30; i++) {
-    const s = B.ep[i];
-    ep[i] = A.ep[s];
-    eo[i] = (A.eo[s] + B.eo[i]) % 2;
-  }
+  for (let i = 0; i < 20; i++) { const s = B.cp[i]; cp[i] = A.cp[s]; co[i] = (A.co[s] + B.co[i]) % 3; }
+  for (let i = 0; i < 30; i++) { const s = B.ep[i]; ep[i] = A.ep[s]; eo[i] = (A.eo[s] + B.eo[i]) % 2; }
   return { cp, co, ep, eo };
 }
-// Inverse generator.
 function invGen(A) {
   const cp = new Int8Array(20), co = new Int8Array(20);
   const ep = new Int8Array(30), eo = new Int8Array(30);
@@ -5174,14 +5139,76 @@ function invGen(A) {
   for (let i = 0; i < 30; i++) { ep[A.ep[i]] = i; eo[A.ep[i]] = (2 - A.eo[i]) % 2; }
   return { cp, co, ep, eo };
 }
-const idxOfTokens = (toks) => toks.map((t) => tokIndex.get(t));
-const tokensOfIdx = (idx) => idx.map((i) => TOKENS[i]);
-const invIdxList = (idx) => idx.slice().reverse().map((i) => tokInv[i]);
+const invSeq = (seq) => seq.slice().reverse().map((g) => ginv[g]);
+
+// Self-cancel / merge a gi-sequence: collapse adjacent same-face turns (order 5)
+// into the minimal-move equivalent (a 144deg double counts the same as a single
+// for sequence-length comparison; we keep the move COUNT minimal). Returns a new
+// gi-sequence using only single turns but with same-face runs reduced so that a
+// run nets 0,1,2,-2,-1 quarter... here turns are 72deg/order5. We re-expand a
+// net amount n in {1,2,3,4} to |n| single turns of the shorter direction:
+//   net 1 -> [f0+]; 2 -> [f+,f+]; 3 -> [f-,f-]; 4 -> [f-]. (drop net 0)
+// This keeps gi-sequences valid (single turns) while removing cancellations,
+// so the move-count metric after final {face,amount} merging is minimized.
+function reduceSeq(seq) {
+  const stack = []; // {face, net mod5 in 0..4}
+  for (const gi of seq) {
+    const face = genFace[gi];
+    const amt = genPrime[gi] ? 4 : 1; // -1 == +4 mod 5
+    if (stack.length && stack[stack.length - 1].face === face) {
+      const top = stack[stack.length - 1];
+      top.net = (top.net + amt) % 5;
+      if (top.net === 0) stack.pop();
+    } else {
+      stack.push({ face, net: amt % 5 });
+    }
+  }
+  // merge again after any pops created same-face neighbors
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i + 1 < stack.length; i++) {
+      if (stack[i].face === stack[i + 1].face) {
+        const net = (stack[i].net + stack[i + 1].net) % 5;
+        stack.splice(i, 2, ...(net === 0 ? [] : [{ face: stack[i].face, net }]));
+        changed = true; break;
+      }
+    }
+  }
+  const out = [];
+  for (const { face, net } of stack) {
+    if (net === 1) out.push(face * 2);
+    else if (net === 2) { out.push(face * 2); out.push(face * 2); }
+    else if (net === 3) { out.push(face * 2 + 1); out.push(face * 2 + 1); }
+    else if (net === 4) out.push(face * 2 + 1);
+  }
+  return out;
+}
+// move-count of a reduced gi-sequence (each same-face maximal run = 1 move)
+function moveCount(seq) {
+  let c = 0, last = -1;
+  for (const gi of seq) { if (genFace[gi] !== last) { c++; last = genFace[gi]; } }
+  return c;
+}
 
 // ---------------------------------------------------------------------------
-// Base primitive shapes (found once by commutator search over the generators).
+// Base primitives.
+//   CORNER3: shortest pure corner 3-cycle (8 turns).
+//   EDGE3:   short pure edge 3-cycle (12 turns) from the verified old solver.
+//   OC3 / OE3: oriented siblings to construct pure 2-twist / 2-flip.
+// All are sequences of generator indices; verified pure at load.
 // ---------------------------------------------------------------------------
-const CORNER_BASES = [
+function tokSeq(arr) { // ["F0","F1'",...] -> gi indices
+  return arr.map((t) => {
+    const prime = t.endsWith("'");
+    const f = parseInt((prime ? t.slice(1, -1) : t.slice(1)), 10);
+    return f * 2 + (prime ? 1 : 0);
+  });
+}
+// Full base shape lists (verified complete) — corner 3-cycle family (11) and
+// edge 3-cycle family (55). Their conjugation orbits cover all directed
+// corner / edge content moves. (Carried over from the verified solver.)
+const CORNER_BASES_TOK = [
   ["F0", "F4'", "F0'", "F2", "F0", "F4", "F0'", "F2'"],
   ["F0", "F2", "F7", "F2'", "F0'", "F2", "F7'", "F2'"],
   ["F0", "F4'", "F11'", "F4", "F0'", "F4'", "F11", "F4"],
@@ -5194,11 +5221,7 @@ const CORNER_BASES = [
   ["F5", "F6", "F11", "F6'", "F5'", "F6", "F11'", "F6'"],
   ["F5'", "F9", "F10'", "F9'", "F5", "F9", "F10", "F9'"],
 ];
-// The base edge 3-cycle shape, plus a family of 55 edge 3-cycle shapes (found
-// once by commutator search) whose conjugation orbits cover all 870 directed
-// edge content-moves.
-const EDGE3 = ["F0", "F1", "F0'", "F6", "F4", "F6'", "F0", "F1'", "F0'", "F6", "F4'", "F6'"];
-const EDGE_BASES = [
+const EDGE_BASES_TOK = [
   ["F0", "F1", "F0'", "F6", "F4", "F6'", "F0", "F1'", "F0'", "F6", "F4'", "F6'"],
   ["F0", "F1", "F0'", "F6", "F4'", "F6'", "F0", "F1'", "F0'", "F6", "F4", "F6'"],
   ["F0", "F2", "F0'", "F5", "F1", "F5'", "F0", "F2'", "F0'", "F5", "F1'", "F5'"],
@@ -5255,182 +5278,156 @@ const EDGE_BASES = [
   ["F7'", "F10'", "F7", "F8'", "F3'", "F8", "F7'", "F10", "F7", "F8'", "F3", "F8"],
   ["F8'", "F10", "F8", "F9'", "F11'", "F9", "F8'", "F10'", "F8", "F9'", "F11", "F9"],
 ];
-// Oriented siblings used to build TWIST / FLIP.
-const OC3 = ["F0", "F1", "F5'", "F1'", "F0'", "F1", "F5", "F1'"]; // corner 3-cycle w/ twist
-const OE3 = ["F0", "F1'", "F0'", "F6", "F4", "F6'", "F0", "F1", "F0'", "F6", "F4'", "F6'"]; // edge 3-cycle w/ flips
+const CORNER_BASES = CORNER_BASES_TOK.map(tokSeq);
+const EDGE_BASES = EDGE_BASES_TOK.map(tokSeq);
 const CORNER3 = CORNER_BASES[0];
+const EDGE3 = EDGE_BASES[0];
+const OC3 = tokSeq(["F0", "F1", "F5'", "F1'", "F0'", "F1", "F5", "F1'"]); // corner 3-cycle w/ twist
+const OE3 = tokSeq(["F0", "F1'", "F0'", "F6", "F4", "F6'", "F0", "F1", "F0'", "F6", "F4'", "F6'"]); // edge 3-cycle w/ flips
 
 // ---------------------------------------------------------------------------
-// Helpers for clean-effect testing.
+// Cycle helper.
 // ---------------------------------------------------------------------------
-function fwdCycle(p, n) {
-  const f = new Int8Array(n).fill(-1);
-  for (let i = 0; i < n; i++) f[p[i]] = i;
+function fwdCycle(p, n) { // p[i]=source. return the single nontrivial cycle as [a,b,c,...] in slot order
+  const inv = new Int8Array(n).fill(-1);
+  for (let i = 0; i < n; i++) inv[p[i]] = i; // inv[i]=destination of i
   let start = -1;
   for (let i = 0; i < n; i++) if (p[i] !== i) { start = i; break; }
   if (start < 0) return null;
   const c = [start];
-  let cur = f[start];
-  while (cur !== start) { c.push(cur); cur = f[cur]; }
+  let cur = inv[start];
+  while (cur !== start) { c.push(cur); cur = inv[cur]; }
   return c;
-}
-function cornerPermClean(S) {
-  for (let i = 0; i < 20; i++) if (S.co[i]) return false;
-  for (let i = 0; i < 30; i++) if (S.eo[i] || S.ep[i] !== i) return false;
-  return true;
-}
-function edgePermClean(S) {
-  for (let i = 0; i < 30; i++) if (S.eo[i]) return false;
-  for (let i = 0; i < 20; i++) if (S.co[i] || S.cp[i] !== i) return false;
-  return true;
 }
 
 // ---------------------------------------------------------------------------
-// Build content-move tables: tbl["cur,home"] = Map(third -> token-index seq)
-// realizing the pure 3-cycle that sends content cur->home->third->cur.
-// Bulk via setups up to depth 3; remaining pairs patched by targeted BFS.
+// ORIENTED 3-cycle table. Solves permutation AND orientation together:
+//   tbl["cur,home"] = Map(deliveredOrient -> { seq, third, mc })
+// A stored seq performs a position 3-cycle cur->home->third->cur AND delivers
+// the piece arriving at `home` with orientation `deliveredOrient` (assuming it
+// started oriented 0; for a piece with current orientation oc, after the move
+// its orientation at home is (oc + deliveredOrient) mod m). Orientation variants
+// come for free by also conjugating each pure base by a single extra face turn
+// (which injects orientation while keeping it a clean corner-/edge-only 3-cycle).
+// `orientMod` is 3 (corners) or 2 (edges); `coord`/`ocoord` are the perm/orient
+// coordinate names. Each (cur,home) ends up with ALL orientation deliveries.
 // ---------------------------------------------------------------------------
-function buildMoveTable(baseList, coord, n, cleanFn, totalPairs) {
-  const baseIdx = baseList.map(idxOfTokens);
-  const baseGens = baseIdx.map(genOfIdx);
+function buildOrientedTable(baseList, coord, ocoord, otherP, otherO, n, om, orientMod, totalPairs, conjCap, dblCap) {
+  // seeds = bases + single-turn conjugations (inject orientation variety), reduced.
+  const seeds = [];
+  const seedSet = new Set();
+  const addSeed = (s) => { const r = reduceSeq(s); if (!r.length) return; const k = r.join(","); if (seedSet.has(k)) return; seedSet.add(k); seeds.push(r); };
+  // All plain bases (cheap, ensures positional coverage) + single-turn
+  // conjugations of the first `conjCap` bases + double-turn conjugations of the
+  // first `dblCap` bases. Conjugations inject orientation variety so two-piece-
+  // both-oriented fixes are available; capping keeps build under budget.
+  let bi = 0;
+  for (const b of baseList) {
+    addSeed(b);
+    if (bi < conjCap) for (let fg = 0; fg < NG; fg++) addSeed([fg, ...b, ...invSeq([fg])]);
+    if (bi < dblCap) {
+      for (let f1 = 0; f1 < NG; f1++) for (let f2 = 0; f2 < NG; f2++) {
+        if (genFace[f1] === genFace[f2]) continue;
+        addSeed([f1, f2, ...b, ...invSeq([f1, f2])]);
+      }
+    }
+    bi++;
+  }
+  const seedGens = seeds.map(genOf);
+  const cleanOnly = (S) => {
+    for (let i = 0; i < om; i++) if (S[otherP][i] !== i || S[otherO][i]) return false;
+    let m = 0;
+    for (let i = 0; i < n; i++) if (S[coord][i] !== i) m++;
+    return m === 3;
+  };
+  // tbl: "cur,home" -> { dm: Map(d -> Map(third -> Map(dThird -> {seq,mc,dCur}))),
+  //                      full: bool (has all orientMod deliveries d) }
   const tbl = new Map();
+  let fullCount = 0;
+  const targetFull = totalPairs;
   const U = [];
-  // record all base 3-cycles for the current setup U (Ugen / UgenInv given).
   const record = (Ugen, UgenInv) => {
-    for (let bi = 0; bi < baseGens.length; bi++) {
-      const S = U.length ? composeGen(composeGen(Ugen, baseGens[bi]), UgenInv) : baseGens[bi];
-      if (!cleanFn(S)) continue;
+    for (let si = 0; si < seeds.length; si++) {
+      const S = U.length ? composeGen(composeGen(Ugen, seedGens[si]), UgenInv) : seedGens[si];
+      if (!cleanOnly(S)) continue;
       const c = fwdCycle(S[coord], n);
       if (!c || c.length !== 3) continue;
-      let seqIdx = null;
+      let seq = null, mc = 0;
       for (let i = 0; i < 3; i++) {
         const cur = c[i], home = c[(i + 1) % 3], third = c[(i + 2) % 3];
+        const d = S[ocoord][home];       // orientation delivered to slot home
+        const dThird = S[ocoord][third]; // delivered to slot third
+        const dCur = S[ocoord][cur];     // delivered to slot cur
         const k = cur + "," + home;
-        let mp = tbl.get(k);
-        if (!mp) { mp = new Map(); tbl.set(k, mp); }
-        if (!mp.has(third) && mp.size < 12) {
-          if (!seqIdx) seqIdx = [...U, ...baseIdx[bi], ...invIdxList(U)];
-          mp.set(third, seqIdx);
+        let rec = tbl.get(k);
+        if (!rec) { rec = { dm: new Map(), full: false }; tbl.set(k, rec); }
+        let dm = rec.dm.get(d);
+        const newD = !dm;
+        if (!dm) { dm = new Map(); rec.dm.set(d, dm); }
+        let tm = dm.get(third);
+        if (!tm) { tm = new Map(); dm.set(third, tm); }
+        const ex = tm.get(dThird);
+        if (ex && ex.mc <= 9) {
+          // already good; but still update full-count if a new delivery appeared
+          if (newD && !rec.full && rec.dm.size >= orientMod) { rec.full = true; fullCount++; }
+          continue;
         }
+        if (!seq) { seq = reduceSeq(U.length ? [...U, ...seeds[si], ...invSeq(U)] : seeds[si]); mc = moveCount(seq); }
+        if (!ex || mc < ex.mc) tm.set(dThird, { seq, mc, dCur });
+        if (newD && !rec.full && rec.dm.size >= orientMod) { rec.full = true; fullCount++; }
       }
     }
   };
-  // Pass 1: FULL sweep to depth 3 (many thirds/pair for cycle3 routing).
   const sweep = (depth, maxDepth, last, Ugen, UgenInv) => {
     record(Ugen, UgenInv);
     if (depth === maxDepth) return;
     for (let gi = 0; gi < NG; gi++) {
-      if (tokFace[gi] === last) continue;
+      if (genFace[gi] === last) continue;
       U.push(gi);
       const nUgen = composeGen(Ugen, GEN[gi]);
-      sweep(depth + 1, maxDepth, tokFace[gi], nUgen, invGen(nUgen));
+      sweep(depth + 1, maxDepth, genFace[gi], nUgen, invGen(nUgen));
       U.pop();
     }
   };
-  sweep(0, 3, -1, IDS, IDS);
-  // Pass 2: deepen for any still-missing directed pairs (stop once complete).
-  if (tbl.size < totalPairs) {
+  sweep(0, 2, -1, IDS, IDS);
+  if (fullCount < targetFull) {
     const dfs = (depth, maxDepth, last, Ugen, UgenInv) => {
       record(Ugen, UgenInv);
-      if (tbl.size >= totalPairs || depth === maxDepth) return;
+      if (depth === maxDepth || fullCount >= targetFull) return;
       for (let gi = 0; gi < NG; gi++) {
-        if (tokFace[gi] === last) continue;
+        if (genFace[gi] === last) continue;
         U.push(gi);
         const nUgen = composeGen(Ugen, GEN[gi]);
-        dfs(depth + 1, maxDepth, tokFace[gi], nUgen, invGen(nUgen));
+        dfs(depth + 1, maxDepth, genFace[gi], nUgen, invGen(nUgen));
         U.pop();
-        if (tbl.size >= totalPairs) return;
+        if (fullCount >= targetFull) return;
       }
     };
-    for (let d = 4; d <= 6 && tbl.size < totalPairs; d++) dfs(0, d, -1, IDS, IDS);
+    for (let d = 3; d <= 5 && fullCount < targetFull; d++) dfs(0, d, -1, IDS, IDS);
   }
   return tbl;
 }
 
 // ---------------------------------------------------------------------------
-// cycle3: token-index sequence performing content a->b->c->a (perm-clean).
-// Uses the move table; falls back to helper decomposition (a b c)=(a b h)(a h c).
+// 2-twist / 2-flip primitives + retargeting tables.
 // ---------------------------------------------------------------------------
-function cycle3Direct(tbl, a, b, c) {
-  let e = tbl.get(a + "," + b); if (e && e.has(c)) return e.get(c);
-  e = tbl.get(b + "," + c); if (e && e.has(a)) return e.get(a);
-  e = tbl.get(c + "," + a); if (e && e.has(b)) return e.get(b);
-  // reverse direction applied twice (a 3-cycle has order 3)
-  e = tbl.get(a + "," + c); if (e && e.has(b)) { const s = e.get(b); return [...s, ...s]; }
-  e = tbl.get(c + "," + b); if (e && e.has(a)) { const s = e.get(a); return [...s, ...s]; }
-  e = tbl.get(b + "," + a); if (e && e.has(c)) { const s = e.get(c); return [...s, ...s]; }
-  return null;
-}
-// Verify a token-index seq performs exactly the content 3-cycle a->b->c->a on
-// `coord` and nothing else (perm + orientation clean).
-function isExactCycle3(seq, coord, n, a, b, c) {
-  const g = genOfIdx(seq);
-  // perm clean elsewhere + orientation clean everywhere
-  for (let i = 0; i < 20; i++) if (g.co[i]) return false;
-  for (let i = 0; i < 30; i++) if (g.eo[i]) return false;
-  const other = coord === "cp" ? g.ep : g.cp;
-  const om = coord === "cp" ? 30 : 20;
-  for (let i = 0; i < om; i++) if (other[i] !== i) return false;
-  const p = g[coord];
-  for (let i = 0; i < n; i++) {
-    const want = i === a ? c : i === b ? a : i === c ? b : i; // p[i]=source
-    if (p[i] !== want) return false;
-  }
-  return true;
-}
-function cycle3(tbl, n, a, b, c) {
-  const d = cycle3Direct(tbl, a, b, c);
-  if (d && isExactCycle3(d, n === 20 ? "cp" : "ep", n, a, b, c)) return d;
-  const coord = n === 20 ? "cp" : "ep";
-  // helper decomposition (a b c) = (a b h)(a h c); verify each candidate.
-  for (let h = 0; h < n; h++) {
-    if (h === a || h === b || h === c) continue;
-    const s1 = cycle3Direct(tbl, a, b, h);
-    if (!s1) continue;
-    const s2 = cycle3Direct(tbl, a, h, c);
-    if (!s2) continue;
-    const seq = [...s1, ...s2];
-    if (isExactCycle3(seq, coord, n, a, b, c)) return seq;
-  }
-  // fallback: (a b c) = (a b h)(b c h)-style, try alternate decomposition orders
-  for (let h = 0; h < n; h++) {
-    if (h === a || h === b || h === c) continue;
-    const cands = [
-      () => { const s1 = cycle3Direct(tbl, a, h, c); const s2 = cycle3Direct(tbl, a, b, h); return s1 && s2 ? [...s1, ...s2] : null; },
-      () => { const s1 = cycle3Direct(tbl, h, b, c); const s2 = cycle3Direct(tbl, a, b, h); return s1 && s2 ? [...s1, ...s2] : null; },
-      () => { const s1 = cycle3Direct(tbl, a, b, h); const s2 = cycle3Direct(tbl, h, b, c); return s1 && s2 ? [...s1, ...s2] : null; },
-    ];
-    for (const mk of cands) {
-      const seq = mk();
-      if (seq && isExactCycle3(seq, coord, n, a, b, c)) return seq;
-    }
-  }
-  return null;
-}
-
-// ---------------------------------------------------------------------------
-// Twist / flip pair tables and retargeting.
-// ---------------------------------------------------------------------------
-// Build the TWIST (pure 2-corner twist) and FLIP (pure 2-edge flip) primitives
-// by matching an oriented 3-cycle's permutation to a pure 3-cycle, then
-// cancelling permutation.
 function matchConjugate(base, coord, targetArr, maxDepth) {
   const target = targetArr.join(",");
   let frontier = [[]];
   const seen = new Set();
   for (let depth = 0; depth <= maxDepth; depth++) {
     for (const U of frontier) {
-      const seq = U.length ? [...U, ...base, ...invIdxList(U)] : base.slice();
-      const g = genOfIdx(seq);
+      const seq = U.length ? [...U, ...base, ...invSeq(U)] : base.slice();
+      const g = genOf(seq);
       if (g[coord].join(",") === target) return seq;
     }
     const nf = [];
     for (const U of frontier) {
-      const last = U.length ? tokFace[U[U.length - 1]] : -1;
+      const last = U.length ? genFace[U[U.length - 1]] : -1;
       for (let gi = 0; gi < NG; gi++) {
-        if (tokFace[gi] === last) continue;
+        if (genFace[gi] === last) continue;
         const nU = [...U, gi];
-        let S = IDS; for (const x of nU) S = comp(S, x);
+        const S = genOf(nU);
         const sig = (coord === "cp" ? S.cp : S.ep).join(",");
         if (seen.has(sig)) continue;
         seen.add(sig);
@@ -5442,127 +5439,165 @@ function matchConjugate(base, coord, targetArr, maxDepth) {
   return null;
 }
 
-const TWIST_IDX = (() => {
-  const corner3Idx = idxOfTokens(CORNER3);
-  const oc3Idx = idxOfTokens(OC3);
-  const matched = matchConjugate(oc3Idx, "cp", genOfIdx(corner3Idx).cp, 6);
-  if (!matched) throw new Error("TWIST build: no conjugator");
-  const seq = [...matched, ...invIdxList(corner3Idx)];
-  const g = genOfIdx(seq);
+const TWIST = (() => {
+  const matched = matchConjugate(OC3, "cp", genOf(CORNER3).cp, 6);
+  if (!matched) throw new Error("TWIST: no conjugator");
+  const seq = reduceSeq([...matched, ...invSeq(CORNER3)]);
+  const g = genOf(seq);
   let ok = true;
   for (let i = 0; i < 20; i++) if (g.cp[i] !== i) ok = false;
   for (let i = 0; i < 30; i++) if (g.ep[i] !== i || g.eo[i]) ok = false;
-  if (!ok || !g.co.some((v) => v)) throw new Error("TWIST build: not a pure twist");
+  if (!ok || !g.co.some((v) => v)) throw new Error("TWIST: not pure");
   return seq;
 })();
-
-const FLIP_IDX = (() => {
-  const edge3Idx = idxOfTokens(EDGE3);
-  const oe3Idx = idxOfTokens(OE3);
-  const matched = matchConjugate(oe3Idx, "ep", genOfIdx(edge3Idx).ep, 6);
-  if (!matched) throw new Error("FLIP build: no conjugator");
-  const seq = [...matched, ...invIdxList(edge3Idx)];
-  const g = genOfIdx(seq);
+const FLIP = (() => {
+  const matched = matchConjugate(OE3, "ep", genOf(EDGE3).ep, 6);
+  if (!matched) throw new Error("FLIP: no conjugator");
+  const seq = reduceSeq([...matched, ...invSeq(EDGE3)]);
+  const g = genOf(seq);
   let ok = true;
   for (let i = 0; i < 20; i++) if (g.cp[i] !== i || g.co[i]) ok = false;
   for (let i = 0; i < 30; i++) if (g.ep[i] !== i) ok = false;
-  if (!ok || !g.eo.some((v) => v)) throw new Error("FLIP build: not a pure flip");
+  if (!ok || !g.eo.some((v) => v)) throw new Error("FLIP: not pure");
   return seq;
 })();
 
-// twist-pair table: tbl["x,y"] = { seq, dx, dy }   (co[x]+=dx, co[y]+=dy).
-// DFS over setups up to depth 4 (no materialized frontier => low memory). Not
-// every pair is directly reachable (shape orbit); twistPair() helper-routes
-// the rest, so partial coverage is fine as long as the twist graph spans all
-// 20 corners (it does at depth 4).
-// DFS that carries the conjugator generator (Ugen) incrementally so each node
-// costs O(1) generator compositions instead of recomposing the whole sequence.
-// `visit(seq, g)` receives the token-index sequence and the effect generator of
-// U·base·U^{-1}.
-function dfsConjugate(baseIdx, maxDepth, visit, stopFn) {
-  const baseGen = genOfIdx(baseIdx);
+function dfsConjugate(baseSeq, maxDepth, visit, stopFn) {
+  const baseGen = genOf(baseSeq);
   const U = [];
   const rec = (depth, last, Ugen, UgenInv) => {
-    const seq = U.length ? [...U, ...baseIdx, ...invIdxList(U)] : baseIdx;
+    const seq = U.length ? [...U, ...baseSeq, ...invSeq(U)] : baseSeq;
     const g = U.length ? composeGen(composeGen(Ugen, baseGen), UgenInv) : baseGen;
     visit(seq, g);
     if (depth === maxDepth || (stopFn && stopFn())) return;
     for (let gi = 0; gi < NG; gi++) {
-      if (tokFace[gi] === last) continue;
+      if (genFace[gi] === last) continue;
       U.push(gi);
       const nUgen = composeGen(Ugen, GEN[gi]);
-      const nUgenInv = invGen(nUgen);
-      rec(depth + 1, tokFace[gi], nUgen, nUgenInv);
+      rec(depth + 1, genFace[gi], nUgen, invGen(nUgen));
       U.pop();
       if (stopFn && stopFn()) return;
     }
   };
   rec(0, -1, IDS, IDS);
 }
-
 function buildTwistTable() {
   const tbl = new Map();
-  dfsConjugate(TWIST_IDX, 4, (seq, g) => {
+  // Small connected twist graph: residue routing (BFS over the graph) only needs
+  // the graph to span all 20 corners and be connected. Depth-3 sweep + early stop.
+  const reached = new Set();
+  const stop = () => reached.size >= 20 && tbl.size >= 120;
+  const put = (k, seq, dx, dy) => {
+    const r = reduceSeq(seq), mc = moveCount(r);
+    const ex = tbl.get(k);
+    if (!ex || mc < ex.mc) tbl.set(k, { seq: r, mc, dx, dy });
+  };
+  const visit = (seq, g) => {
     for (let i = 0; i < 20; i++) if (g.cp[i] !== i) return;
     for (let i = 0; i < 30; i++) if (g.ep[i] !== i || g.eo[i]) return;
     const nz = [];
     for (let i = 0; i < 20; i++) if (g.co[i]) nz.push(i);
     if (nz.length !== 2) return;
     const [x, y] = nz;
-    if (!tbl.has(x + "," + y)) tbl.set(x + "," + y, { seq: seq.slice(), dx: g.co[x], dy: g.co[y] });
-    if (!tbl.has(y + "," + x)) tbl.set(y + "," + x, { seq: seq.slice(), dx: g.co[y], dy: g.co[x] });
-  });
+    put(x + "," + y, seq, g.co[x], g.co[y]);
+    put(y + "," + x, seq, g.co[y], g.co[x]);
+    reached.add(x); reached.add(y);
+  };
+  for (let d = 3; d <= 5 && !stop(); d++) dfsConjugate(TWIST, d, visit, stop);
   return tbl;
 }
-
-// flip-pair table: tbl["x,y"] = seq (flips edges x and y). Built to full
-// connectivity so flipPair() can route any pair through the flip graph.
 function buildFlipTable() {
   const tbl = new Map();
   const reached = new Set();
-  const stop = () => reached.size >= 30;
-  const visit = (seq, g) => {
-    for (let i = 0; i < 20; i++) if (g.cp[i] !== i || g.co[i]) return;
-    for (let i = 0; i < 30; i++) if (g.ep[i] !== i) return;
-    const nz = [];
-    for (let i = 0; i < 30; i++) if (g.eo[i]) nz.push(i);
-    if (nz.length !== 2) return;
-    const [x, y] = nz;
-    if (!tbl.has(x + "," + y)) { const s = seq.slice(); tbl.set(x + "," + y, s); tbl.set(y + "," + x, s); }
-    reached.add(x); reached.add(y);
+  // flipPair BFS-routes, so the flip graph only needs to span all 30 edges and be
+  // connected. We sweep a SET of flip seeds (FLIP + single-turn conjugations) to a
+  // shallow depth so spanning is reached cheaply.
+  const seeds = [];
+  const seedSet = new Set();
+  const addSeed = (s) => { const r = reduceSeq(s); if (!r.length) return; const k = r.join(","); if (seedSet.has(k)) return; seedSet.add(k); seeds.push(r); };
+  addSeed(FLIP);
+  for (let fg = 0; fg < NG; fg++) addSeed([fg, ...FLIP, ...invSeq([fg])]);
+  const seedGens = seeds.map(genOf);
+  const stop = () => reached.size >= 30 && tbl.size >= 180;
+  const put = (k, seq) => {
+    const r = reduceSeq(seq), mc = moveCount(r);
+    const ex = tbl.get(k);
+    if (!ex || mc < ex.mc) tbl.set(k, { seq: r, mc });
   };
-  for (let d = 4; d <= 6 && reached.size < 30; d++) dfsConjugate(FLIP_IDX, d, visit, stop);
+  const U = [];
+  const record = (Ugen, UgenInv) => {
+    for (let si = 0; si < seeds.length; si++) {
+      const g = U.length ? composeGen(composeGen(Ugen, seedGens[si]), UgenInv) : seedGens[si];
+      let bad = false;
+      for (let i = 0; i < 20; i++) if (g.cp[i] !== i || g.co[i]) { bad = true; break; }
+      if (bad) continue;
+      for (let i = 0; i < 30; i++) if (g.ep[i] !== i) { bad = true; break; }
+      if (bad) continue;
+      const nz = [];
+      for (let i = 0; i < 30; i++) if (g.eo[i]) nz.push(i);
+      if (nz.length !== 2) continue;
+      const [x, y] = nz;
+      const seq = U.length ? [...U, ...seeds[si], ...invSeq(U)] : seeds[si];
+      put(x + "," + y, seq); put(y + "," + x, seq);
+      reached.add(x); reached.add(y);
+    }
+  };
+  const sweep = (depth, maxDepth, last, Ugen, UgenInv) => {
+    record(Ugen, UgenInv);
+    if (depth === maxDepth || stop()) return;
+    for (let gi = 0; gi < NG; gi++) {
+      if (genFace[gi] === last) continue;
+      U.push(gi);
+      const nUgen = composeGen(Ugen, GEN[gi]);
+      sweep(depth + 1, maxDepth, genFace[gi], nUgen, invGen(nUgen));
+      U.pop();
+      if (stop()) return;
+    }
+  };
+  for (let d = 1; d <= 4 && !stop(); d++) sweep(0, d, -1, IDS, IDS);
   return tbl;
 }
-
-const inv3 = (d) => (d === 1 ? 1 : 2);
-
-// twistPair: token-index seq adding co[x]+=A, co[y]+=(-A mod 3); helper-routed.
-function twistPair(tbl, x, A, y) {
+// twistPair: add +A to co[x] and -A to co[y]. Direct via table entry if present;
+// else BFS-route over the twist graph (x..h1..h2..y); chaining twistPair along a
+// path nets +A at x and -A at y (intermediates cancel). Graph spans all 20 corners.
+function twistDirect(tbl, x, A, y) {
   A = ((A % 3) + 3) % 3;
   if (A === 0) return [];
   const e = tbl.get(x + "," + y);
-  if (e) {
-    const k = (A * inv3(((e.dx % 3) + 3) % 3)) % 3;
-    const out = [];
-    for (let i = 0; i < k; i++) out.push(...e.seq);
-    return out;
-  }
-  for (let h = 0; h < 20; h++) {
-    if (h === x || h === y) continue;
-    if (tbl.has(x + "," + h) && tbl.has(h + "," + y)) {
-      const s1 = twistPair(tbl, x, A, h);
-      const s2 = twistPair(tbl, h, A, y);
-      if (s1 && s2) return [...s1, ...s2];
-    }
-  }
-  return null;
+  if (!e) return null;
+  const base = ((e.dx % 3) + 3) % 3;
+  const k = (A * (base === 1 ? 1 : 2)) % 3; // # applications so x gains A
+  const out = [];
+  for (let i = 0; i < k; i++) out.push(...e.seq);
+  return out;
 }
-
-// flipPair: token-index seq flipping edges x and y; routed through flip graph.
+function twistPair(tbl, tadj, x, A, y) {
+  A = ((A % 3) + 3) % 3;
+  if (A === 0) return [];
+  const d = twistDirect(tbl, x, A, y);
+  if (d) return d;
+  // BFS path x -> y over twist graph
+  const prev = new Map([[x, -1]]);
+  const q = [x]; let h = 0;
+  while (h < q.length) {
+    const u = q[h++];
+    if (u === y) break;
+    for (const v of tadj[u]) if (!prev.has(v)) { prev.set(v, u); q.push(v); }
+  }
+  if (!prev.has(y)) return null;
+  const path = [];
+  let cur = y;
+  while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
+  const out = [];
+  for (let i = 0; i + 1 < path.length; i++) {
+    const seg = twistDirect(tbl, path[i], A, path[i + 1]);
+    if (!seg) return null;
+    out.push(...seg);
+  }
+  return out;
+}
 function flipPair(tbl, fadj, x, y) {
-  if (tbl.has(x + "," + y)) return tbl.get(x + "," + y).slice();
-  // BFS path in flip graph; flipping along a path nets flips at endpoints only.
+  if (tbl.has(x + "," + y)) return tbl.get(x + "," + y).seq.slice();
   const prev = new Map([[x, -1]]);
   const q = [x];
   let h = 0;
@@ -5576,81 +5611,314 @@ function flipPair(tbl, fadj, x, y) {
   let cur = y;
   while (cur !== -1) { path.unshift(cur); cur = prev.get(cur); }
   const out = [];
-  for (let i = 0; i + 1 < path.length; i++) out.push(...tbl.get(path[i] + "," + path[i + 1]));
+  for (let i = 0; i + 1 < path.length; i++) out.push(...tbl.get(path[i] + "," + path[i + 1]).seq);
   return out;
 }
 
 // ---------------------------------------------------------------------------
-// Build all tables once at load.
+// Build tables once.
 // ---------------------------------------------------------------------------
-const C_MOVE = buildMoveTable(CORNER_BASES, "cp", 20, cornerPermClean, 380);
-const E_MOVE = buildMoveTable(EDGE_BASES, "ep", 30, edgePermClean, 870);
 const TWIST_TBL = buildTwistTable();
 const FLIP_TBL = buildFlipTable();
 const FLIP_ADJ = (() => {
   const adj = Array.from({ length: 30 }, () => new Set());
-  for (const k of FLIP_TBL.keys()) {
-    const [a, b] = k.split(",").map(Number);
-    adj[a].add(b); adj[b].add(a);
-  }
+  for (const k of FLIP_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
   return adj;
 })();
+const TWIST_ADJ = (() => {
+  const adj = Array.from({ length: 20 }, () => new Set());
+  for (const k of TWIST_TBL.keys()) { const [a, b] = k.split(",").map(Number); adj[a].add(b); adj[b].add(a); }
+  return adj;
+})();
+// Oriented 3-cycle tables (solve perm + orientation together).
+const C_ORI = buildOrientedTable(CORNER_BASES, "cp", "co", "ep", "eo", 20, 30, 3, 380, 11, 6);
+const E_ORI = buildOrientedTable(EDGE_BASES, "ep", "eo", "cp", "co", 30, 20, 2, 870, 45, 0);
 
-// ---------------------------------------------------------------------------
-// SOLVER
-// ---------------------------------------------------------------------------
-function solveImpl(state) {
-  const ctx = {
-    S: {
-      cp: Int8Array.from(state.cp),
-      co: Int8Array.from(state.co),
-      ep: Int8Array.from(state.ep),
-      eo: Int8Array.from(state.eo),
-    },
-    sol: [],
-  };
-  if (isSolvedState(ctx.S)) return [];
-  const run = (seq) => {
-    if (!seq) throw new Error("null sequence");
-    for (const gi of seq) { ctx.S = comp(ctx.S, gi); ctx.sol.push(gi); }
-  };
-
-  phasePerm(ctx, run, "cp", 20, C_MOVE);
-  phaseTwist(ctx, run);
-  phasePerm(ctx, run, "ep", 30, E_MOVE);
-  phaseFlip(ctx, run);
-
-  if (!isSolvedState(ctx.S)) throw new Error("solver did not reach solved");
-  return reduceTokens(tokensOfIdx(ctx.sol));
+// Cheaper pure 2-orientation primitives from oriented-table "sibling differences":
+// two variants of the SAME positional 3-cycle differ only in orientation, so
+// applying one then the inverse of the other nets a pure orientation change on the
+// moved pieces (a 2-twist for corners / 2-flip for edges). These are usually much
+// shorter than the conjugated-commutator TWIST/FLIP base, so they make residue
+// cleanup cheaper. We add them into TWIST_TBL/FLIP_TBL keeping the shortest.
+function augmentOrientPrims(otbl, tbl, n, om, isCorner) {
+  for (const [, rec] of otbl) {
+    // gather all variants of this (cur,home) by positional 3-cycle = (cur,home,third)
+    // grouped by third; each group's entries (varying d/dThird) are siblings.
+    const byThird = new Map(); // third -> array of entries (siblings: same positions)
+    for (const [d, dm] of rec.dm) for (const [t, tm] of dm) for (const [dThird, ent] of tm) {
+      let arr = byThird.get(t); if (!arr) { arr = []; byThird.set(t, arr); }
+      arr.push(ent);
+    }
+    for (const [, arr] of byThird) {
+      if (arr.length < 2) continue;
+      const lim = Math.min(arr.length, 4);
+      // cache per-entry generator + inverse to test the difference cheaply
+      for (let k = 0; k < lim; k++) if (!arr[k]._g) { arr[k]._g = genOf(arr[k].seq); arr[k]._gi = invGen(arr[k]._g); }
+      for (let i = 0; i < lim; i++) for (let j = 0; j < lim; j++) {
+        if (i === j) continue;
+        // difference = (arr[i]) then inverse(arr[j]); pure orientation if siblings.
+        const g = composeGen(arr[i]._g, arr[j]._gi);
+        let pure = true;
+        for (let k = 0; k < 20; k++) if (g.cp[k] !== k) { pure = false; break; }
+        if (pure) for (let k = 0; k < 30; k++) if (g.ep[k] !== k) { pure = false; break; }
+        if (!pure) continue;
+        if (isCorner) { for (let k = 0; k < 30; k++) if (g.eo[k]) { pure = false; break; } }
+        else { for (let k = 0; k < 20; k++) if (g.co[k]) { pure = false; break; } }
+        if (!pure) continue;
+        const oc = isCorner ? g.co : g.eo;
+        const nz = [];
+        for (let k = 0; k < n; k++) if (oc[k]) nz.push(k);
+        if (nz.length !== 2) continue;
+        const [x, y] = nz;
+        const seq = reduceSeq([...arr[i].seq, ...invSeq(arr[j].seq)]);
+        if (!seq.length) continue;
+        const mc = moveCount(seq);
+        if (isCorner) {
+          const exy = tbl.get(x + "," + y);
+          if (!exy || mc < exy.mc) tbl.set(x + "," + y, { seq, mc, dx: oc[x], dy: oc[y] });
+          const eyx = tbl.get(y + "," + x);
+          if (!eyx || mc < eyx.mc) tbl.set(y + "," + x, { seq, mc, dx: oc[y], dy: oc[x] });
+        } else {
+          const e1 = tbl.get(x + "," + y);
+          if (!e1 || mc < e1.mc) { tbl.set(x + "," + y, { seq, mc }); tbl.set(y + "," + x, { seq, mc }); }
+        }
+      }
+    }
+  }
 }
+augmentOrientPrims(C_ORI, TWIST_TBL, 20, 3, true);
+augmentOrientPrims(E_ORI, FLIP_TBL, 30, 2, false);
+// free the per-entry generator caches used only during augmentation
+for (const tbl of [C_ORI, E_ORI]) for (const [, rec] of tbl) for (const [, dm] of rec.dm) for (const [, tm] of dm) for (const [, ent] of tm) { delete ent._g; delete ent._gi; }
+// rebuild adjacency including augmented entries
+for (const k of TWIST_TBL.keys()) { const [a, b] = k.split(",").map(Number); TWIST_ADJ[a].add(b); TWIST_ADJ[b].add(a); }
+for (const k of FLIP_TBL.keys()) { const [a, b] = k.split(",").map(Number); FLIP_ADJ[a].add(b); FLIP_ADJ[b].add(a); }
 
+// ---------------------------------------------------------------------------
+// SOLVER. Phase order: corners (oriented 3-cycles, perm+orientation together),
+// corner-twist residue cleanup, edges (oriented 3-cycles), edge-flip residue.
+// ---------------------------------------------------------------------------
 function isSolvedState(S) {
   for (let i = 0; i < 20; i++) if (S.cp[i] !== i || S.co[i]) return false;
   for (let i = 0; i < 30; i++) if (S.ep[i] !== i || S.eo[i]) return false;
   return true;
 }
-
-// Permutation phase: solve cp or ep by 3-cycles via cycle decomposition.
-function phasePerm(ctx, run, coord, n, tbl) {
+// Oriented permutation phase: solve a coordinate's permutation AND orientation
+// together, slot-by-slot (increasing). For slot `home`, the belonging piece is
+// at `cur` with current orientation `oc`. Choose a 3-cycle variant from the
+// oriented table whose delivered orientation d satisfies (oc + d) % om === 0, and
+// whose `third` is > home (monotone progress, never disturbs a solved slot).
+// Falls back to the plain perm phase (then orientation cleanup) if no oriented
+// variant fits — guaranteeing completeness.
+function phaseOriented(ctx, run, coord, ocoord, n, om, otbl, ptbl) {
   let guard = 0;
-  while (guard++ < 100) {
-    const p = ctx.S[coord];
-    let a = -1;
-    for (let i = 0; i < n; i++) if (p[i] !== i) { a = i; break; }
-    if (a < 0) return;
+  while (guard++ < 400) {
+    const p = ctx.S[coord], o = ctx.S[ocoord];
+    const mis = [];
+    for (let i = 0; i < n; i++) if (p[i] !== i) mis.push(i);
+    if (mis.length === 0) return; // permutation solved (orientation residue: caller cleans)
+    // If exactly 3 misplaced (final cycle), try a single variant solving all three
+    // positions+orientations (zero residue).
+    if (mis.length === 3) {
+      const closed = solveFinalTriple(otbl, ptbl, p, o, om, n, mis);
+      if (closed) { run(closed); continue; }
+    }
+    // GREEDY two-piece-both-oriented: scan all misplaced `home`; a 3-cycle
+    // (cur,home,third=p[home]) that delivers home AND third oriented solves two
+    // pieces with no residue. Pick the shortest such op if any exists.
+    {
+      let bestSeq = null, bestMc = Infinity;
+      for (const home of mis) {
+        let cur = -1;
+        for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
+        const twoFix = p[home];
+        if (twoFix === cur) continue; // would be a 2-cycle, not 3
+        if (p[twoFix] === twoFix) continue; // third already solved -> not a clean double
+        const need = ((om - o[cur]) % om);
+        const rec = otbl.get(cur + "," + home);
+        if (!rec) continue;
+        const dm = rec.dm.get(need);
+        if (!dm) continue;
+        const tm = dm.get(twoFix);
+        if (!tm) continue;
+        const needThird = ((om - o[home]) % om); // dThird making third land oriented
+        const ent = tm.get(needThird);
+        if (ent && ent.mc < bestMc) { bestMc = ent.mc; bestSeq = ent.seq; }
+      }
+      if (bestSeq) { run(bestSeq); continue; }
+    }
+    // Otherwise: solve the lowest misplaced slot (monotone) with the best variant.
+    let home = mis[0];
     let cur = -1;
-    for (let i = 0; i < n; i++) if (p[i] === a) { cur = i; break; }
-    let helper = -1;
-    for (let i = 0; i < n; i++) if (p[i] !== i && i !== cur && i !== a) { helper = i; break; }
-    if (helper < 0) throw new Error("phasePerm: single misplaced (parity?) at " + a);
-    const seq = cycle3(tbl, n, cur, a, helper);
-    if (!seq) throw new Error("phasePerm: no cycle3 for " + [cur, a, helper]);
-    run(seq);
+    for (let i = 0; i < n; i++) if (p[i] === home) { cur = i; break; }
+    const oc = o[cur];
+    const need = ((om - oc) % om); // delivered orientation landing home at 0
+    const twoFix = p[home]; // if third===p[home], slot `third` is ALSO solved (2 pieces/op)
+    const rec = otbl.get(cur + "," + home);
+    let chosen = null;
+    if (rec) {
+      const dm = rec.dm.get(need);
+      if (dm) {
+        // Iterate variants: dm = Map(third -> Map(dThird -> {seq,mc,dCur})).
+        // After op: slot third gets piece from home (orient (o[home]+dThird)%om);
+        //           slot cur  gets piece from third (orient (o[third]+dCur)%om).
+        let best = null, bestScore = Infinity;
+        for (const [t, tm] of dm) {
+          if (t <= home || t === cur) continue;
+          for (const [dThird, ent] of tm) {
+            const resThird = (o[home] + dThird) % om;
+            const resCur = (o[t] + ent.dCur) % om;
+            let score = ent.mc * 0.4;
+            if (t === twoFix && resThird === 0) {
+              score -= 100; // two-piece fix with BOTH oriented: ideal
+            } else {
+              if (p[t] === t) score += 6; // disturbing a solved slot: bad
+              score += (resThird !== 0 ? 1 : 0) * 5 + (resCur !== 0 ? 1 : 0) * 5;
+            }
+            if (score < bestScore) { bestScore = score; best = ent; }
+          }
+        }
+        if (best) chosen = best.seq;
+      }
+    }
+    if (!chosen) {
+      // fall back to plain perm 3-cycle (orientation cleaned up afterward)
+      const seq = pickPlainCycle(ptbl, coord, n, p, home, cur);
+      run(seq);
+      continue;
+    }
+    run(chosen);
   }
-  throw new Error("phasePerm did not converge");
+  throw new Error("phaseOriented did not converge");
 }
-
-// Corner orientation phase: zero co via twist pairs.
+// For the final 3 misplaced slots (a single 3-cycle), find a variant solving all
+// three positions AND orientations, leaving zero residue. Enumerates oriented
+// table variants whose positional effect matches and tests the full effect on the
+// current state. Returns a gi-seq or null.
+function solveFinalTriple(otbl, ptbl, p, o, om, n, mis) {
+  const coord = n === 20 ? "cp" : "ep";
+  const ocoord = n === 20 ? "co" : "eo";
+  // collect candidate seqs from all otbl entries among these 3 slots
+  const cands = [];
+  for (const a of mis) for (const b of mis) {
+    if (a === b) continue;
+    const rec = otbl.get(a + "," + b);
+    if (!rec) continue;
+    for (const [, dm] of rec.dm) for (const [, tm] of dm) for (const [, ent] of tm) cands.push(ent);
+  }
+  // dedupe by seq identity (object), test each on the 3-slot sub-state
+  let best = null, bestMc = Infinity;
+  for (const ent of cands) {
+    if (ent.mc >= bestMc) continue;
+    const g = genOf(ent.seq);
+    // apply g to a state that is identity except the 3 slots' current p/o; check solved on the 3.
+    // Build current state restricted: we apply g to the live ctx not available here,
+    // so test purely: after this op, does slot s end solved for all s in mis?
+    // effect of op on slot s: new piece source = g[coord][s]; new orient = (o_of_source + g[ocoord][s]) % om
+    let ok = true;
+    for (const s of mis) {
+      const src = g[coord][s];
+      if (p[src] !== s) { ok = false; break; }            // position must land home (p[src] is identity of piece at src)
+      const oSrc = o[src];
+      if (((oSrc + g[ocoord][s]) % om) !== 0) { ok = false; break; }
+    }
+    if (!ok) continue;
+    // also must not disturb any slot outside mis
+    let clean = true;
+    for (let i = 0; i < n; i++) {
+      if (mis.includes(i)) continue;
+      if (g[coord][i] !== i || g[ocoord][i]) { clean = false; break; }
+    }
+    if (!clean) continue;
+    best = ent.seq; bestMc = ent.mc;
+  }
+  return best;
+}
+// Positional 3-cycle seq from the oriented table: sends slot a->b, b->c, c->a
+// (orientation ignored). Direct table entry if present; else compose two table
+// 3-cycles; verified by simulation. otbl covers all pairs with many thirds so a
+// direct or 2-composition is essentially always available.
+function posSeqFor(otbl, coord, a, b, c) {
+  // a table entry under key (cur,home)=(a,b) with third=c sends a->b,b->c,c->a.
+  const tryKey = (x, y, z) => {
+    const rec = otbl.get(x + "," + y); if (!rec) return null;
+    let best = null;
+    for (const [, dm] of rec.dm) { const tm = dm.get(z); if (!tm) continue; for (const [, e] of tm) if (!best || e.mc < best.mc) best = e; }
+    return best ? best.seq : null;
+  };
+  // the cycle (a b c) [a->b->c->a] equals entry (a,b,c). Rotations are the same cycle.
+  let s = tryKey(a, b, c); if (s) return s;
+  s = tryKey(b, c, a); if (s) return s;
+  s = tryKey(c, a, b); if (s) return s;
+  return null;
+}
+function isPosCycle3(seq, coord, n, a, b, c) {
+  const g = genOf(seq);
+  const oc = coord === "cp" ? "co" : "eo";
+  const op = coord === "cp" ? "ep" : "cp";
+  const oo = coord === "cp" ? "eo" : "co";
+  for (let i = 0; i < 20; i++) if (g.co[i]) return false;
+  for (let i = 0; i < 30; i++) if (g.eo[i]) return false;
+  const om = coord === "cp" ? 30 : 20;
+  for (let i = 0; i < om; i++) if (g[op][i] !== i) return false;
+  const p = g[coord];
+  for (let i = 0; i < n; i++) {
+    const want = i === a ? c : i === b ? a : i === c ? b : i;
+    if (p[i] !== want) return false;
+  }
+  return true;
+}
+function posCycle3(otbl, n, a, b, c) {
+  const coord = n === 20 ? "cp" : "ep";
+  const d = posSeqFor(otbl, coord, a, b, c);
+  if (d && isPosCycle3(d, coord, n, a, b, c)) return d;
+  // compose: (a b c) = (a b h)(a h c) for some helper h
+  for (let h = 0; h < n; h++) {
+    if (h === a || h === b || h === c) continue;
+    const s1 = posSeqFor(otbl, coord, a, b, h);
+    if (!s1) continue;
+    const s2 = posSeqFor(otbl, coord, a, h, c);
+    if (!s2) continue;
+    const seq = [...s1, ...s2];
+    if (isPosCycle3(seq, coord, n, a, b, c)) return seq;
+  }
+  return null;
+}
+// Fallback when no orientation-correct variant fits: pick ANY positional 3-cycle
+// from the oriented table (ignoring orientation), preferring a two-piece fix
+// (third === p[home]) then a misplaced third > home (monotone). The oriented
+// table covers all (cur,home) pairs with many thirds, so this always succeeds.
+function pickPlainCycle(otbl, coord, n, p, home, cur) {
+  const twoFix = p[home];
+  const rec = otbl.get(cur + "," + home);
+  if (rec) {
+    // gather thirds -> shortest seq across all deliveries
+    const best = new Map(); // third -> {seq,mc}
+    for (const [, dm] of rec.dm) for (const [t, tm] of dm) {
+      for (const [, ent] of tm) {
+        const ex = best.get(t);
+        if (!ex || ent.mc < ex.mc) best.set(t, ent);
+      }
+    }
+    if (twoFix > home && twoFix !== cur && best.has(twoFix)) return best.get(twoFix).seq;
+    // prefer a misplaced third > home (monotone, never disturbs solved slots)
+    let third = -1, bestMc = Infinity;
+    for (const [t, ent] of best) {
+      if (t <= home || t === cur) continue;
+      if (p[t] !== t && ent.mc < bestMc) { bestMc = ent.mc; third = t; }
+    }
+    if (third >= 0) return best.get(third).seq;
+  }
+  // No direct monotone third in the table; build the exact 3-cycle (cur,home,h)
+  // for a misplaced helper h>home via composition (guaranteed, monotone).
+  let helper = -1;
+  for (let i = home + 1; i < n; i++) if (p[i] !== i && i !== cur) { helper = i; break; }
+  if (helper >= 0) {
+    const seq = posCycle3(otbl, n, cur, home, helper);
+    if (seq) return seq;
+  }
+  throw new Error("pickPlainCycle: no cycle for " + [cur, home]);
+}
 function phaseTwist(ctx, run) {
   let guard = 0;
   while (guard++ < 60) {
@@ -5658,19 +5926,15 @@ function phaseTwist(ctx, run) {
     const tw = [];
     for (let i = 0; i < 20; i++) if (co[i]) tw.push(i);
     if (tw.length === 0) return;
-    // pair the first twisted corner with another; drive first to 0.
     const x = tw[0];
     const y = tw[1] !== undefined ? tw[1] : tw[0];
-    // A = amount to add to x to make it 0
     const A = (3 - co[x]) % 3;
-    const seq = twistPair(TWIST_TBL, x, A, y);
-    if (!seq) throw new Error("phaseTwist: no twistPair for " + [x, y]);
+    const seq = twistPair(TWIST_TBL, TWIST_ADJ, x, A, y);
+    if (!seq) throw new Error("phaseTwist: no twistPair " + [x, y]);
     run(seq);
   }
   throw new Error("phaseTwist did not converge");
 }
-
-// Edge orientation phase: zero eo via flip pairs.
 function phaseFlip(ctx, run) {
   let guard = 0;
   while (guard++ < 60) {
@@ -5679,34 +5943,95 @@ function phaseFlip(ctx, run) {
     for (let i = 0; i < 30; i++) if (eo[i]) fl.push(i);
     if (fl.length === 0) return;
     const seq = flipPair(FLIP_TBL, FLIP_ADJ, fl[0], fl[1]);
-    if (!seq) throw new Error("phaseFlip: no flipPair for " + [fl[0], fl[1]]);
+    if (!seq) throw new Error("phaseFlip: no flipPair " + [fl[0], fl[1]]);
     run(seq);
   }
   throw new Error("phaseFlip did not converge");
 }
 
-// Cancel trivially-adjacent inverse tokens to shorten output a little.
-function reduceTokens(toks) {
-  const out = [];
-  for (const t of toks) {
-    const last = out[out.length - 1];
-    if (last !== undefined) {
-      const li = tokIndex.get(last);
-      const ti = tokIndex.get(t);
-      if (tokInv[ti] === li) { out.pop(); continue; }
+// ---------------------------------------------------------------------------
+// Peephole optimizer on the gi token stream.
+//   1) cancel adjacent inverse turns (F0 F0' -> nothing),
+//   2) merge runs of the same face (order 5) into the net amount in {-2,-1,1,2}
+//      (net 0 -> drop). Repeat to fixpoint.
+// Output: [{face, amount}].
+// ---------------------------------------------------------------------------
+function gisToMoves(gis) {
+  // first reduce gi stream with stack-based same-face merging + inverse cancel.
+  // Represent each gi as (face, +1/-1). Merge consecutive same-face by summing
+  // mod 5 into canonical amount in {-2,-1,1,2} or drop if 0.
+  const stack = []; // entries {face, amt}  amt in nonzero mod-5 residue normalized
+  const norm = (a) => { a = ((a % 5) + 5) % 5; if (a === 3) return -2; if (a === 4) return -1; return a; }; // 0,1,2,-2,-1
+  for (const gi of gis) {
+    const face = genFace[gi];
+    const amt = genPrime[gi] ? -1 : 1;
+    if (stack.length && stack[stack.length - 1].face === face) {
+      const top = stack[stack.length - 1];
+      const na = norm(top.amt + amt);
+      if (na === 0) stack.pop();
+      else top.amt = na;
+    } else {
+      stack.push({ face, amt: norm(amt) });
     }
-    out.push(t);
   }
-  return out;
+  // Now a same-face neighbor can re-appear after a drop; do another pass to merge.
+  let changed = true;
+  while (changed) {
+    changed = false;
+    for (let i = 0; i + 1 < stack.length; i++) {
+      if (stack[i].face === stack[i + 1].face) {
+        const na = norm(stack[i].amt + stack[i + 1].amt);
+        stack.splice(i, 2, ...(na === 0 ? [] : [{ face: stack[i].face, amt: na }]));
+        changed = true;
+        break;
+      }
+    }
+  }
+  return stack.map((e) => ({ face: e.face, amount: e.amt }));
 }
-    return solveImpl;
+
+function solve(state) {
+  const S0 = {
+    cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
+    ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
+  };
+  if (isSolvedState(S0)) return [];
+  const ctx = { S: S0 };
+  const stream = [];
+  const run = (seq) => {
+    if (!seq) throw new Error("null sequence");
+    for (const gi of seq) { ctx.S = comp(ctx.S, gi); stream.push(gi); }
+  };
+  // Corners: solve permutation + orientation together via oriented 3-cycles.
+  phaseOriented(ctx, run, "cp", "co", 20, 3, C_ORI, C_ORI);
+  phaseTwist(ctx, run); // residue (usually empty / tiny)
+  // Edges: same.
+  phaseOriented(ctx, run, "ep", "eo", 30, 2, E_ORI, E_ORI);
+  phaseFlip(ctx, run); // residue
+  if (!isSolvedState(ctx.S)) throw new Error("solver did not reach solved");
+
+  const moves = gisToMoves(stream);
+  // sanity: verify moves reproduce the solution on the logical model.
+  let V = {
+    cp: Int8Array.from(state.cp), co: Int8Array.from(state.co),
+    ep: Int8Array.from(state.ep), eo: Int8Array.from(state.eo),
+  };
+  for (const mv of moves) {
+    const prime = mv.amount < 0;
+    const gi = mv.face * 2 + (prime ? 1 : 0);
+    for (let k = 0; k < Math.abs(mv.amount); k++) V = comp(V, gi);
+  }
+  if (!isSolvedState(V)) throw new Error("move-optimization broke the solution");
+  return moves;
+}
+    return solve;
   })();
   return _megaSolveFn;
 }
 function megaSolveFull() {
-  let toks; try { toks = megaGetSolve()(megaReadState()); } catch (e) { return null; }
-  if (!toks) return null;
-  return toks.map(t => { const pr = t.endsWith("'"); const i = parseInt(t.slice(1), 10); return MEGA_KEYS[i] + (pr ? "'" : ''); });
+  let moves; try { moves = megaGetSolve()(megaReadState()); } catch (e) { return null; }
+  if (!moves) return null;
+  return moves.map(m => MEGA_KEYS[m.face] + (Math.abs(m.amount) === 2 ? '2' : '') + (m.amount < 0 ? "'" : ''));
 }
 const puzzleMega = {
   id: 'megaminx', name: 'Megaminx',
