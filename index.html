@@ -315,6 +315,19 @@
   .pyra-net.editing path.cell { cursor: pointer; }
   .pyra-net path.cell.bad { stroke: #ff3b3b; stroke-width: 2.6; stroke-opacity: 1; }
 
+  .skewb-net {
+    position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
+    z-index: 8; padding: 13px 15px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 16px; backdrop-filter: blur(18px); display: none;
+  }
+  .skewb-net.on { display: block; }
+  .skewb-net svg { display: block; width: 196px; height: 149px; overflow: visible; }
+  .skewb-net polygon { stroke: #15151b; stroke-width: 0.5; stroke-linejoin: round; }
+  .skewb-net .face-outline { fill: none; stroke: #e7e7ef; stroke-width: 1.1; stroke-linejoin: round; stroke-opacity: 0.85; pointer-events: none; }
+  .skewb-net.editing polygon.cell { cursor: pointer; }
+  .skewb-net polygon.cell.bad { stroke: #ff3b3b; stroke-width: 1.8; stroke-opacity: 1; }
+
   /* 3×3 net (cross of six 3×3 faces, outlined) + the state-editor palette */
   .net3 {
     position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
@@ -8259,6 +8272,8 @@ function makeSkewbGeo(THREE, scale = 1) {
     _ROT24: ROT24,
     _HOME: HOME,
     _FACE_NORMALS: FACE_NORMALS,
+    _SLOT_FACE_ORDER: SLOT_FACE_ORDER,   // editor: co convention
+    _CORNER_POS: CORNER_POS,             // editor: corner home positions
   };
 }
 
@@ -8904,6 +8919,9 @@ const skewbPieces = skewbGeo.pieces.map(desc => {
     fg.setAttribute('normal',new THREE.Float32BufferAttribute(cnrm,3));
     const fmesh=new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SKEWB_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide}));
     if (desc.kind==='corner') fmesh.userData.skewbCorner = desc.homeIndex;
+    fmesh.userData.lc = new THREE.Vector3(pc[0],pc[1],pc[2]);     // local sticker centroid (editor)
+    fmesh.userData.ln = new THREE.Vector3(cn[0],cn[1],cn[2]);     // outward normal → robust face id
+    fmesh.userData.homeFace = fl.faceIndex;                       // original colour → restored on reset
     g.add(fmesh);
   }
   const dg=new THREE.BufferGeometry();
@@ -8912,13 +8930,177 @@ const skewbPieces = skewbGeo.pieces.map(desc => {
   skewbGroup.add(g);
   return { id:desc.id, kind:desc.kind, homeIndex:desc.homeIndex, home:desc.center.slice(), position:g.position, quaternion:g.quaternion, group:g };
 });
-function skewbReset(){ for(const p of skewbPieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
+function skewbReset(){ for(const p of skewbPieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);
+  for(const c of p.group.children) if(c.userData.homeFace!=null) c.material.color.setHex(SKEWB_FACE_HEX[c.userData.homeFace]); } }   // clear any paint
 // Natural Skewb turn: each of the 8 corners turns its OWN cap (all 8 distinct).
 function skewbBuildMove(tok,prime){ const i=SKEWB_KEYS.indexOf(tok); const d=SKEWB_CORNER_DIRS[i]; return {axis:new THREE.Vector3(d[0],d[1],d[2]),axisName:tok,target:(prime?1:-1)*(2*Math.PI/3),done:0,notation:tok+(prime?"'":"")}; }
 function skewbReadState(){ return skewbGeo.readState(skewbPieces); }
 function skewbSolved(){ const s=skewbReadState(); return s.cp.every((v,i)=>v===i)&&s.co.every(v=>v===0)&&s.cenp.every((v,i)=>v===i); }
 function skewbScramble(){ const t=[]; let last=-1; for(let i=0;i<12;i++){let c;do{c=Math.floor(Math.random()*8);}while(c===last);last=c;t.push(SKEWB_KEYS[c]+(Math.random()<0.5?"'":""));} return t; }
 function skewbFinalize(){ const e=history[settleIndex++]; if(!e)return; if(e.phase!=='scramble'){e.phase='solve'; if(timerState==='running'&&skewbSolved()){timerState='done';timerEnd=e.t;if(drillTarget==null)recordSolve();}} renderHistory(); }
+
+/* ===== Skewb state editor: unfolded net + paint -> solvable state =====
+   Decode painted facelet colours into the solver's {cp,co,cenp} (mirrors
+   readState: corner identity by 3-colour set, twist by which slot face shows the
+   corner's reference colour, centre by colour). For SOLVING a painted state we
+   reconstruct piece proxies from the decoded state via the 24 cube rotations and
+   run the existing corner-0 fix + solver — so a painted state is solvable while
+   normal play keeps its proven live-piece path (decode==readState, gate-tested). */
+const SKEWB_NET_NS = 'http://www.w3.org/2000/svg';
+const skewbNetEl = document.createElement('div');
+skewbNetEl.className = 'skewb-net';
+const skewbNetSvg = document.createElementNS(SKEWB_NET_NS, 'svg');
+skewbNetSvg.setAttribute('viewBox', '0 0 96 73');
+skewbNetEl.appendChild(skewbNetSvg);
+document.body.appendChild(skewbNetEl);
+// per-face 2D frame (e1=net-right, e2=net-up) — a standard cube unfold
+const SKEWB_FRAME = { 4:{e1:[1,0,0],e2:[0,1,0]}, 0:{e1:[0,0,-1],e2:[0,1,0]}, 5:{e1:[-1,0,0],e2:[0,1,0]},
+                      1:{e1:[0,0,1],e2:[0,1,0]}, 2:{e1:[1,0,0],e2:[0,0,1]}, 3:{e1:[1,0,0],e2:[0,0,-1]} };
+const SKEWB_NET_POS = { 2:[1,0], 1:[0,1], 4:[1,1], 0:[2,1], 5:[3,1], 3:[1,2] };   // face -> (col,row)
+const skewbNetPolys = [];   // [face*5+cell] = svg poly ; cell 0=centre,1=TR,2=TL,3=BL,4=BR
+const skewbSlotMesh = [];   // [face*5+cell] = current facelet mesh
+{
+  const S = 22, OX = 4, OY = 4;
+  for (let f = 0; f < 6; f++) {
+    const [col, row] = SKEWB_NET_POS[f];
+    const x0 = OX+col*S, y0 = OY+row*S, x1 = x0+S, y1 = y0+S, cx = (x0+x1)/2, cy = (y0+y1)/2;
+    const TL=[x0,y0], TR=[x1,y0], BR=[x1,y1], BL=[x0,y1], T=[cx,y0], R=[x1,cy], B=[cx,y1], L=[x0,cy];
+    const shapes = [ [T,R,B,L], [TR,R,T], [TL,T,L], [BL,L,B], [BR,B,R] ];   // diamond, TR, TL, BL, BR
+    shapes.forEach((pts, cell) => {
+      const poly = document.createElementNS(SKEWB_NET_NS, 'polygon');
+      poly.setAttribute('points', pts.map(p=>p.join(',')).join(' '));
+      poly.setAttribute('fill', '#'+SKEWB_FACE_HEX[f].toString(16).padStart(6,'0'));
+      poly.setAttribute('class', 'cell'); poly.dataset.idx = f*5+cell;
+      skewbNetSvg.appendChild(poly); skewbNetPolys[f*5+cell] = poly;
+    });
+    const out = document.createElementNS(SKEWB_NET_NS, 'polygon');
+    out.setAttribute('points', [TL,TR,BR,BL].map(p=>p.join(',')).join(' '));
+    out.setAttribute('class', 'face-outline'); skewbNetSvg.appendChild(out);
+  }
+}
+const SKEWB_FN_V = SKEWB_FACE_N.map(n=>new THREE.Vector3(n[0],n[1],n[2]).normalize());
+const _skc = new THREE.Vector3(), _skn = new THREE.Vector3();
+function skewbNearestFace(v){ let bf=0,bd=-Infinity; for(let f=0;f<6;f++){const d=v.dot(SKEWB_FN_V[f]); if(d>bd){bd=d;bf=f;}} return bf; }
+function skewbLocate(p, child) {                          // facelet -> (face by normal, cell)
+  p.group.localToWorld(_skc.copy(child.userData.lc));
+  _skn.copy(child.userData.ln).applyQuaternion(p.group.quaternion);
+  const face = skewbNearestFace(_skn);
+  if (p.kind === 'center') return { face, cell: 0 };
+  const fr = SKEWB_FRAME[face];
+  const u = _skc.x*fr.e1[0]+_skc.y*fr.e1[1]+_skc.z*fr.e1[2];
+  const v = _skc.x*fr.e2[0]+_skc.y*fr.e2[1]+_skc.z*fr.e2[2];
+  const cell = (v>0) ? (u>0?1:2) : (u>0?4:3);            // TR,TL / BR,BL
+  return { face, cell };
+}
+function skewbReadGrid() {
+  const grid = new Array(30).fill(null);
+  for (const p of skewbPieces) for (const child of p.group.children) {
+    if (!child.userData.lc) continue;
+    const { face, cell } = skewbLocate(p, child);
+    grid[face*5+cell] = child.material.color.getHex();
+    skewbSlotMesh[face*5+cell] = child;
+  }
+  return grid;
+}
+function skewbUpdateNet() {
+  const grid = skewbReadGrid();
+  for (let i=0;i<30;i++) if (grid[i]!=null) skewbNetPolys[i].setAttribute('fill', '#'+grid[i].toString(16).padStart(6,'0'));
+}
+let skewbCornerCells = null, skewbCornerHomeSet = null, skewbCornerRefColor = null, skewbCenterColorToId = null;
+function buildSkewbStruct() {                              // capture while solved (state-independent)
+  const SFO = skewbGeo._SLOT_FACE_ORDER, CP = skewbGeo._CORNER_POS;
+  skewbCornerHomeSet = []; skewbCornerRefColor = []; skewbCornerCells = [];
+  for (let k=0;k<8;k++){
+    skewbCornerHomeSet[k] = SFO[k].map(f=>SKEWB_FACE_HEX[f]).slice().sort((a,b)=>a-b);
+    skewbCornerRefColor[k] = SKEWB_FACE_HEX[CP[k][0] > 0 ? 0 : 1];     // ±X home face colour
+    skewbCornerCells[k] = { faces: SFO[k], cellByFace: {} };
+  }
+  for (const p of skewbPieces) {
+    if (p.kind !== 'corner') continue;
+    for (const child of p.group.children) {
+      if (!child.userData.lc) continue;
+      const { face, cell } = skewbLocate(p, child);
+      skewbCornerCells[p.homeIndex].cellByFace[face] = face*5+cell;
+    }
+  }
+  skewbCenterColorToId = {};
+  for (let f=0;f<6;f++) skewbCenterColorToId[SKEWB_FACE_HEX[f]] = f;
+}
+function skewbDecodeColors(grid) {
+  if (!skewbCornerCells) buildSkewbStruct();
+  const SFO = skewbGeo._SLOT_FACE_ORDER;
+  const cp = new Array(8).fill(0), co = new Array(8).fill(0), cenp = new Array(6).fill(0);
+  const homeByKey = {}; for (let k=0;k<8;k++) homeByKey[skewbCornerHomeSet[k].join(',')] = k;
+  for (let s=0;s<8;s++){
+    const cc = skewbCornerCells[s], colByFace = {};
+    for (const f of cc.faces) colByFace[f] = grid[cc.cellByFace[f]];
+    const id = homeByKey[cc.faces.map(f=>colByFace[f]).slice().sort((a,b)=>a-b).join(',')];
+    cp[s] = (id==null)?0:id;
+    const ref = skewbCornerRefColor[cp[s]], order = SFO[s];
+    for (let i=0;i<3;i++) if (colByFace[order[i]] === ref) { co[s] = i; break; }
+  }
+  for (let f=0;f<6;f++){ const id = skewbCenterColorToId[grid[f*5+0]]; cenp[f] = (id==null)?f:id; }
+  return { cp, co, cenp };
+}
+function skewbEditState(){ return skewbDecodeColors(skewbReadGrid()); }
+// Reconstruct piece proxies that realise a decoded state, using the 24 cube
+// rotations (proper). readState(reconstructed) === state (gate-tested).
+function skewbReconstructProxies(S) {
+  const ROT24 = skewbGeo._ROT24, CP = skewbGeo._CORNER_POS, SFO = skewbGeo._SLOT_FACE_ORDER, sc = SKEWB_SCALE;
+  const px = [];
+  for (let s=0;s<8;s++){
+    const P = S.cp[s];
+    const home = new THREE.Vector3(CP[P][0],CP[P][1],CP[P][2]);
+    const slot = new THREE.Vector3(CP[s][0],CP[s][1],CP[s][2]);
+    const refDir = new THREE.Vector3(CP[P][0],0,0).normalize();
+    let q = null;
+    for (const r of ROT24) {
+      if (home.clone().applyQuaternion(r).distanceToSquared(slot) > 0.05) continue;
+      const face = skewbNearestFace(refDir.clone().applyQuaternion(r));
+      if (SFO[s].indexOf(face) === S.co[s]) { q = r; break; }
+    }
+    px.push({ id:'corner-'+P, position: slot.multiplyScalar(sc), quaternion: (q||new THREE.Quaternion()).clone() });
+  }
+  for (let f=0;f<6;f++){
+    const C = S.cenp[f];
+    const homeN = new THREE.Vector3(...SKEWB_FACE_N[C]), slotN = new THREE.Vector3(...SKEWB_FACE_N[f]);
+    let q = null; for (const r of ROT24){ if (homeN.clone().applyQuaternion(r).distanceToSquared(slotN) < 0.05){ q=r; break; } }
+    px.push({ id:'center-'+C, position: slotN.multiplyScalar(sc), quaternion: (q||new THREE.Quaternion()).clone() });
+  }
+  return px;
+}
+function paintSkewb(idx, color) {
+  const mesh = skewbSlotMesh[idx];
+  if (mesh) mesh.material.color.setHex(color);
+  skewbNetPolys[idx].setAttribute('fill', '#'+color.toString(16).padStart(6,'0'));
+}
+function validateSkewb() {
+  const grid = skewbReadGrid();
+  if (!skewbCornerCells) buildSkewbStruct();
+  const bad = new Set();
+  const counts = {}; for (let i=0;i<30;i++){ const c=grid[i]; counts[c]=(counts[c]||0)+1; }
+  const countBad = SKEWB_FACE_HEX.some(c => (counts[c]||0) !== 5);
+  let impossible=0, dup=0;
+  const homeKeys = new Set(skewbCornerHomeSet.map(s=>s.join(','))), seen = {};
+  for (let s=0;s<8;s++){
+    const cc = skewbCornerCells[s], cols = cc.faces.map(f=>grid[cc.cellByFace[f]]);
+    const key = cols.slice().sort((a,b)=>a-b).join(',');
+    const mark = () => cc.faces.forEach(f=>bad.add(cc.cellByFace[f]));
+    if (new Set(cols).size !== 3 || !homeKeys.has(key)) { impossible++; mark(); continue; }
+    if (seen[key]!=null) { dup++; mark(); const o=skewbCornerCells[seen[key]]; o.faces.forEach(f=>bad.add(o.cellByFace[f])); }
+    else seen[key]=s;
+  }
+  const cenCols = []; for (let f=0;f<6;f++) cenCols.push(grid[f*5+0]);
+  const cenDistinct = new Set(cenCols).size === 6;
+  if (!cenDistinct) for (let f=0;f<6;f++) if (cenCols.filter(c=>c===cenCols[f]).length>1) bad.add(f*5+0);
+  const msgs = [];
+  if (countBad) msgs.push('colour counts ≠ 5');
+  if (impossible) msgs.push(impossible+' impossible');
+  if (dup) msgs.push(dup+' duplicate');
+  if (!cenDistinct) msgs.push('centres not distinct');
+  return { bad, ok: msgs.length===0, message: msgs.length ? '⚠ '+msgs.join(' · ') : '✓ valid Skewb' };
+}
+buildSkewbStruct();
 // solver outputs axis tokens A0..A3; map each axis to the corner-cap key with the matching direction
 const SKEWB_AXIS_TO_KEY = skewbGeo.axes.map(ax => { let bi=0,bd=-2; for(let i=0;i<SKEWB_CORNER_DIRS.length;i++){const d=SKEWB_CORNER_DIRS[i];const dot=d[0]*ax.dir[0]+d[1]*ax.dir[1]+d[2]*ax.dir[2];if(dot>bd){bd=dot;bi=i;}} return SKEWB_KEYS[bi]; });
 // The IDA* solver keeps reference corner 0 fixed (its 4 axes never touch it) and
@@ -8934,8 +9116,8 @@ function skewbApplyCapProxy(px, i, prime){
   for (const c of sel) skewbGeo.snapPiece(c);
 }
 const _skKey = st => st.cp.join()+'|'+st.co.join()+'|'+st.cenp.join();
-function skewbFixCorner0(){
-  let level = [{ px: skewbCloneProxies(skewbPieces), path: [] }];
+function skewbFixCorner0(startProxies){
+  let level = [{ px: skewbCloneProxies(startProxies), path: [] }];
   const seen = new Set([ _skKey(skewbGeo.readState(level[0].px)) ]);
   let nodes = 0;
   for (let depth = 0; depth <= 8 && level.length; depth++){
@@ -8958,10 +9140,13 @@ function skewbFixCorner0(){
   return null;
 }
 function skewbSolveFull(){
-  const s0 = skewbReadState();
+  const live = skewbReadState(), edit = skewbEditState();
+  const same = live.cp.join()===edit.cp.join() && live.co.join()===edit.co.join() && live.cenp.join()===edit.cenp.join();
+  const px = same ? skewbCloneProxies(skewbPieces) : skewbReconstructProxies(edit);   // painted state → real proxies
+  const s0 = same ? live : skewbGeo.readState(px);
   let pre = [], state = s0;
   if (!(s0.cp[0] === 0 && s0.co[0] === 0)) {           // reference corner displaced → bring it home first
-    const fix = skewbFixCorner0();
+    const fix = skewbFixCorner0(px);
     if (!fix) return null;
     pre = fix.toks; state = fix.state;
   }
@@ -8974,7 +9159,8 @@ const puzzleSkewb = {
   buildMove:(t,p,d)=>skewbBuildMove(t,p),
   selectPieces:(m)=>skewbGeo.selectPieces(m,skewbPieces),
   snapPiece:(p)=>skewbGeo.snapPiece(p),
-  build:skewbReset, updateNet:()=>{}, updateProjections:()=>{}, finalizeMovePhase:skewbFinalize,
+  build:skewbReset, updateNet:skewbUpdateNet, updateProjections:()=>{}, finalizeMovePhase:skewbFinalize,
+  netEl:skewbNetEl, paletteColors:SKEWB_FACE_HEX, paintCell:paintSkewb, validate:validateSkewb, editable:true,
   readState:skewbReadState, scramble:skewbScramble, storageKey:'skewb-solves', solveFull:skewbSolveFull,
   keymap:{ faceKeys:Object.fromEntries(SKEWB_KEYS.map(c=>[c,c])) },
   phaseConfig:{order:['solve'],labels:{solve:'Solve'}},
@@ -10001,7 +10187,9 @@ function switchPuzzle(id) {
   netEl.style.visibility = (id === '2x2') ? 'visible' : 'hidden';
   pyraNetEl.classList.toggle('on', id === 'pyraminx');
   cube3NetEl.classList.toggle('on', id === '3x3');
+  skewbNetEl.classList.toggle('on', id === 'skewb');
   if (id === '3x3') cube3UpdateNet();
+  if (id === 'skewb') skewbUpdateNet();
   puzzle = PUZZLES[id];
   pyraSnapTarget = null;
   setEditMode(false);                                        // leave edit mode when switching puzzles
@@ -10043,6 +10231,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 
 
