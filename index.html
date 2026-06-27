@@ -9619,6 +9619,7 @@ const sq1Pieces = sq1Geo.pieces.map(desc => {
     const fmesh=new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SQ1_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide}));
     fmesh.userData.lc=new THREE.Vector3(pc[0],pc[1],pc[2]);          // local sticker centroid (editor)
     fmesh.userData.ln=new THREE.Vector3(cn[0],cn[1],cn[2]);          // outward normal
+    fmesh.userData.poly=poly.map(v=>new THREE.Vector3(v[0],v[1],v[2]));  // sticker outline (rel piece centre) for net projection
     fmesh.userData.faceIndex=fl.faceIndex;                           // original colour → restored on reset
     g.add(fmesh);
   }
@@ -9645,38 +9646,15 @@ const SQ1_SEG2WEDGE = [0,0,1,2,2,3,4,4,5,6,6,7];   // cubeshape: [C,C,E,C,C,E,..
 const _sq1w = new THREE.Vector3(), _sq1n = new THREE.Vector3();
 // facelet -> net cell (or -1 for the hidden underside); midFn maps middle side faces
 function sq1CellOf(p, child) {
-  const fi = child.userData.faceIndex;
-  if (p.layer === 'middle') { const base = p.position.x < 0 ? 40 : 43; const off = fi===2?1 : fi===3?2 : 0; return base + off; }
   _sq1n.copy(child.userData.ln).applyQuaternion(p.group.quaternion);
   p.group.localToWorld(_sq1w.copy(child.userData.lc));
+  if (p.layer === 'middle') { const base = _sq1w.x < 0 ? 40 : 43; const off = Math.abs(_sq1n.x) > Math.abs(_sq1n.z) ? 0 : (_sq1n.z > 0 ? 1 : 2); return base + off; }
   const th = Math.atan2(_sq1w.z, _sq1w.x) * 180/Math.PI;
   const seg = (((Math.floor((th+180)/30)) % 12) + 12) % 12;
   if (p.layer === 'top') { if (_sq1n.y > 0.5) return SQ1_SEG2WEDGE[seg]; if (Math.abs(_sq1n.y) < 0.5) return 8 + seg; return -1; }
   if (_sq1n.y < -0.5) return 20 + SQ1_SEG2WEDGE[seg]; if (Math.abs(_sq1n.y) < 0.5) return 28 + seg; return -1;   // bottom
 }
-// build the SVG clock cells
-{
-  const aP = (cx,cy,r,d)=>{ const a=d*Math.PI/180; return (cx+r*Math.cos(a)).toFixed(2)+' '+(cy+r*Math.sin(a)).toFixed(2); };
-  const sector = (cx,cy,r0,r1,a0,a1)=>{ const lg=(a1-a0)>180?1:0;
-    if (r0<=0.01) return `M ${cx} ${cy} L ${aP(cx,cy,r1,a0)} A ${r1} ${r1} 0 ${lg} 1 ${aP(cx,cy,r1,a1)} Z`;
-    return `M ${aP(cx,cy,r1,a0)} A ${r1} ${r1} 0 ${lg} 1 ${aP(cx,cy,r1,a1)} L ${aP(cx,cy,r0,a1)} A ${r0} ${r0} 0 ${lg} 0 ${aP(cx,cy,r0,a0)} Z`; };
-  const Ri=21, Rmid=23, Ro=35;
-  const WEDGE_SEGS=[[0,1],[2,2],[3,4],[5,5],[6,7],[8,8],[9,10],[11,11]];   // which segs each inner wedge spans
-  function buildClock(cx, cy, yf, base){    // yf=+1 top (screen=θ), -1 bottom (screen=-θ)
-    const mk=(idx,d)=>{ const poly=document.createElementNS(SQ1_NET_NS,'path'); poly.setAttribute('d',d);
-      poly.setAttribute('class','cell'); poly.dataset.idx=idx; sq1NetSvg.appendChild(poly); sq1NetPolys[idx]=poly; };
-    for (let w=0; w<8; w++){ const [s0,s1]=WEDGE_SEGS[w]; let a0=s0*30-180, a1=(s1+1)*30-180;
-      if (yf<0){ const t=-a1; a1=-a0; a0=t; } mk(base+w, sector(cx,cy,0,Ri,a0,a1)); }
-    for (let s=0; s<12; s++){ let a0=s*30-180, a1=(s+1)*30-180; if (yf<0){ const t=-a1; a1=-a0; a0=t; } mk(base+8+s, sector(cx,cy,Rmid,Ro,a0,a1)); }
-  }
-  buildClock(75, 38, 1, 0); buildClock(75, 112, -1, 20);
-  // middle strip: 6 cells (mid-L L,F,B  mid-R R,F,B) as a row of rects
-  const labels=['L','F','B','R','F','B'];
-  for (let i=0;i<6;i++){ const x=75-3*14+i*14, idx=40+i;
-    const r=document.createElementNS(SQ1_NET_NS,'rect'); r.setAttribute('x',x); r.setAttribute('y',69); r.setAttribute('width',13); r.setAttribute('height',12);
-    r.setAttribute('rx',1.5); r.setAttribute('class','cell'); r.dataset.idx=idx; sq1NetSvg.appendChild(r); sq1NetPolys[idx]=r; }
-}
-function sq1ReadGrid() {
+function sq1ReadGrid() {       // cubeshape colour grid (for validate / reconstruction)
   const grid = new Array(46).fill(null);
   for (const p of sq1Pieces) for (const child of p.group.children) {
     if (child.userData.faceIndex == null) continue;
@@ -9685,14 +9663,50 @@ function sq1ReadGrid() {
   }
   return grid;
 }
+// ---- DYNAMIC net: project the actual settled pieces each update. Top-down view of
+// whatever is currently in the top layer + bottom-up of the bottom layer + middle
+// strip; only the OUTWARD-facing facelet per direction is drawn (white/yellow
+// undersides are skipped), so shape + colour are always faithful (cube-shape or not). ----
+const _sq1pv = new THREE.Vector3();
+let sq1CellMesh = [];
+function sq1WorldPoly(p, child){ return child.userData.poly.map(v=>{ _sq1pv.copy(v).applyQuaternion(p.quaternion).add(p.position); return [_sq1pv.x, _sq1pv.y, _sq1pv.z]; }); }
 function sq1UpdateNet() {
-  const grid = sq1ReadGrid();
-  for (let i=0;i<46;i++) if (grid[i]!=null) sq1NetPolys[i].setAttribute('fill', '#'+grid[i].toString(16).padStart(6,'0'));
+  while (sq1NetSvg.firstChild) sq1NetSvg.removeChild(sq1NetSvg.firstChild);
+  sq1CellMesh = [];
+  const cxT=75, cyT=34, cxB=75, cyB=112, S=13, Ri=20, Ro=29;
+  const aP=(cx,cy,r,a)=>(cx+r*Math.cos(a)).toFixed(2)+' '+(cy+r*Math.sin(a)).toFixed(2);
+  const sector=(cx,cy,r0,r1,a0,a1)=>{ const lg=Math.abs(a1-a0)>Math.PI?1:0;
+    return `M ${aP(cx,cy,r1,a0)} A ${r1} ${r1} 0 ${lg} 1 ${aP(cx,cy,r1,a1)} L ${aP(cx,cy,r0,a1)} A ${r0} ${r0} 0 ${lg} 0 ${aP(cx,cy,r0,a0)} Z`; };
+  const add=(d,color,idx)=>{ const el=document.createElementNS(SQ1_NET_NS,'path'); el.setAttribute('d',d);
+    el.setAttribute('fill','#'+color.toString(16).padStart(6,'0')); el.setAttribute('class','cell'); el.dataset.idx=idx; sq1NetSvg.appendChild(el); };
+  for (const p of sq1Pieces){
+    const y=p.position.y, layer = Math.abs(y)<0.2 ? 'middle' : (y>0?'top':'bottom');
+    for (const child of p.group.children){
+      if (child.userData.faceIndex==null) continue;
+      _sq1n.copy(child.userData.ln).applyQuaternion(p.quaternion);
+      const color=child.material.color.getHex(), idx=sq1CellOf(p,child);
+      if (layer==='middle'){
+        if (Math.abs(_sq1n.y)>0.5) continue;                       // middle internal top/bottom faces
+        p.group.localToWorld(_sq1pv.copy(child.userData.lc));
+        const col=(_sq1pv.x<0?0:3)+(Math.abs(_sq1n.x)>Math.abs(_sq1n.z)?0:(_sq1n.z>0?1:2)), x=75-42+col*14;
+        add(`M ${x} 67 h 13 v 11 h -13 Z`, color, idx); if(idx>=0) sq1CellMesh[idx]=child; continue;
+      }
+      const outwardUp = (layer==='top') ? _sq1n.y>0.5 : _sq1n.y<-0.5;
+      const underside = (layer==='top') ? _sq1n.y<-0.5 : _sq1n.y>0.5;
+      if (underside) continue;                                      // skip hidden white/yellow underside
+      const cx=layer==='top'?cxT:cxB, cy=layer==='top'?cyT:cyB, zf=layer==='top'?1:-1, wp=sq1WorldPoly(p,child);
+      if (outwardUp){                                               // top/bottom sticker → projected polygon (real shape)
+        add('M '+wp.map(v=>`${(cx+v[0]*S).toFixed(2)} ${(cy+zf*v[2]*S).toFixed(2)}`).join(' L ')+' Z', color, idx);
+      } else {                                                      // side sticker → outer-ring sector at its real angular span
+        let lo=Infinity, hi=-Infinity; for(const v of wp){ const a=Math.atan2(zf*v[2],v[0]); lo=Math.min(lo,a); hi=Math.max(hi,a); }
+        if (hi-lo>Math.PI){ lo=Infinity; hi=-Infinity; for(const v of wp){ let a=Math.atan2(zf*v[2],v[0]); if(a<0)a+=2*Math.PI; lo=Math.min(lo,a); hi=Math.max(hi,a);} }
+        add(sector(cx,cy,Ri,Ro,lo,hi), color, idx);
+      }
+      if(idx>=0) sq1CellMesh[idx]=child;
+    }
+  }
 }
-function paintSq1(idx, color) {
-  const m = sq1SlotMesh[idx]; if (m) m.material.color.setHex(color);
-  sq1NetPolys[idx].setAttribute('fill', '#'+color.toString(16).padStart(6,'0'));
-}
+function paintSq1(idx, color){ const m=sq1CellMesh[idx]; if(m) m.material.color.setHex(color); sq1UpdateNet(); }
 // piece cell-groups (cubeshape): inner wedge + its outer side segment(s)
 const SQ1_GROUPS = (() => {
   const g = [], wedgeSegs = [[0,1],[2,2],[3,4],[5,5],[6,7],[8,8],[9,10],[11,11]];
@@ -9726,6 +9740,55 @@ function validateSq1() {
   if(dup) msgs.push(dup+' duplicate');
   return { bad, ok: msgs.length===0, message: msgs.length ? '⚠ '+msgs.join(' · ') : '✓ valid Square-1' };
 }
+// ---- solve from paint: place the real pieces to realise the painted pattern, so
+// the position/identity-based Sq1 solver can solve it (then the solution sorts it). ----
+let sq1ReconData = null;   // { pieceData, slotInfo[16] {home,cells,kind}, midHome{L,R}, midData }
+function sq1BuildReconData() {
+  const pieceCells = {};
+  for (const p of sq1Pieces) { const cells=[]; for (const c of p.group.children){ if(c.userData.faceIndex==null) continue; const cell=sq1CellOf(p,c); if(cell>=0) cells.push(cell); } pieceCells[p.id]=cells.slice().sort((a,b)=>a-b); }
+  const data = id => { const p=sq1Pieces.find(x=>x.id===id); return { id, kind:p.kind, layer:p.layer, home:p.home.slice(),
+    facelets: p.group.children.filter(c=>c.userData.faceIndex!=null).map(c=>({ lc:c.userData.lc.clone(), ln:c.userData.ln.clone(), color:SQ1_FACE_HEX[c.userData.faceIndex] })) }; };
+  const slotInfo = [];
+  for (let gi=0; gi<16; gi++){ const gcells=SQ1_GROUPS[gi].cells.slice().sort((a,b)=>a-b);
+    const pid=Object.keys(pieceCells).find(id=>pieceCells[id].join()===gcells.join());
+    slotInfo[gi]={ home:sq1Pieces.find(p=>p.id===pid).home.slice(), cells:SQ1_GROUPS[gi].cells, kind:SQ1_GROUPS[gi].kind }; }
+  sq1ReconData = { topBot: ['tc-0','tc-1','tc-2','tc-3','te-0','te-1','te-2','te-3','bc-0','bc-1','bc-2','bc-3','be-0','be-1','be-2','be-3'].map(data),
+    slotInfo, mid: ['mid-L','mid-R'].map(data), midHome:{ L:sq1Pieces.find(p=>p.id==='mid-L').home.slice(), R:sq1Pieces.find(p=>p.id==='mid-R').home.slice() } };
+}
+const SQ1_RECON_CAND = (() => { const c=[]; for(let k=0;k<12;k++){ const ry=new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0,1,0), k*Math.PI/6);
+  c.push(ry.clone()); for(const ax of [[1,0,0],[0,0,1]]) c.push(ry.clone().multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(...ax),Math.PI))); } return c; })();
+function sq1ReconstructFromPaint() {
+  if (!sq1ReconData) sq1BuildReconData();
+  const grid = sq1ReadGrid(), used = new Set(), _v=new THREE.Vector3(), _n=new THREE.Vector3(), assign=[];
+  const hypoCell=(layer,posV,normV)=>{ const th=Math.atan2(posV.z,posV.x)*180/Math.PI, seg=(((Math.floor((th+180)/30))%12)+12)%12;
+    if(layer==='top'){ if(normV.y>0.5) return SQ1_SEG2WEDGE[seg]; if(Math.abs(normV.y)<0.5) return 8+seg; return -1; }
+    if(normV.y<-0.5) return 20+SQ1_SEG2WEDGE[seg]; if(Math.abs(normV.y)<0.5) return 28+seg; return -1; };
+  for (let gi=0; gi<16; gi++){ const slot=sq1ReconData.slotInfo[gi], home=new THREE.Vector3(...slot.home);
+    const slotLayer=slot.home[1]>0?'top':'bottom', want=slot.cells.slice().sort((a,b)=>a-b); let found=null;
+    for (const pd of sq1ReconData.topBot){ if(used.has(pd.id) || (pd.kind==='corner')!==(slot.kind==='corner')) continue;
+      for (const q of SQ1_RECON_CAND){ let ok=true; const got=[];
+        for (const fl of pd.facelets){ _n.copy(fl.ln).applyQuaternion(q); _v.copy(fl.lc).applyQuaternion(q).add(home);
+          const cell=hypoCell(slotLayer,_v,_n); if(cell<0) continue; got.push(cell); if(grid[cell]!==fl.color){ ok=false; break; } }
+        got.sort((a,b)=>a-b); if(ok && got.join()===want.join()){ found={pid:pd.id,home:slot.home,q}; break; } }
+      if(found) break; }
+    if(found){ used.add(found.pid); assign.push(found); } }
+  // middle: 2 slots (L cells 40-42, R cells 43-45)
+  const midUsed=new Set();
+  for (const side of ['L','R']){ const home=new THREE.Vector3(...sq1ReconData.midHome[side]), wantBase=side==='L'?40:43; let found=null;
+    for (const pd of sq1ReconData.mid){ if(midUsed.has(pd.id)) continue;
+      for (const q of SQ1_RECON_CAND){ let ok=true; const got=[];
+        for (const fl of pd.facelets){ _n.copy(fl.ln).applyQuaternion(q); _v.copy(fl.lc).applyQuaternion(q).add(home);
+          const base=_v.x<0?40:43, off=Math.abs(_n.x)>Math.abs(_n.z)?0:(_n.z>0?1:2), cell=base+off;
+          if(base!==wantBase){ ok=false; break; } got.push(cell); if(grid[cell]!==fl.color){ ok=false; break; } }
+        if(ok && got.length===3){ found={pid:pd.id,home:sq1ReconData.midHome[side],q}; break; } }
+      if(found) break; }
+    if(found){ midUsed.add(found.pid); assign.push(found); } }
+  for (const a of assign){ const p=sq1Pieces.find(x=>x.id===a.pid); p.position.set(a.home[0],a.home[1],a.home[2]); p.quaternion.copy(a.q); sq1Geo.snapPiece(p); }
+  for (const p of sq1Pieces) for (const c of p.group.children) if (c.userData.faceIndex!=null) c.material.color.setHex(SQ1_FACE_HEX[c.userData.faceIndex]);  // relocated pieces wear natural colours = the painted pattern
+  return assign.length;   // 18 if fully reconstructed
+}
+function sq1IsPainted(){ for(const p of sq1Pieces) for(const c of p.group.children){ if(c.userData.faceIndex==null) continue;
+  if(c.material.color.getHex()!==SQ1_FACE_HEX[c.userData.faceIndex]) return true; } return false; }
 function sq1Solved(){ return !!(sq1Geo.isSolved && sq1Geo.isSolved(sq1Pieces)); }
 function sq1BuildMove(face, prime, tok){
   // NOTE: legality of a slice must be judged when it ANIMATES, not when it is
@@ -10424,6 +10487,7 @@ function sq1AssetInit() {
 async function sq1SolveFull() {
   if (!_sq1Solve) await sq1AssetInit();
   if (!_sq1Solve) return null;
+  if (sq1IsPainted()) { if (sq1ReconstructFromPaint() < 18) return null; }   // painted state → place real pieces to match
   let moves; try { moves = _sq1Solve(sq1Pieces); } catch (e) { return null; }
   return moves ? sq1MovesToToks(moves) : null;
 }
@@ -10518,6 +10582,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 
 
