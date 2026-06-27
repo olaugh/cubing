@@ -11000,6 +11000,7 @@ function ollAnswer(ci) {
   }
 }
 function ollFitCamera() {
+  controls.maxDistance = 100;                            // the default cap (22) would clamp the PBL zoom-out + distort the pan
   const dir = new THREE.Vector3(4.6, 4.2, 6.5);
   const tan = Math.tan(camera.fov * Math.PI / 360);
   if (window.innerWidth <= 720) {
@@ -11047,6 +11048,7 @@ function stopOllTrainer() {
   ollBtnEl.classList.remove('active');
   cubeGroup.rotation.y = 0;
   projGroup.visible = (puzzle.id === '2x2');              // restore the hidden-face halos
+  controls.maxDistance = 22;                              // restore the normal zoom cap
   if (ollT.camSaved) { camera.position.copy(ollT.camSaved); controls.target.set(0, 0, 0); controls.update(); ollT.camSaved = null; }
   resetState(true);                                       // restore the solved cube
 }
