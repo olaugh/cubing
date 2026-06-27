@@ -352,6 +352,10 @@
   .sq1-net .cell { stroke: #101014; stroke-width: 0.5; stroke-linejoin: round; }
   .sq1-net.editing .cell { cursor: pointer; }
   .sq1-net .cell.bad { stroke: #ff3b3b; stroke-width: 1.8; stroke-opacity: 1; }
+  .sq1-notation { display: flex; gap: 4px; margin-bottom: 9px; }
+  .sq1-notation .ntog { flex: 1; padding: 4px 7px; font-size: 11px; border-radius: 7px; cursor: pointer;
+    border: 1px solid var(--panel-border); background: transparent; color: var(--muted); white-space: nowrap; }
+  .sq1-notation .ntog.active { background: var(--accent); border-color: transparent; color: #fff; }
 
   /* 3×3 net (cross of six 3×3 faces, outlined) + the state-editor palette */
   .net3 {
@@ -2656,7 +2660,8 @@ function renderHistory() {
     const last = i === chunks.length - 1;
     const live = last && isAnimating && ch.phase !== 'scramble';
     const cmoves = compressMoves(ch.moves);
-    if (ch.phase !== 'scramble') total += cmoves.length;
+    const dmoves = (puzzle.id === 'sq1' && sq1Notation === 'karn') ? sq1MovesToKarn(cmoves) : cmoves;   // Karnaukh readout
+    if (ch.phase !== 'scramble') total += dmoves.length;
     let labelHtml;
     if (ch.phase === 'scramble') {
       labelHtml = '<span class="name scr">Scramble</span>';
@@ -2667,9 +2672,9 @@ function renderHistory() {
         ? `<span class="name matched">${base} · ${match}</span>`
         : `<span class="name">${base}</span>`;
     }
-    const moves = cmoves.map(m => `<span class="mv">${m}</span>`).join('');
+    const moves = dmoves.map(m => `<span class="mv">${m}</span>`).join('');
     html += `<div class="chunk ${ch.phase} ${live ? 'live' : ''}">
-      <div class="chunk-label">${labelHtml}<span class="count">${cmoves.length}</span></div>
+      <div class="chunk-label">${labelHtml}<span class="count">${dmoves.length}</span></div>
       <div class="moves">${moves}</div>
     </div>`;
   });
@@ -3510,6 +3515,16 @@ function makeGroup(label, moves, variants) {
 function buildDock() {
   dock.innerHTML = '';
   for (const k in buttonMap) delete buttonMap[k];
+  if (puzzle.id === 'sq1') {                                  // notation toggle: granular U/D/slice ↔ Karnaukh
+    const tog = document.createElement('div'); tog.className = 'sq1-notation';
+    [['std', 'U D /'], ['karn', 'Karnaukh']].forEach(([mode, lbl]) => {
+      const tb = document.createElement('button'); tb.className = 'ntog' + (sq1Notation === mode ? ' active' : ''); tb.textContent = lbl;
+      tb.addEventListener('click', () => { if (sq1Notation !== mode) { sq1Notation = mode; try { localStorage.setItem('sq1-notation', mode); } catch (e) {} buildDock(); renderHistory(); } });
+      tog.appendChild(tb);
+    });
+    dock.appendChild(tog);
+    if (sq1Notation === 'karn') { buildSq1KarnDock(); return; }
+  }
   (puzzle.dockGroups || []).forEach((gr, i) => {
     if (i > 0) { const div = document.createElement('div'); div.className = 'divider'; dock.appendChild(div); }
     dock.appendChild(makeGroup(gr.label, gr.moves, gr.variants));
@@ -10490,6 +10505,49 @@ async function sq1SolveFull() {
   if (sq1IsPainted()) { if (sq1ReconstructFromPaint() < 18) return null; }   // painted state → place real pieces to match
   let moves; try { moves = _sq1Solve(sq1Pieces); } catch (e) { return null; }
   return moves ? sq1MovesToToks(moves) : null;
+}
+/* ---- Square-1 notation: granular U/D/slice ↔ Karnaukh (Karnotation) ----
+   Karnaukh letters are shorthand for common (top,bottom) turn pairs; a space
+   between them is a slice. m/m' were cropped in the source table, so they're
+   omitted (those pairs just show as (x,y)). For input, each letter macro turns
+   the top by x ticks + bottom by y ticks; the keyboard stays granular. */
+let sq1Notation = 'std';
+try { const s = localStorage.getItem('sq1-notation'); if (s === 'karn' || s === 'std') sq1Notation = s; } catch (e) {}
+const SQ1_KARN = { U:[3,0], "U'":[-3,0], u:[2,-1], "u'":[-2,1], D:[0,3], "D'":[0,-3], d:[-1,2], "d'":[1,-2],
+                   E:[3,3], "E'":[-3,-3], e:[1,1], "e'":[-1,-1], M:[2,2], "M'":[-2,-2] };
+const SQ1_KARN_REV = {}; for (const k in SQ1_KARN) SQ1_KARN_REV[SQ1_KARN[k].join(',')] = k;
+function sq1TurnTok(face, a){ return face + (Math.abs(a) > 1 ? Math.abs(a) : '') + (a < 0 ? "'" : ''); }
+function sq1ApplyKarn(letter){ const v = SQ1_KARN[letter]; if (!v) return; if (v[0]) applyMove(sq1TurnTok('U', v[0])); if (v[1]) applyMove(sq1TurnTok('D', v[1])); }
+function sq1MovesToKarn(cmoves){    // group ticks between slices into (x,y) -> Karnaukh letter (or (x,y))
+  const out = [], norm = n => { n = ((n % 12) + 12) % 12; return n > 6 ? n - 12 : n; };
+  let tx = 0, ty = 0;
+  const flush = () => { const x = norm(tx), y = norm(ty); if (x || y) out.push(SQ1_KARN_REV[x + ',' + y] || `(${x},${y})`); tx = 0; ty = 0; };
+  for (const m of cmoves){
+    if (m === '/') { flush(); out.push('/'); continue; }
+    const mm = String(m).match(/\d+/); let amt = mm ? parseInt(mm[0], 10) : 1; if (String(m).includes("'")) amt = -amt;
+    if (m[0] === 'U') tx += amt; else if (m[0] === 'D') ty += amt;
+  }
+  flush();
+  return out;
+}
+function buildSq1KarnDock(){
+  const groups = [ { label:'Top', toks:['U',"U'",'u',"u'"] }, { label:'Bottom', toks:['D',"D'",'d',"d'"] },
+                   { label:'Both', toks:['E',"E'",'e',"e'",'M',"M'"] }, { label:'Slice', toks:['/'] } ];
+  groups.forEach((gr, i) => {
+    if (i > 0) { const div = document.createElement('div'); div.className = 'divider'; dock.appendChild(div); }
+    const grp = document.createElement('div'); grp.className = 'grp';
+    const gl = document.createElement('div'); gl.className = 'glabel'; gl.textContent = gr.label; grp.appendChild(gl);
+    for (let r = 0; r < gr.toks.length; r += 2){
+      const row = document.createElement('div'); row.className = 'row';
+      for (const tok of gr.toks.slice(r, r + 2)){
+        const btn = document.createElement('button'); btn.className = 'mbtn'; btn.textContent = tok;
+        btn.addEventListener('click', () => tok === '/' ? applyMove('/') : sq1ApplyKarn(tok));
+        buttonMap[tok] = btn; row.appendChild(btn);
+      }
+      grp.appendChild(row);
+    }
+    dock.appendChild(grp);
+  });
 }
 const puzzleSq1 = {
   id:'sq1', name:'Square-1', group:sq1Group,
