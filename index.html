@@ -9779,10 +9779,13 @@ function sq1UpdateNet() {
         p.group.localToWorld(_sq1pv.copy(child.userData.lc));
         const leftHalf=_sq1pv.x<0, isSide=Math.abs(_sq1n.x)>Math.abs(_sq1n.z), isFront=_sq1n.z>0;
         const slot=leftHalf?(isSide?1:(isFront?2:0)):(isSide?4:(isFront?3:5)), s=SQ1_MID_SLOT[slot];
-        add(`M ${s.x} 66 h ${s.w} v 14 h ${-s.w} Z`, color, idx);   // equator bar cell
-        if (slot===2||slot===3){                                   // front halves bridge to the rings' front sectors (shared border)
-          add(`M ${s.x} 63 h ${s.w} v 3 h ${-s.w} Z`, color, idx);
-          add(`M ${s.x} 80 h ${s.w} v 3 h ${-s.w} Z`, color, idx);
+        if (slot===2||slot===3){                                   // viewer-facing front half: fill the gap, curving to the ring borders
+          const xl=s.x, xr=s.x+s.w, N=6, pts=[];                    // top edge follows the bottom of the top ring (r=29 @ cyT=34)
+          for(let i=0;i<=N;i++){ const x=xl+(xr-xl)*i/N; pts.push(`${x.toFixed(2)} ${(cyT+Math.sqrt(Math.max(0,Ro*Ro-(x-cxT)**2))).toFixed(2)}`); }
+          for(let i=N;i>=0;i--){ const x=xl+(xr-xl)*i/N; pts.push(`${x.toFixed(2)} ${(cyB-Math.sqrt(Math.max(0,Ro*Ro-(x-cxB)**2))).toFixed(2)}`); }  // bottom edge follows the top of the bottom ring
+          add('M '+pts.join(' L ')+' Z', color, idx);
+        } else {
+          add(`M ${s.x} 66 h ${s.w} v 14 h ${-s.w} Z`, color, idx); // L/R/back: equator-band tabs (no single ring to share an edge)
         }
         if(idx>=0) sq1CellMesh[idx]=child; continue;
       }
