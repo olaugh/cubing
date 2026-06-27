@@ -407,11 +407,25 @@
     border-radius: 4px; padding: 1px 5px; color: var(--text);
   }
   @media (max-width: 720px) {
-    .history { display: none; }
-    .help { display: none; }
-    .solver { display: none; }
-    .casehelp { display: none; }
-    .hud { display: none; }
+    .history, .help, .solver, .casehelp, .hud { display: none; }
+    /* the side net panels overlap the canvas on a phone — hide them (incl. their .on state) */
+    .net, .net3, .net3.on, .pyra-net, .pyra-net.on, .skewb-net, .skewb-net.on,
+    .mega-net, .mega-net.on, .sq1-net, .sq1-net.on { display: none; }
+    /* topbar reflows to two rows: scrollable chooser, then actions */
+    .topbar { flex-wrap: wrap; gap: 7px; padding: 9px 9px; }
+    .brand, .spacer { display: none; }
+    .puzzle-chooser { margin-left: 0; order: 1; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .puzzle-chooser::-webkit-scrollbar { display: none; }
+    .puzzle-chooser .pz { font-size: 12px; padding: 7px 12px; white-space: nowrap; }
+    .top-actions { order: 2; flex: 1 1 100%; justify-content: space-between; }
+    .top-actions button.btn { flex: 1; font-size: 12px; padding: 9px 6px; }
+    /* stats becomes a bottom sheet */
+    .stats { top: auto; bottom: 0; left: 0; right: 0; width: auto; border-radius: 16px 16px 0 0; max-height: 72vh; overflow-y: auto; }
+    /* dock: hidden for puzzles you turn by drag/tap; kept for Pyraminx + Square-1 */
+    .right-dock { display: none; }
+    body[data-puz="pyraminx"] .right-dock, body[data-puz="sq1"] .right-dock { display: flex; right: 9px; bottom: 9px; gap: 6px; }
+    .dock .mbtn { min-width: 34px; min-height: 34px; font-size: 13px; }
+    .palette .sw { width: 26px; height: 26px; }
   }
 </style>
 </head>
@@ -7315,6 +7329,64 @@ renderer.domElement.addEventListener('pointerup', (e) => {
   }
 });
 
+/* ===== Touch/pointer drag-to-turn (2×2): drag a sticker to turn its layer, drag
+   the background to orbit. The grabbed face normal n + the in-plane drag give the
+   turn axis (n × drag, snapped to a cube axis); the grabbed cubie picks the layer.
+   A capture-phase pointerdown claims the gesture from OrbitControls on a sticker
+   hit (stopPropagation) and leaves background drags to orbit. ===== */
+const DRAG_TURN = { '2x2': 1 };
+const _dragRay = new THREE.Raycaster();
+const _dragNdc = new THREE.Vector2();
+let _dragTurn = null;
+function _dragSnapAxis(v) {
+  const ax = Math.abs(v.x), ay = Math.abs(v.y), az = Math.abs(v.z);
+  if (ax >= ay && ax >= az) return new THREE.Vector3(Math.sign(v.x) || 1, 0, 0);
+  if (ay >= az) return new THREE.Vector3(0, Math.sign(v.y) || 1, 0);
+  return new THREE.Vector3(0, 0, Math.sign(v.z) || 1);
+}
+function _dragSticker(e) {
+  const rect = renderer.domElement.getBoundingClientRect();
+  _dragNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  _dragNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  _dragRay.setFromCamera(_dragNdc, camera);
+  return _dragRay.intersectObjects(cubeGroup.children, true).find(h => h.object.userData && h.object.userData.normal) || null;
+}
+window.addEventListener('pointerdown', (e) => {
+  if (e.pointerType !== 'touch') return;                     // touch only — desktop mouse keeps orbit + keys
+  if (e.target !== renderer.domElement || !DRAG_TURN[puzzle.id] || paused || e.button !== 0 || current || queue.length) return;
+  const hit = _dragSticker(e);
+  if (!hit) return;                                          // missed the cube → OrbitControls orbits
+  e.stopPropagation();                                       // claim it; OrbitControls won't see this pointerdown
+  let n = _dragSnapAxis(hit.face.normal.clone().transformDirection(hit.object.matrixWorld));
+  if (n.dot(hit.point) < 0) n.negate();                      // outward
+  _dragTurn = { x0: e.clientX, y0: e.clientY, p: hit.point.clone(), n, cp: hit.object.parent.position.clone() };
+}, true);
+function _dragEnd(e) {
+  if (!_dragTurn) return;
+  const d = _dragTurn; _dragTurn = null;
+  if (Math.hypot(e.clientX - d.x0, e.clientY - d.y0) < 9) return;     // a tap, not a drag
+  const rect = renderer.domElement.getBoundingClientRect();
+  _dragNdc.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+  _dragNdc.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+  _dragRay.setFromCamera(_dragNdc, camera);
+  const Q = new THREE.Vector3();
+  if (!_dragRay.ray.intersectPlane(new THREE.Plane().setFromNormalAndCoplanarPoint(d.n, d.p), Q)) return;
+  const drag = Q.sub(d.p); drag.addScaledVector(d.n, -drag.dot(d.n));  // into the face plane
+  if (drag.length() < 0.12) return;
+  const rot = new THREE.Vector3().crossVectors(d.n, drag);
+  const ax = Math.abs(rot.x), ay = Math.abs(rot.y), az = Math.abs(rot.z);
+  let axisName, comp;
+  if (ax >= ay && ax >= az) { axisName = 'x'; comp = rot.x; }
+  else if (ay >= az) { axisName = 'y'; comp = rot.y; }
+  else { axisName = 'z'; comp = rot.z; }
+  const layerSign = Math.sign(d.cp[axisName]); if (!layerSign) return;
+  const FACE = { x: { 1: 'R', '-1': 'L' }, y: { 1: 'U', '-1': 'D' }, z: { 1: 'F', '-1': 'B' } };
+  const prime = (Math.sign(comp) === layerSign);
+  applyMove(FACE[axisName][layerSign] + (prime ? "'" : ''), 'solve');
+}
+window.addEventListener('pointerup', _dragEnd);
+window.addEventListener('pointercancel', _dragEnd);
+
 
 /* ===== 3×3 (Rubik's Cube) — reuses the 2×2 cubie engine (buildMove / snapCubie /
    selectCubies-by-axis-sign), with 26 cubies and the middle layers present.
@@ -10570,6 +10642,7 @@ const puzzleSq1 = {
 
 const PUZZLES = { '2x2': puzzle2x2, '3x3': puzzleCube3, 'pyraminx': puzzlePyra, 'megaminx': puzzleMega, 'skewb': puzzleSkewb, 'sq1': puzzleSq1 };
 puzzle = puzzle2x2;
+document.body.dataset.puz = puzzle.id;
 buildDock();
 buildSolver();
 solveBtnEl.style.display = puzzle.solveFull ? '' : 'none';
@@ -10634,6 +10707,7 @@ function switchPuzzle(id) {
   drillResultEl.textContent = '';
   document.querySelector('.help').innerHTML = puzzle.helpHTML;
   document.querySelectorAll('#puzzleChooser .pz').forEach(x => x.classList.toggle('active', x.dataset.puz === id));
+  document.body.dataset.puz = id;                                       // CSS hook for per-puzzle mobile layout
   document.getElementById('brandSub').textContent = PUZZLES[id].name;
   document.title = 'ocube · ' + PUZZLES[id].name;
   if (!statsEl.classList.contains('hidden')) { rebuildScopePick(); renderStats(); }
