@@ -341,6 +341,18 @@
   .mega-net.editing polygon.cell { cursor: pointer; }
   .mega-net polygon.cell.bad { stroke: #ff3b3b; stroke-width: 1.4; stroke-opacity: 1; }
 
+  .sq1-net {
+    position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
+    z-index: 8; padding: 12px 14px;
+    background: var(--panel); border: 1px solid var(--panel-border);
+    border-radius: 16px; backdrop-filter: blur(18px); display: none;
+  }
+  .sq1-net.on { display: block; }
+  .sq1-net svg { display: block; width: 244px; height: 244px; overflow: visible; }
+  .sq1-net .cell { stroke: #101014; stroke-width: 0.5; stroke-linejoin: round; }
+  .sq1-net.editing .cell { cursor: pointer; }
+  .sq1-net .cell.bad { stroke: #ff3b3b; stroke-width: 1.8; stroke-opacity: 1; }
+
   /* 3×3 net (cross of six 3×3 faces, outlined) + the state-editor palette */
   .net3 {
     position: fixed; left: 22px; top: 50%; transform: translateY(-50%);
@@ -2947,7 +2959,7 @@ function setEditMode(on) {
     puzzle.netEl.classList.toggle('editing', editMode);
     if (!editMode) puzzle.netEl.querySelectorAll('.cell.bad').forEach(c => c.classList.remove('bad'));
   }
-  if (editMode) { if (puzzle.updateNet) puzzle.updateNet(); buildPalette(puzzle.paletteColors); editValidate(); }
+  if (editMode) { if (puzzle.editReset) puzzle.editReset(); if (puzzle.updateNet) puzzle.updateNet(); buildPalette(puzzle.paletteColors); editValidate(); }
 }
 editBtnEl.addEventListener('click', () => { if (puzzle && puzzle.editable) setEditMode(!editMode); });
 document.addEventListener('click', (e) => {                       // click-to-paint a net cell while editing
@@ -9604,7 +9616,11 @@ const sq1Pieces = sq1Geo.pieces.map(desc => {
     const fg=new THREE.BufferGeometry();
     fg.setAttribute('position',new THREE.Float32BufferAttribute(cpos,3));
     fg.setAttribute('normal',new THREE.Float32BufferAttribute(cnrm,3));
-    g.add(new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SQ1_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide})));
+    const fmesh=new THREE.Mesh(fg,new THREE.MeshStandardMaterial({color:SQ1_FACE_HEX[fl.faceIndex],roughness:0.42,metalness:0.04,side:THREE.DoubleSide}));
+    fmesh.userData.lc=new THREE.Vector3(pc[0],pc[1],pc[2]);          // local sticker centroid (editor)
+    fmesh.userData.ln=new THREE.Vector3(cn[0],cn[1],cn[2]);          // outward normal
+    fmesh.userData.faceIndex=fl.faceIndex;                           // original colour → restored on reset
+    g.add(fmesh);
   }
   const dg=new THREE.BufferGeometry();
   dg.setAttribute('position',new THREE.Float32BufferAttribute(dark,3)); dg.computeVertexNormals();
@@ -9612,8 +9628,104 @@ const sq1Pieces = sq1Geo.pieces.map(desc => {
   sq1Group.add(g);
   return { id:desc.id, kind:desc.kind, layer:desc.layer, home:desc.center.slice(), position:g.position, quaternion:g.quaternion, group:g };
 });
-function sq1Reset(){ for(const p of sq1Pieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);} }
+function sq1Reset(){ for(const p of sq1Pieces){p.position.set(p.home[0],p.home[1],p.home[2]);p.quaternion.set(0,0,0,1);
+  for(const c of p.group.children) if(c.userData.faceIndex!=null) c.material.color.setHex(SQ1_FACE_HEX[c.userData.faceIndex]); } }   // clear any paint
 function sq1ReadState(){ return sq1Geo.readState(sq1Pieces); }
+
+/* ===== Square-1 state editor: clock/pie net (the conventional flat Sq1 view) =====
+   Each layer = inner 8 wedges (top/bottom stickers) + outer 12 segments (side
+   stickers); + 6 middle cells. The shape is fixed to cubeshape (entering edit
+   resets it). Cells map to 3D facelets by layer + up/down/side normal + angle. */
+const SQ1_NET_NS = 'http://www.w3.org/2000/svg';
+const sq1NetEl = document.createElement('div'); sq1NetEl.className = 'sq1-net';
+const sq1NetSvg = document.createElementNS(SQ1_NET_NS, 'svg'); sq1NetSvg.setAttribute('viewBox', '0 0 150 150'); sq1NetEl.appendChild(sq1NetSvg);
+document.body.appendChild(sq1NetEl);
+const sq1NetPolys = [], sq1SlotMesh = [];
+const SQ1_SEG2WEDGE = [0,0,1,2,2,3,4,4,5,6,6,7];   // cubeshape: [C,C,E,C,C,E,...]
+const _sq1w = new THREE.Vector3(), _sq1n = new THREE.Vector3();
+// facelet -> net cell (or -1 for the hidden underside); midFn maps middle side faces
+function sq1CellOf(p, child) {
+  const fi = child.userData.faceIndex;
+  if (p.layer === 'middle') { const base = p.position.x < 0 ? 40 : 43; const off = fi===2?1 : fi===3?2 : 0; return base + off; }
+  _sq1n.copy(child.userData.ln).applyQuaternion(p.group.quaternion);
+  p.group.localToWorld(_sq1w.copy(child.userData.lc));
+  const th = Math.atan2(_sq1w.z, _sq1w.x) * 180/Math.PI;
+  const seg = (((Math.floor((th+180)/30)) % 12) + 12) % 12;
+  if (p.layer === 'top') { if (_sq1n.y > 0.5) return SQ1_SEG2WEDGE[seg]; if (Math.abs(_sq1n.y) < 0.5) return 8 + seg; return -1; }
+  if (_sq1n.y < -0.5) return 20 + SQ1_SEG2WEDGE[seg]; if (Math.abs(_sq1n.y) < 0.5) return 28 + seg; return -1;   // bottom
+}
+// build the SVG clock cells
+{
+  const aP = (cx,cy,r,d)=>{ const a=d*Math.PI/180; return (cx+r*Math.cos(a)).toFixed(2)+' '+(cy+r*Math.sin(a)).toFixed(2); };
+  const sector = (cx,cy,r0,r1,a0,a1)=>{ const lg=(a1-a0)>180?1:0;
+    if (r0<=0.01) return `M ${cx} ${cy} L ${aP(cx,cy,r1,a0)} A ${r1} ${r1} 0 ${lg} 1 ${aP(cx,cy,r1,a1)} Z`;
+    return `M ${aP(cx,cy,r1,a0)} A ${r1} ${r1} 0 ${lg} 1 ${aP(cx,cy,r1,a1)} L ${aP(cx,cy,r0,a1)} A ${r0} ${r0} 0 ${lg} 0 ${aP(cx,cy,r0,a0)} Z`; };
+  const Ri=21, Rmid=23, Ro=35;
+  const WEDGE_SEGS=[[0,1],[2,2],[3,4],[5,5],[6,7],[8,8],[9,10],[11,11]];   // which segs each inner wedge spans
+  function buildClock(cx, cy, yf, base){    // yf=+1 top (screen=θ), -1 bottom (screen=-θ)
+    const mk=(idx,d)=>{ const poly=document.createElementNS(SQ1_NET_NS,'path'); poly.setAttribute('d',d);
+      poly.setAttribute('class','cell'); poly.dataset.idx=idx; sq1NetSvg.appendChild(poly); sq1NetPolys[idx]=poly; };
+    for (let w=0; w<8; w++){ const [s0,s1]=WEDGE_SEGS[w]; let a0=s0*30-180, a1=(s1+1)*30-180;
+      if (yf<0){ const t=-a1; a1=-a0; a0=t; } mk(base+w, sector(cx,cy,0,Ri,a0,a1)); }
+    for (let s=0; s<12; s++){ let a0=s*30-180, a1=(s+1)*30-180; if (yf<0){ const t=-a1; a1=-a0; a0=t; } mk(base+8+s, sector(cx,cy,Rmid,Ro,a0,a1)); }
+  }
+  buildClock(75, 38, 1, 0); buildClock(75, 112, -1, 20);
+  // middle strip: 6 cells (mid-L L,F,B  mid-R R,F,B) as a row of rects
+  const labels=['L','F','B','R','F','B'];
+  for (let i=0;i<6;i++){ const x=75-3*14+i*14, idx=40+i;
+    const r=document.createElementNS(SQ1_NET_NS,'rect'); r.setAttribute('x',x); r.setAttribute('y',69); r.setAttribute('width',13); r.setAttribute('height',12);
+    r.setAttribute('rx',1.5); r.setAttribute('class','cell'); r.dataset.idx=idx; sq1NetSvg.appendChild(r); sq1NetPolys[idx]=r; }
+}
+function sq1ReadGrid() {
+  const grid = new Array(46).fill(null);
+  for (const p of sq1Pieces) for (const child of p.group.children) {
+    if (child.userData.faceIndex == null) continue;
+    const cell = sq1CellOf(p, child);
+    if (cell >= 0) { grid[cell] = child.material.color.getHex(); sq1SlotMesh[cell] = child; }
+  }
+  return grid;
+}
+function sq1UpdateNet() {
+  const grid = sq1ReadGrid();
+  for (let i=0;i<46;i++) if (grid[i]!=null) sq1NetPolys[i].setAttribute('fill', '#'+grid[i].toString(16).padStart(6,'0'));
+}
+function paintSq1(idx, color) {
+  const m = sq1SlotMesh[idx]; if (m) m.material.color.setHex(color);
+  sq1NetPolys[idx].setAttribute('fill', '#'+color.toString(16).padStart(6,'0'));
+}
+// piece cell-groups (cubeshape): inner wedge + its outer side segment(s)
+const SQ1_GROUPS = (() => {
+  const g = [], wedgeSegs = [[0,1],[2,2],[3,4],[5,5],[6,7],[8,8],[9,10],[11,11]];
+  for (let lay=0; lay<2; lay++){ const ib=lay*20, ob=lay*20+8;
+    for (let w=0; w<8; w++){ const [s0,s1]=wedgeSegs[w]; const cells=[ib+w]; for(let s=s0;s<=s1;s++) cells.push(ob+s);
+      g.push({ kind: s0===s1?'edge':'corner', cells }); } }
+  g.push({ kind:'mid', cells:[40,41,42] }); g.push({ kind:'mid', cells:[43,44,45] });
+  return g;
+})();
+function validateSq1() {
+  const grid = sq1ReadGrid(), bad = new Set();
+  const [U,D,F,B,L,R] = SQ1_FACE_HEX;
+  const want = new Map([[U,8],[D,8],[F,8],[B,8],[L,7],[R,7]]);
+  const cnt = new Map(); for (const c of grid) cnt.set(c,(cnt.get(c)||0)+1);
+  let countBad=false; for (const [c,n] of want) if ((cnt.get(c)||0)!==n) countBad=true;
+  const topSet=new Set([U,D]), sideSet=new Set([F,B,L,R]), opp=new Map([[F,B],[B,F],[L,R],[R,L]]);
+  let impossible=0, dup=0; const sig={};
+  for (const grp of SQ1_GROUPS){
+    const cols=grp.cells.map(c=>grid[c]), mark=()=>grp.cells.forEach(c=>bad.add(c));
+    if (grp.kind==='corner'){ const [t,s1,s2]=cols;
+      if(!topSet.has(t)||!sideSet.has(s1)||!sideSet.has(s2)||s1===s2||opp.get(s1)===s2){ impossible++; mark(); continue; }
+      const k='c'+[s1,s2].sort((a,b)=>a-b).join()+t; if(sig[k]!=null){dup++; mark(); grp.cells.forEach(c=>bad.add(c)); SQ1_GROUPS[sig[k]].cells.forEach(c=>bad.add(c));} else sig[k]=SQ1_GROUPS.indexOf(grp);
+    } else if (grp.kind==='edge'){ const [t,s]=cols;
+      if(!topSet.has(t)||!sideSet.has(s)){ impossible++; mark(); continue; }
+      const k='e'+s+t; if(sig[k]!=null){dup++; mark(); SQ1_GROUPS[sig[k]].cells.forEach(c=>bad.add(c));} else sig[k]=SQ1_GROUPS.indexOf(grp);
+    } else { if(!cols.every(c=>sideSet.has(c))){ impossible++; mark(); } }
+  }
+  const msgs=[];
+  if(countBad) msgs.push('colour counts off');
+  if(impossible) msgs.push(impossible+' impossible');
+  if(dup) msgs.push(dup+' duplicate');
+  return { bad, ok: msgs.length===0, message: msgs.length ? '⚠ '+msgs.join(' · ') : '✓ valid Square-1' };
+}
 function sq1Solved(){ return !!(sq1Geo.isSolved && sq1Geo.isSolved(sq1Pieces)); }
 function sq1BuildMove(face, prime, tok){
   // NOTE: legality of a slice must be judged when it ANIMATES, not when it is
@@ -10321,7 +10433,8 @@ const puzzleSq1 = {
   buildMove:(f,p,d,tok)=>sq1BuildMove(f,p,tok),
   selectPieces:(m)=>(m.select === 'right' && !sq1Geo.canSlice(sq1Pieces)) ? [] : sq1Geo.selectPieces(m,sq1Pieces),  // gate slice legality at activation
   snapPiece:(p)=>sq1Geo.snapPiece(p),
-  build:sq1Reset, updateNet:()=>{}, updateProjections:()=>{}, finalizeMovePhase:sq1Finalize,
+  build:sq1Reset, updateNet:sq1UpdateNet, updateProjections:()=>{}, finalizeMovePhase:sq1Finalize,
+  netEl:sq1NetEl, paletteColors:SQ1_FACE_HEX, paintCell:paintSq1, validate:validateSq1, editable:true, editReset:sq1Reset,
   readState:sq1ReadState, solveFull:sq1SolveFull, scramble:sq1Scramble, storageKey:'sq1-solves',
   keymap:{ faceKeys:{ u:'U', d:'D', '/':'/' } },
   phaseConfig:{order:['solve'],labels:{solve:'Solve'}},
@@ -10359,9 +10472,11 @@ function switchPuzzle(id) {
   cube3NetEl.classList.toggle('on', id === '3x3');
   skewbNetEl.classList.toggle('on', id === 'skewb');
   megaNetEl.classList.toggle('on', id === 'megaminx');
+  sq1NetEl.classList.toggle('on', id === 'sq1');
   if (id === '3x3') cube3UpdateNet();
   if (id === 'skewb') skewbUpdateNet();
   if (id === 'megaminx') megaUpdateNet();
+  if (id === 'sq1') sq1UpdateNet();
   puzzle = PUZZLES[id];
   pyraSnapTarget = null;
   setEditMode(false);                                        // leave edit mode when switching puzzles
