@@ -433,9 +433,9 @@
   .ot-seg-btn { font-size: 12px; padding: 6px 11px; border-radius: 7px; border: 1px solid var(--panel-border);
     background: rgba(255,255,255,0.05); color: inherit; cursor: pointer; }
   .ot-seg-btn.active { background: var(--accent); border-color: transparent; color: #fff; }
-  .ot-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 8px; }
-  .ot-choice { padding: 13px 8px; border-radius: 10px; border: 1px solid var(--panel-border);
-    background: rgba(255,255,255,0.06); color: inherit; cursor: pointer; font-size: 15px; font-weight: 600;
+  .ot-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(92px, 1fr)); gap: 7px; }
+  .ot-choice { padding: 8px 7px; border-radius: 9px; border: 1px solid var(--panel-border);
+    background: rgba(255,255,255,0.06); color: inherit; cursor: pointer; font-size: 13.5px; font-weight: 600;
     transition: background .12s, border-color .12s; }
   .ot-choice:hover { background: rgba(255,255,255,0.13); }
   .ot-choice.correct { background: #1f9d57; border-color: #1f9d57; color: #fff; }
@@ -10904,6 +10904,7 @@ const otDistValEl = document.getElementById('otDistVal');
 const otOrientEl  = document.getElementById('otOrient');
 const otModeEl    = document.getElementById('otMode');
 const otTitleEl   = document.getElementById('otTitle');
+const ollTrainerEl = document.getElementById('ollTrainer');
 const ollBtnEl    = document.getElementById('ollBtn');
 
 // Two recognition modes share one trainer. They differ only in DATA + how
@@ -10998,10 +10999,30 @@ function ollAnswer(ci) {
     otRevealEl.appendChild(nx);
   }
 }
-function ollFitCamera() {                                 // PBL shows the 4 halos — zoom out (more on narrow screens) so
-  const dir = new THREE.Vector3(4.6, 4.2, 6.5);          // they sit beside the cube instead of compositing over it
-  if (ollT.M.halos) dir.setLength(Math.min(20, 10 / Math.min(1, camera.aspect)));
-  camera.position.copy(dir); controls.target.set(0, 0, 0); controls.update();
+function ollFitCamera() {
+  const dir = new THREE.Vector3(4.6, 4.2, 6.5);
+  const tan = Math.tan(camera.fov * Math.PI / 360);
+  if (window.innerWidth <= 720) {
+    // Mobile: shrink the cube (+ its halos) and centre it in the open band
+    // between the topbar and the bottom-sheet card.
+    const card = ollTrainerEl.getBoundingClientRect();
+    const bar = document.querySelector('.topbar').getBoundingClientRect();
+    const openTop = bar.bottom, openBot = card.top || window.innerHeight;
+    const openH = Math.max(120, openBot - openTop), openMid = (openTop + openBot) / 2;
+    const H = window.innerHeight;
+    const contentR = ollT.M.halos ? 2.85 : 1.8;          // world radius to keep on-screen (cube, or cube + halos)
+    const targetRpx = 0.40 * Math.min(openH, window.innerWidth);
+    const dist = contentR * H / (2 * tan * targetRpx);
+    camera.position.copy(dir).setLength(dist); controls.target.set(0, 0, 0); controls.update();
+    camera.updateMatrixWorld();
+    const camUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
+    const v = camUp.multiplyScalar(-(H / 2 - openMid) * (2 * dist * tan / H));   // pan so the cube sits at the open-band centre
+    camera.position.add(v); controls.target.copy(v); controls.update();
+  } else {
+    // Desktop: centred on origin; PBL zooms out so the halos clear the cube.
+    if (ollT.M.halos) dir.setLength(Math.min(20, 10 / Math.min(1, camera.aspect)));
+    camera.position.copy(dir); controls.target.set(0, 0, 0); controls.update();
+  }
 }
 function startOllTrainer() {
   if (puzzle.id !== '2x2' || trainerActive) return;
@@ -11014,9 +11035,9 @@ function startOllTrainer() {
   ollBtnEl.classList.add('active');
   ollApplyMode();
   ollT.camSaved = camera.position.clone();               // restore the player's view on exit
-  ollFitCamera();
   ollRenderScore();
   ollNextQuestion();
+  ollFitCamera();                                         // fit after the card is populated (it measures the card)
 }
 function stopOllTrainer() {
   if (!trainerActive) return;
@@ -11038,15 +11059,15 @@ otModeEl.addEventListener('click', (e) => {
   otModeEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x === b));
   try { localStorage.setItem('cubing-train-mode', ollT.mode); } catch (e) {}
   ollApplyMode();
-  if (trainerActive) { ollFitCamera(); ollNextQuestion(); }   // fresh question in the new mode (score preserved)
+  if (trainerActive) { ollNextQuestion(); ollFitCamera(); }   // fresh question in the new mode (score preserved)
 });
 document.getElementById('otDistMinus').addEventListener('click', () => {
   ollT.dist = ollT.distByMode[ollT.mode] = Math.max(1, ollT.dist - 1); otDistValEl.textContent = ollT.dist;
-  if (trainerActive && !ollT.answered) ollBuildChoices();
+  if (trainerActive && !ollT.answered) { ollBuildChoices(); ollFitCamera(); }   // card height changed → re-centre
 });
 document.getElementById('otDistPlus').addEventListener('click', () => {
   ollT.dist = ollT.distByMode[ollT.mode] = Math.min(ollT.ncase - 1, ollT.dist + 1); otDistValEl.textContent = ollT.dist;
-  if (trainerActive && !ollT.answered) ollBuildChoices();
+  if (trainerActive && !ollT.answered) { ollBuildChoices(); ollFitCamera(); }
 });
 otOrientEl.addEventListener('click', (e) => {
   const b = e.target.closest('.ot-seg-btn'); if (!b) return;
