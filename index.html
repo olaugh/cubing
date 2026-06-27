@@ -291,7 +291,10 @@
     grid-template-columns: repeat(2, 1fr);
     grid-template-rows: repeat(2, 1fr);
     gap: 3px; width: 46px; height: 46px;
+    box-shadow: 0 0 0 1.6px rgba(231,231,239,0.6); border-radius: 5px;
   }
+  .net.editing .cell { cursor: pointer; }
+  .net.editing .cell:hover { box-shadow: inset 0 0 0 2px #fff, inset 0 0 0 1px rgba(0,0,0,0.25); }
   .gf-u { grid-area: u; } .gf-l { grid-area: l; } .gf-f { grid-area: f; }
   .gf-r { grid-area: r; } .gf-b { grid-area: b; } .gf-d { grid-area: d; }
   .cell {
@@ -337,7 +340,7 @@
   .palette .sw { width: 28px; height: 28px; border-radius: 7px; cursor: pointer; box-shadow: inset 0 0 0 1px rgba(0,0,0,0.35); transition: transform .08s; }
   .palette .sw:hover { transform: scale(1.12); }
   .palette .sw.active { outline: 3px solid #fff; outline-offset: 1px; }
-  .net3 .cell.bad { box-shadow: inset 0 0 0 2.5px #ff3b3b, 0 0 7px rgba(255,59,59,0.65); animation: badpulse 1.1s ease-in-out infinite; }
+  .cell.bad { box-shadow: inset 0 0 0 2.5px #ff3b3b, 0 0 7px rgba(255,59,59,0.65) !important; animation: badpulse 1.1s ease-in-out infinite; }
   @keyframes badpulse { 0%,100% { box-shadow: inset 0 0 0 2.5px #ff3b3b, 0 0 6px rgba(255,59,59,0.55); } 50% { box-shadow: inset 0 0 0 2.5px #ff8080, 0 0 12px rgba(255,59,59,0.95); } }
   .edit-status {
     position: fixed; left: 50%; transform: translateX(-50%); bottom: 64px; z-index: 9; display: none;
@@ -2914,7 +2917,7 @@ function setEditMode(on) {
     puzzle.netEl.classList.toggle('editing', editMode);
     if (!editMode) puzzle.netEl.querySelectorAll('.cell.bad').forEach(c => c.classList.remove('bad'));
   }
-  if (editMode) { buildPalette(puzzle.paletteColors); editValidate(); }
+  if (editMode) { if (puzzle.updateNet) puzzle.updateNet(); buildPalette(puzzle.paletteColors); editValidate(); }
 }
 editBtnEl.addEventListener('click', () => { if (puzzle && puzzle.editable) setEditMode(!editMode); });
 document.addEventListener('click', (e) => {                       // click-to-paint a net cell while editing
@@ -3497,13 +3500,14 @@ const NET_ORDER = ['U', 'L', 'F', 'R', 'B', 'D'];
 const netEl = document.createElement('div');
 netEl.className = 'net';
 const netCells = {};
+const net2Sticker = new Array(24);                               // facelet idx (face*4+pos) -> live tile mesh (for painting)
 for (const f of NET_ORDER) {
   const g = document.createElement('div');
   g.className = 'facegrid gf-' + f.toLowerCase();
   netCells[f] = [];
   for (let i = 0; i < 4; i++) {
     const cell = document.createElement('div');
-    cell.className = 'cell';
+    cell.className = 'cell'; cell.dataset.idx = NET_ORDER.indexOf(f) * 4 + i;
     g.appendChild(cell);
     netCells[f].push(cell);
   }
@@ -3680,6 +3684,7 @@ function updateNet() {
           const col = dot3(cubie.position, F.u) > 0 ? 1 : 0;
           const row = dot3(cubie.position, F.w) > 0 ? 1 : 0;
           netCells[f][row * 2 + col].style.background = hexColor(t.userData.color);
+          net2Sticker[NET_ORDER.indexOf(f) * 4 + row * 2 + col] = t;
           break;
         }
       }
@@ -3688,6 +3693,56 @@ function updateNet() {
   updateProjectionColors();
 }
 updateNet();
+
+/* ===== 2×2 state editor: net cells are paintable; readCornerState2x2 already reads
+   userData.color, so a painted (valid) state is directly solvable. ===== */
+const PALETTE6 = ['+y', '+x', '+z', '-y', '-x', '-z'].map(k => COLORS[k]);
+const C2_AXIS = new Map();                                       // colour -> opposite-pair axis (standard scheme)
+[['+y','-y'],['+x','-x'],['+z','-z']].forEach((pair, ax) => pair.forEach(k => C2_AXIS.set(COLORS[k], ax)));
+function paint2x2(idx, color) {
+  const t = net2Sticker[idx];
+  if (!t) return;
+  t.material.color.setHex(color);
+  if (t.material.emissive) t.material.emissive.setHex(color);
+  t.userData.color = color;                                      // readCornerState2x2 / readFaces read this
+  const f = NET_ORDER[Math.floor(idx / 4)], pos = idx % 4;
+  netCells[f][pos].style.background = hexColor(color);
+}
+let NET2_CORNERS = null;                                         // 8 corner groups (3 facelet idxs each) — fixed geometry
+function net2Corners() {
+  if (NET2_CORNERS) return NET2_CORNERS;
+  const groups = [];
+  for (const cubie of cubies) {
+    const tris = [];
+    for (const t of cubie.children) {
+      if (!t.userData || !t.userData.isTile) continue;
+      _n.copy(t.userData.normal).applyQuaternion(cubie.quaternion);
+      const [nx, ny, nz] = roundAxis(_n);
+      for (const f of NET_ORDER) { const F = NET[f]; if (F.n[0] === nx && F.n[1] === ny && F.n[2] === nz) {
+        const c = dot3(cubie.position, F.u) > 0 ? 1 : 0, r = dot3(cubie.position, F.w) > 0 ? 1 : 0;
+        tris.push(NET_ORDER.indexOf(f) * 4 + r * 2 + c); break;
+      } }
+    }
+    if (tris.length === 3) groups.push(tris);
+  }
+  NET2_CORNERS = groups;
+  return groups;
+}
+function validate2x2() {
+  const col = i => net2Sticker[i] ? net2Sticker[i].material.color.getHex() : 0;
+  const bad = new Set(), issues = [];
+  const cnt = new Map(); for (let i = 0; i < 24; i++) { const c = col(i); cnt.set(c, (cnt.get(c) || 0) + 1); }
+  if (cnt.size !== 6 || [...cnt.values()].some(n => n !== 4)) issues.push('colour counts ≠ 4');
+  let nImp = 0;
+  for (const fs of net2Corners()) { const ax = fs.map(i => C2_AXIS.get(col(i))); if (ax.includes(undefined) || new Set(ax).size !== 3) { fs.forEach(i => bad.add(i)); nImp++; } }
+  if (nImp) issues.push(nImp + ' impossible');
+  const seen = new Map(); let nDup = 0;
+  for (const fs of net2Corners()) { const k = fs.map(col).sort((a, b) => a - b).join(','); if (!seen.has(k)) seen.set(k, []); seen.get(k).push(fs); }
+  for (const list of seen.values()) if (list.length > 1) { for (const fs of list) for (const i of fs) bad.add(i); nDup += list.length; }
+  if (nDup) issues.push(nDup + ' duplicate');
+  const ok = issues.length === 0;
+  return { bad, ok, message: ok ? '✓ valid cube' : '⚠ ' + issues.join(' · ') };
+}
 
 /* ============================================================
    Keyboard
@@ -6092,6 +6147,7 @@ const puzzle2x2 = {
   snapPiece: snapCubie,
   build: buildCube,
   updateNet,
+  netEl, paletteColors: PALETTE6, paintCell: paint2x2, validate: validate2x2, editable: true,
   updateProjections: updateProjectionLayout,
   finalizeMovePhase,
   scramble: randomStateScramble,
@@ -9863,6 +9919,7 @@ function switchPuzzle(id) {
   try { localStorage.setItem('cubing-last-puzzle', id); } catch (e) {}   // persist choice across reloads
 }
 animate();
+
 
 
 
