@@ -9756,8 +9756,10 @@ function sq1ReadGrid() {       // cubeshape colour grid (for validate / reconstr
 // undersides are skipped), so shape + colour are always faithful (cube-shape or not). ----
 const _sq1pv = new THREE.Vector3();
 let sq1CellMesh = [];
-// middle = equator unrolled, front-centred: L/R are full faces (2× wide), F/B are half-faces
-const SQ1_MID_SLOT = [ {x:27,w:12}, {x:39,w:24}, {x:63,w:12}, {x:75,w:12}, {x:87,w:24}, {x:111,w:12} ];  // B_L, L, F_L, F_R, R, B_R
+// middle = equator unrolled. The viewer-facing front halves (F_L,F_R) are widened to
+// span the front face's extent in the rings (the 45°-135° arc → x 54.5..95.5) so the
+// green column lines up with the front face above/below; L/R full faces flank them.
+const SQ1_MID_SLOT = [ {x:18.5,w:12}, {x:30.5,w:24}, {x:54.5,w:20.5}, {x:75,w:20.5}, {x:95.5,w:24}, {x:119.5,w:12} ];  // B_L, L, F_L, F_R, R, B_R
 function sq1WorldPoly(p, child){ return child.userData.poly.map(v=>{ _sq1pv.copy(v).applyQuaternion(p.quaternion).add(p.position); return [_sq1pv.x, _sq1pv.y, _sq1pv.z]; }); }
 function sq1UpdateNet() {
   while (sq1NetSvg.firstChild) sq1NetSvg.removeChild(sq1NetSvg.firstChild);
