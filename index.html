@@ -6991,21 +6991,24 @@ const megaFaceNormals = megaGeo.faces.map(f => f.normal);
 // 12 distinct face colours; opposite faces get a contrasting pair.
 // Canonical Megaminx scheme. White on top (face 0); clockwise upper ring (faces
 // 8,3,2,1,4) = red, green, purple, yellow, blue. Grey opposite white (face 9);
-// clockwise lower ring from below (faces 11,6,5,7,10) = orange, light blue, pale
-// yellow, pink, light green.
+// clockwise lower ring from below (faces 11,6,5,7,10) = pink, light green, orange,
+// light blue, pale yellow (i.e. orange, light blue, pale yellow, pink, light green
+// starting from face 5). Opposite faces are light/dark counterparts, per the
+// standard scheme: white/grey, red/orange, green/light-green, blue/light-blue,
+// yellow/pale-yellow, purple/pink. Antipodal face pairs: 8-5, 3-6, 2-11, 1-10, 4-7.
 const MEGA_FACE_HEX = [
   0xf4f4f4, // 0  white (top)
-  0xf6d000, // 1  yellow      (upper)
-  0x8e44ad, // 2  purple      (upper)
-  0x12a150, // 3  green       (upper)
-  0x2244cc, // 4  blue        (upper)
-  0xe8dca0, // 5  pale yellow (lower)
-  0x33c4e8, // 6  light blue  (lower)
-  0xff66aa, // 7  pink        (lower)
-  0xd91f33, // 8  red         (upper)
+  0xf6d000, // 1  yellow      (upper)  opp 10 pale yellow
+  0x8e44ad, // 2  purple      (upper)  opp 11 pink
+  0x12a150, // 3  green       (upper)  opp 6  light green
+  0x2244cc, // 4  blue        (upper)  opp 7  light blue
+  0xf07b1d, // 5  orange      (lower)  opp 8  red
+  0xa6e22e, // 6  light green (lower)  opp 3  green
+  0x33c4e8, // 7  light blue  (lower)  opp 4  blue
+  0xd91f33, // 8  red         (upper)  opp 5  orange
   0x9aa0a6, // 9  grey (bottom)
-  0xa6e22e, // 10 light green (lower)
-  0xf07b1d, // 11 orange      (lower)
+  0xe8dca0, // 10 pale yellow (lower)  opp 1  yellow
+  0xff66aa, // 11 pink        (lower)  opp 2  purple
 ];
 const MEGA_DARK = new THREE.MeshStandardMaterial({ color: 0x18181d, roughness: 0.85, metalness: 0.0, side: THREE.DoubleSide });
 const megaGroup = new THREE.Group();
