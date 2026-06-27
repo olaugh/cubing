@@ -10998,6 +10998,11 @@ function ollAnswer(ci) {
     otRevealEl.appendChild(nx);
   }
 }
+function ollFitCamera() {                                 // PBL shows the 4 halos — zoom out (more on narrow screens) so
+  const dir = new THREE.Vector3(4.6, 4.2, 6.5);          // they sit beside the cube instead of compositing over it
+  if (ollT.M.halos) dir.setLength(Math.min(20, 10 / Math.min(1, camera.aspect)));
+  camera.position.copy(dir); controls.target.set(0, 0, 0); controls.update();
+}
 function startOllTrainer() {
   if (puzzle.id !== '2x2' || trainerActive) return;
   if (editMode) setEditMode(false);
@@ -11008,6 +11013,8 @@ function startOllTrainer() {
   document.body.classList.add('oll-train');
   ollBtnEl.classList.add('active');
   ollApplyMode();
+  ollT.camSaved = camera.position.clone();               // restore the player's view on exit
+  ollFitCamera();
   ollRenderScore();
   ollNextQuestion();
 }
@@ -11019,6 +11026,7 @@ function stopOllTrainer() {
   ollBtnEl.classList.remove('active');
   cubeGroup.rotation.y = 0;
   projGroup.visible = (puzzle.id === '2x2');              // restore the hidden-face halos
+  if (ollT.camSaved) { camera.position.copy(ollT.camSaved); controls.target.set(0, 0, 0); controls.update(); ollT.camSaved = null; }
   resetState(true);                                       // restore the solved cube
 }
 ollBtnEl.addEventListener('click', () => { trainerActive ? stopOllTrainer() : startOllTrainer(); });
@@ -11030,7 +11038,7 @@ otModeEl.addEventListener('click', (e) => {
   otModeEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x === b));
   try { localStorage.setItem('cubing-train-mode', ollT.mode); } catch (e) {}
   ollApplyMode();
-  if (trainerActive) ollNextQuestion();                  // fresh question in the new mode (score preserved)
+  if (trainerActive) { ollFitCamera(); ollNextQuestion(); }   // fresh question in the new mode (score preserved)
 });
 document.getElementById('otDistMinus').addEventListener('click', () => {
   ollT.dist = ollT.distByMode[ollT.mode] = Math.max(1, ollT.dist - 1); otDistValEl.textContent = ollT.dist;
@@ -11072,6 +11080,7 @@ window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
+  if (trainerActive) ollFitCamera();                     // keep PBL halos clear of the cube after an orientation change
 });
 </script>
 </body>
