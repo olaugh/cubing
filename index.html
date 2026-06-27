@@ -335,7 +335,7 @@
     border-radius: 16px; backdrop-filter: blur(18px); display: none;
   }
   .mega-net.on { display: block; }
-  .mega-net svg { display: block; width: 288px; height: 228px; overflow: visible; }
+  .mega-net svg { display: block; height: 360px; width: auto; overflow: visible; }
   .mega-net polygon { stroke: #101014; stroke-width: 0.35; stroke-linejoin: round; }
   .mega-net .face-outline { fill: none; stroke: #e7e7ef; stroke-width: 0.8; stroke-linejoin: round; stroke-opacity: 0.8; pointer-events: none; }
   .mega-net.editing polygon.cell { cursor: pointer; }
@@ -7096,33 +7096,102 @@ for (const desc of megaGeo.pieces) for (const fl of desc.facelets) {
   megaFaceFacelets[fl.faceIndex].push({ poly: fl.poly, centroid: c, kind: desc.kind, home: desc.homeIndex });
 }
 {
-  const NET_R = 13, COLS = 4, SPX = 28, SPY = 30, OX = 18, OY = 17;
+  // ===== Two-flower (double-dome) net =====================================
+  // The 12 faces unfold as ONE rigid coplanar assembly: white (face 0) is the
+  // root with its 5 upper-ring petals; one upper petal bridges across the
+  // equator to a lower face, which carries grey (face 9) and its 4 remaining
+  // lower petals. Every face is rotated about its hinge-with-parent until its
+  // normal matches white's, so the whole thing is coplanar and sticker-side-up;
+  // a single projection then needs no mirror/chirality fix-ups. The per-face
+  // local uv frames + cell anchors (read by megaLocate) are placement-
+  // independent and built exactly as before, so state-reading is unaffected.
   const v3 = a => new THREE.Vector3(a[0],a[1],a[2]);
+
+  // per-face local frame + cell anchors (face-local uv) — unchanged contract
   for (let f = 0; f < 12; f++) {
-    const col = f % COLS, row = (f / COLS) | 0;
-    const sx = OX + col*SPX, sy = OY + row*SPY;
     const center = v3(megaFaceCenter[f]), n = v3(megaFaceNormals[f]).normalize(), fls = megaFaceFacelets[f];
     const cf = fls.find(x => x.kind === 'corner') || fls[0];
     let e1 = v3(cf.centroid).sub(center); e1.addScaledVector(n, -e1.dot(n)).normalize();
     const e2 = n.clone().cross(e1).normalize();
-    let maxr = 0; for (const x of fls) for (const p of x.poly){ const r=v3(p).sub(center); maxr=Math.max(maxr, Math.hypot(r.dot(e1), r.dot(e2))); }
-    const scale = NET_R / maxr;
     megaFaceFrame[f] = { c: center, e1, e2 };
     const to2d = p => { const r=v3(p).sub(center); return [r.dot(e1), r.dot(e2)]; };
-    const toNet = uv => [sx + scale*uv[1], sy - scale*uv[0]];   // rotate (u,v)->(v,-u): reference corner points up
-    fls.forEach((x, k) => {
-      const cellIdx = f*11 + k;
-      const poly = document.createElementNS(MEGA_NET_NS, 'polygon');
-      poly.setAttribute('points', x.poly.map(p => toNet(to2d(p)).map(z=>z.toFixed(2)).join(',')).join(' '));
+    fls.forEach((x, k) => { megaCellAnchor[f*11 + k] = to2d(x.centroid); });
+  }
+
+  // 3D face data + adjacency (faces share an edge <=> share 2 vertices)
+  const FCv = megaFaceCenter.map(v3), FNv = megaFaceNormals.map(n => v3(n).normalize());
+  const faceVtx = [];
+  for (let f=0; f<12; f++) faceVtx[f] = megaFaceFacelets[f].filter(x=>x.kind==='corner').map(x=>v3(x.poly[0]));
+  const samePt = (a,b)=> a.distanceToSquared(b) < 1e-6;
+  const hinge = (fa,fb)=>{ const o=[]; for(const a of faceVtx[fa]) for(const b of faceVtx[fb]) if(samePt(a,b)) o.push(a); return o.length===2?o:null; };
+  const adj = f => { const r=[]; for(let g=0; g<12; g++) if(g!==f && hinge(f,g)) r.push(g); return r; };
+  const upper = adj(0), lower = adj(9);
+
+  // bridge edge: an upper petal adjacent to a lower petal
+  let Ustar=upper[0], Lstar=lower[0];
+  outer: for(const u of upper) for(const l of lower) if(hinge(u,l)){ Ustar=u; Lstar=l; break outer; }
+
+  // spanning tree: white -> uppers; Ustar -> Lstar -> grey -> other lowers
+  const parent = new Array(12).fill(-2);
+  parent[0]=-1; for(const u of upper) parent[u]=0;
+  parent[Lstar]=Ustar; parent[9]=Lstar;
+  for(const l of lower) if(l!==Lstar) parent[l]=9;
+
+  // per-face affine map (original 3D -> unfolded plane): M_f = M_parent * rHinge
+  const M = new Array(12); M[0]=new THREE.Matrix4();
+  const order=[]; { const q=[0]; while(q.length){ const f=q.shift(); order.push(f); for(let g=0;g<12;g++) if(parent[g]===f) q.push(g); } }
+  for(const f of order){ if(f===0) continue;
+    const p=parent[f], h=hinge(f,p), H1=h[0], d=h[1].clone().sub(h[0]).normalize();
+    const nf=FNv[f], np=FNv[p], cr=new THREE.Vector3().crossVectors(nf,np);
+    const ang=Math.atan2(cr.dot(d), nf.dot(np));   // rotate n_f onto n_p about hinge (both ⟂ hinge)
+    const R=new THREE.Matrix4().makeRotationAxis(d, ang);
+    const rF=new THREE.Matrix4().makeTranslation(H1.x,H1.y,H1.z).multiply(R).multiply(new THREE.Matrix4().makeTranslation(-H1.x,-H1.y,-H1.z));
+    M[f]=M[p].clone().multiply(rF);
+  }
+
+  // project the coplanar assembly with white's frame (viewed from outside => no mirror)
+  const c0=FCv[0], n0=FNv[0];
+  let pe1=faceVtx[0][0].clone().sub(c0); pe1.addScaledVector(n0,-pe1.dot(n0)).normalize();
+  const pe2=new THREE.Vector3().crossVectors(n0, pe1).normalize();
+  const uvOf=(f,p3)=>{ const q=v3(p3).applyMatrix4(M[f]).sub(c0); return [q.dot(pe1), q.dot(pe2)]; };
+
+  // rotate so grey sits straight below white (white dome on top)
+  const gv=uvOf(9, megaFaceCenter[9]);
+  const th=-Math.PI/2 - Math.atan2(gv[1], gv[0]), ct=Math.cos(th), st=Math.sin(th);
+  const rot=p=>[p[0]*ct - p[1]*st, p[0]*st + p[1]*ct];
+
+  // gather all 2D points + bounding box
+  let minU=Infinity,maxU=-Infinity,minV=Infinity,maxV=-Infinity;
+  const acc=p=>{ if(p[0]<minU)minU=p[0]; if(p[0]>maxU)maxU=p[0]; if(p[1]<minV)minV=p[1]; if(p[1]>maxV)maxV=p[1]; return p; };
+  const facePts=[];
+  for(let f=0; f<12; f++){
+    const cells=megaFaceFacelets[f].map((x,k)=>({ idx:f*11+k, pts:x.poly.map(p=>acc(rot(uvOf(f,p)))) }));
+    const fc=rot(uvOf(f, megaFaceCenter[f]));
+    const outline=faceVtx[f].map(p=>rot(uvOf(f,[p.x,p.y,p.z])))
+      .sort((a,b)=>Math.atan2(a[1]-fc[1],a[0]-fc[0])-Math.atan2(b[1]-fc[1],b[0]-fc[0]));
+    facePts[f]={cells, outline};
+  }
+
+  // emit (math y-up -> svg y-down). Scale up so a face circumradius ~= 13, to
+  // keep the fixed 0.35 stroke-width thin relative to each facelet.
+  const c0uv=rot(uvOf(0, megaFaceCenter[0]));
+  let r0=0; for(const c of facePts[0].cells) for(const pt of c.pts) r0=Math.max(r0, Math.hypot(pt[0]-c0uv[0], pt[1]-c0uv[1]));
+  const SCALE=13/r0, PAD=8;
+  const W=(maxU-minU)*SCALE+2*PAD, H=(maxV-minV)*SCALE+2*PAD;
+  const X=u=>(u-minU)*SCALE+PAD, Y=v=>(maxV-v)*SCALE+PAD;
+  megaNetSvg.setAttribute('viewBox', `0 0 ${W.toFixed(2)} ${H.toFixed(2)}`);
+  const ptStr=pts=>pts.map(p=>`${X(p[0]).toFixed(2)},${Y(p[1]).toFixed(2)}`).join(' ');
+  for(let f=0; f<12; f++){
+    for(const c of facePts[f].cells){
+      const poly=document.createElementNS(MEGA_NET_NS,'polygon');
+      poly.setAttribute('points', ptStr(c.pts));
       poly.setAttribute('fill', '#'+MEGA_FACE_HEX[f].toString(16).padStart(6,'0'));
-      poly.setAttribute('class', 'cell'); poly.dataset.idx = cellIdx;
-      megaNetSvg.appendChild(poly);
-      megaNetPolys[cellIdx] = poly; megaCellAnchor[cellIdx] = to2d(x.centroid);
-    });
-    const out = document.createElementNS(MEGA_NET_NS, 'polygon'), op = [];
-    for (let i=0;i<5;i++){ const a = -Math.PI/2 + i*2*Math.PI/5; op.push([sx+NET_R*Math.cos(a), sy+NET_R*Math.sin(a)]); }
-    out.setAttribute('points', op.map(q=>q.map(z=>z.toFixed(2)).join(',')).join(' '));
-    out.setAttribute('class', 'face-outline'); megaNetSvg.appendChild(out);
+      poly.setAttribute('class','cell'); poly.dataset.idx=c.idx;
+      megaNetSvg.appendChild(poly); megaNetPolys[c.idx]=poly;
+    }
+    const out=document.createElementNS(MEGA_NET_NS,'polygon');
+    out.setAttribute('points', ptStr(facePts[f].outline));
+    out.setAttribute('class','face-outline'); megaNetSvg.appendChild(out);
   }
 }
 const megaFN_V = megaFaceNormals.map(n=>new THREE.Vector3(n[0],n[1],n[2]).normalize());
