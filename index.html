@@ -445,6 +445,30 @@
   .ot-reveal .ot-tip { font-style: italic; opacity: 0.85; }
   .ot-next { margin-left: 10px; font-size: 12px; padding: 5px 12px; border-radius: 7px;
     border: 1px solid var(--panel-border); background: var(--accent); border-color: transparent; color: #fff; cursor: pointer; }
+  /* execute drills (Repeat / Recall): move keypad + algorithm strip */
+  .ot-exec { display: none; flex-direction: column; gap: 9px; }
+  .ot-alg { text-align: center; font-family: var(--mono); font-size: 15px; letter-spacing: 0.5px;
+    min-height: 20px; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 7px; }
+  .ot-alg .tok { color: var(--text-dim); transition: color .1s; }
+  .ot-alg .tok.done { color: var(--text); }
+  .ot-alg .tok.next { color: #fff; background: var(--accent); border-radius: 5px; padding: 0 5px; }
+  .ot-pad { display: grid; grid-template-columns: repeat(3, 1fr); gap: 6px; }
+  .ot-pad button { padding: 11px 6px; border-radius: 9px; border: 1px solid var(--panel-border);
+    background: rgba(255,255,255,0.06); color: inherit; cursor: pointer; font-family: var(--mono); font-size: 15px; font-weight: 600; }
+  .ot-pad button:hover { background: rgba(255,255,255,0.13); }
+  .ot-pad button.flash-ok { background: #1f9d57; border-color: #1f9d57; color: #fff; }
+  .ot-pad button.flash-bad { background: #c5384a; border-color: #c5384a; color: #fff; }
+  .ot-exec-btns { display: flex; gap: 7px; justify-content: center; }
+  .ot-exec-btn { font-size: 12.5px; padding: 7px 13px; border-radius: 8px; border: 1px solid var(--panel-border);
+    background: rgba(255,255,255,0.05); color: inherit; cursor: pointer; }
+  .ot-exec-btn:hover { background: rgba(255,255,255,0.12); }
+  /* per-drill visibility */
+  #ollTrainer[data-drill="repeat"] .ot-exec, #ollTrainer[data-drill="recall"] .ot-exec { display: flex; }
+  #ollTrainer:not([data-drill="name"]) .ot-choices,
+  #ollTrainer:not([data-drill="name"]) .ot-ctl--dist,
+  #ollTrainer:not([data-drill="name"]) .ot-ctl--orient { display: none; }
+  #ollTrainer[data-drill="repeat"] #otUndo, #ollTrainer[data-drill="repeat"] #otReveal2 { display: none; }
+  #ollTrainer[data-drill="recall"]:not(.ot-revealed) .ot-alg { display: none; }
   @media (max-width: 720px) {
     .history, .help, .solver, .casehelp, .hud { display: none; }
     /* the side net panels overlap the canvas on a phone — hide them (incl. their .on state) */
@@ -573,7 +597,7 @@
     </div>
   </div>
 
-  <div class="oll-trainer" id="ollTrainer">
+  <div class="oll-trainer" id="ollTrainer" data-drill="name">
     <div class="ot-bar">
       <span class="ot-title" id="otTitle">2×2 OLL · name the case</span>
       <span class="ot-score" id="otScore"></span>
@@ -581,23 +605,38 @@
     </div>
     <div class="ot-controls">
       <div class="ot-ctl" id="otMode">
-        <span class="ot-ctl-label">Mode</span>
+        <span class="ot-ctl-label">Cases</span>
         <button class="ot-seg-btn active" data-mode="oll">OLL</button>
         <button class="ot-seg-btn" data-mode="pbl">PBL</button>
       </div>
-      <div class="ot-ctl">
+      <div class="ot-ctl" id="otDrill">
+        <span class="ot-ctl-label">Drill</span>
+        <button class="ot-seg-btn active" data-drill="name">Name</button>
+        <button class="ot-seg-btn" data-drill="repeat">Repeat</button>
+        <button class="ot-seg-btn" data-drill="recall">Recall</button>
+      </div>
+      <div class="ot-ctl ot-ctl--dist">
         <span class="ot-ctl-label">Distractors</span>
         <button class="ot-step" id="otDistMinus" aria-label="fewer">−</button>
         <span class="ot-step-val" id="otDistVal">3</span>
         <button class="ot-step" id="otDistPlus" aria-label="more">+</button>
       </div>
-      <div class="ot-ctl" id="otOrient">
+      <div class="ot-ctl ot-ctl--orient" id="otOrient">
         <span class="ot-ctl-label">Orientation</span>
         <button class="ot-seg-btn active" data-mode="canon">Canonical</button>
         <button class="ot-seg-btn" data-mode="rand">Random</button>
       </div>
     </div>
     <div class="ot-choices" id="otChoices"></div>
+    <div class="ot-exec" id="otExec">
+      <div class="ot-alg" id="otAlg"></div>
+      <div class="ot-pad" id="otPad"></div>
+      <div class="ot-exec-btns" id="otExecBtns">
+        <button class="ot-exec-btn" id="otUndo">↶ Undo</button>
+        <button class="ot-exec-btn" id="otReveal2">Reveal</button>
+        <button class="ot-exec-btn" id="otSkip">Skip →</button>
+      </div>
+    </div>
     <div class="ot-reveal" id="otReveal"></div>
   </div>
 
@@ -10904,6 +10943,13 @@ const otDistValEl = document.getElementById('otDistVal');
 const otOrientEl  = document.getElementById('otOrient');
 const otModeEl    = document.getElementById('otMode');
 const otTitleEl   = document.getElementById('otTitle');
+const otDrillEl   = document.getElementById('otDrill');
+const otExecEl    = document.getElementById('otExec');
+const otAlgEl     = document.getElementById('otAlg');
+const otPadEl     = document.getElementById('otPad');
+const otUndoEl    = document.getElementById('otUndo');
+const otReveal2El = document.getElementById('otReveal2');
+const otSkipEl    = document.getElementById('otSkip');
 const ollTrainerEl = document.getElementById('ollTrainer');
 const ollBtnEl    = document.getElementById('ollBtn');
 
@@ -10920,16 +10966,20 @@ const TRAIN_MODES = {
          halos: true,  randomize: 'auf',
          tip: 'Count side bars per layer — 4 = solved, 1 = adjacent, 0 = diagonal.' },
 };
-const ollT = { mode: 'oll', M: TRAIN_MODES.oll, ncase: OLL_NAMES.length, dist: 3, distByMode: { oll: 3, pbl: 3 },
+const ollT = { mode: 'oll', drill: 'name', M: TRAIN_MODES.oll, ncase: OLL_NAMES.length, dist: 3, distByMode: { oll: 3, pbl: 3 },
                canonical: true, caseI: -1, choices: [], answered: false, correct: 0, total: 0, streak: 0, best: 0,
-               yRot: 0, autoTimer: null };
+               yRot: 0, autoTimer: null, turned: false,
+               execArr: null, exp: [], stepIdx: 0, hist: [], peeked: false, execDone: false, clean: true };
+const OT_DRILL_TITLE = { name: 'name the case', repeat: 'repeat the algorithm', recall: 'recall from memory' };
 
-function ollApplyMode() {                                 // repoint the bundle + per-mode distractors + retitle
+function ollApplyMode() {                                 // repoint the bundle + per-mode distractors + retitle + sync drill UI
   ollT.M = TRAIN_MODES[ollT.mode];
   ollT.ncase = ollT.M.names.length;
   ollT.dist = ollT.distByMode[ollT.mode] = Math.max(1, Math.min(ollT.ncase - 1, ollT.distByMode[ollT.mode]));
   otDistValEl.textContent = ollT.dist;
-  otTitleEl.textContent = ollT.M.title;
+  ollTrainerEl.dataset.drill = ollT.drill;
+  otDrillEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.drill === ollT.drill));
+  otTitleEl.textContent = `2×2 ${ollT.mode.toUpperCase()} · ${OT_DRILL_TITLE[ollT.drill]}`;
 }
 function ollShuffle(a) { for (let k = a.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [a[k], a[j]] = [a[j], a[k]]; } return a; }
 function ollSample(exclude, n) {                          // n distinct case indices != exclude
@@ -10941,7 +10991,7 @@ function ollPaintArr(arr, yRot) {
   for (let idx = 0; idx < 24; idx++) paint2x2(idx, COLOR_LIST[arr[idx]]);
   updateNet();
   cubeGroup.rotation.y = yRot;
-  projGroup.visible = trainerActive && ollT.M.halos;     // PBL keeps the 4-sided halos; OLL drops them
+  projGroup.visible = trainerActive && ollT.drill === 'name' && ollT.M.halos;   // halos only help the PBL Name read
 }
 function ollPaintCurrent() {                             // paint ollT.caseI honouring Canonical/Random + mode
   ensureSolver();
@@ -10970,13 +11020,87 @@ function ollBuildChoices() {                             // (re)roll the option 
 }
 function ollNextQuestion() {
   if (ollT.autoTimer) { clearTimeout(ollT.autoTimer); ollT.autoTimer = null; }
+  if (ollT.turned) { queue.length = 0; current = null; puzzle.build(); puzzle.updateNet(); ollT.turned = false; }   // exec turned the cube → home + fresh tile map
+  if (ollT.drill === 'name') {
+    ollT.caseI = Math.floor(Math.random() * ollT.ncase);
+    ollPaintCurrent();
+    ollBuildChoices();
+  } else {
+    ollStartExec();
+  }
+}
+// ----- Execute drills (Repeat = guided, alg shown; Recall = free, alg hidden) -----
+const OT_PAD_FACES = ['R', 'U', 'F', 'B'];
+function ollBuildPad() {
+  otPadEl.innerHTML = '';
+  for (const f of OT_PAD_FACES) for (const v of ['', "'", '2']) {
+    const b = document.createElement('button'); const tok = f + v;
+    b.textContent = tok; b.dataset.tok = tok; otPadEl.appendChild(b);
+  }
+}
+function ollFlashPad(tok, cls) {
+  const b = otPadEl.querySelector(`button[data-tok="${tok}"]`); if (!b) return;
+  b.classList.add(cls); setTimeout(() => b.classList.remove(cls), 220);
+}
+function ollExecRenderAlg() {
+  otAlgEl.innerHTML = ollT.exp.map((t, i) => {
+    const cls = i < ollT.stepIdx ? 'done' : (i === ollT.stepIdx && ollT.drill === 'repeat' && !ollT.execDone) ? 'next' : '';
+    return `<span class="tok ${cls}">${t}</span>`;
+  }).join('');
+}
+function ollStartExec() {
   ollT.caseI = Math.floor(Math.random() * ollT.ncase);
-  ollPaintCurrent();
-  ollBuildChoices();
+  const arr = applyToks(SOLVED_ARR, invToks(ollT.M.algs[ollT.caseI]));   // real case state; the canonical alg solves it
+  ollT.execArr = Uint8Array.from(arr);
+  ollT.exp = ollT.M.algs[ollT.caseI].slice();
+  ollT.stepIdx = 0; ollT.hist = []; ollT.peeked = false; ollT.execDone = false; ollT.clean = true; ollT.yRot = 0;
+  ollPaintArr(arr, 0);                                    // canonical orientation so the alg applies directly
+  ollTrainerEl.classList.remove('ot-revealed');
+  otRevealEl.innerHTML = '';
+  ollExecRenderAlg();
+}
+function ollExecMove(tok) {
+  if (!trainerActive || ollT.drill === 'name' || ollT.execDone) return;
+  if (ollT.drill === 'repeat' && tok !== ollT.exp[ollT.stepIdx]) { ollFlashPad(tok, 'flash-bad'); ollT.clean = false; return; }
+  applyMove(tok, 'solve');                                // animate the turn on the painted cube
+  ollT.execArr = applyPerm(ollT.execArr, PERM[tok]);
+  ollT.hist.push(tok); ollT.turned = true;
+  if (ollT.drill === 'repeat') ollT.stepIdx++;
+  ollFlashPad(tok, 'flash-ok');
+  ollExecRenderAlg();
+  if (isSolvedArr(ollT.execArr)) ollExecSolved();
+}
+function ollExecUndo() {
+  if (!ollT.hist.length || ollT.execDone) return;
+  const inv = inv1(ollT.hist.pop());
+  applyMove(inv, 'solve');
+  ollT.execArr = applyPerm(ollT.execArr, PERM[inv]); ollT.turned = true;
+  if (ollT.drill === 'repeat' && ollT.stepIdx > 0) ollT.stepIdx--;
+  ollExecRenderAlg();
+}
+function ollExecReveal() {
+  if (ollT.execDone) return;
+  ollT.peeked = true; ollT.clean = false;
+  ollTrainerEl.classList.add('ot-revealed');
+  ollExecRenderAlg();
+}
+function ollExecSkip() { if (ollT.autoTimer) return; ollT.streak = 0; ollNextQuestion(); }
+function ollExecSolved() {
+  ollT.execDone = true; ollT.total++;
+  if (ollT.clean) { ollT.correct++; ollT.streak++; ollT.best = Math.max(ollT.best, ollT.streak); } else ollT.streak = 0;
+  ollTrainerEl.classList.add('ot-revealed');
+  ollExecRenderAlg();
+  otRevealEl.innerHTML = `<b>✓ Solved!</b> &nbsp;<span class="ot-moves">${ollT.M.algs[ollT.caseI].join(' ')}</span>`;
+  ollRenderScore();
+  ollT.autoTimer = setTimeout(ollNextQuestion, 1100);
 }
 function ollRenderScore() {
-  const pct = ollT.total ? Math.round(100 * ollT.correct / ollT.total) : 0;
-  otScoreEl.textContent = `✓ ${ollT.correct}/${ollT.total} · ${pct}% · streak ${ollT.streak} (best ${ollT.best})`;
+  if (ollT.drill === 'name') {
+    const pct = ollT.total ? Math.round(100 * ollT.correct / ollT.total) : 0;
+    otScoreEl.textContent = `✓ ${ollT.correct}/${ollT.total} · ${pct}% · streak ${ollT.streak} (best ${ollT.best})`;
+  } else {
+    otScoreEl.textContent = `✓ ${ollT.correct} ${ollT.drill === 'repeat' ? 'done' : 'solved'} · streak ${ollT.streak} (best ${ollT.best})`;
+  }
 }
 function ollAnswer(ci) {
   if (ollT.answered || ci == null) return;
@@ -11011,7 +11135,7 @@ function ollFitCamera() {
     const openTop = bar.bottom, openBot = card.top || window.innerHeight;
     const openH = Math.max(120, openBot - openTop), openMid = (openTop + openBot) / 2;
     const H = window.innerHeight;
-    const contentR = ollT.M.halos ? 2.85 : 1.8;          // world radius to keep on-screen (cube, or cube + halos)
+    const contentR = (ollT.drill === 'name' && ollT.M.halos) ? 2.85 : 1.8;   // world radius (cube, or cube + halos)
     const targetRpx = 0.40 * Math.min(openH, window.innerWidth);
     const dist = contentR * H / (2 * tan * targetRpx);
     camera.position.copy(dir).setLength(dist); controls.target.set(0, 0, 0); controls.update();
@@ -11020,8 +11144,8 @@ function ollFitCamera() {
     const v = camUp.multiplyScalar(-(H / 2 - openMid) * (2 * dist * tan / H));   // pan so the cube sits at the open-band centre
     camera.position.add(v); controls.target.copy(v); controls.update();
   } else {
-    // Desktop: centred on origin; PBL zooms out so the halos clear the cube.
-    if (ollT.M.halos) dir.setLength(Math.min(20, 10 / Math.min(1, camera.aspect)));
+    // Desktop: centred on origin; PBL Name zooms out so the halos clear the cube.
+    if (ollT.drill === 'name' && ollT.M.halos) dir.setLength(Math.min(20, 10 / Math.min(1, camera.aspect)));
     camera.position.copy(dir); controls.target.set(0, 0, 0); controls.update();
   }
 }
@@ -11077,14 +11201,36 @@ otOrientEl.addEventListener('click', (e) => {
   otOrientEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x === b));
   if (trainerActive) ollPaintCurrent();                     // re-orient (keep button highlight + cube in sync, even post-answer)
 });
-window.addEventListener('keydown', (e) => {               // trainer keymap (digits pick a choice, Esc exits)
+otDrillEl.addEventListener('click', (e) => {
+  const b = e.target.closest('.ot-seg-btn'); if (!b || b.dataset.drill === ollT.drill) return;
+  ollT.drill = b.dataset.drill;
+  ollT.correct = ollT.total = ollT.streak = ollT.best = 0;  // the metric differs per drill
+  try { localStorage.setItem('cubing-train-drill', ollT.drill); } catch (e) {}
+  ollApplyMode();
+  if (trainerActive) { ollRenderScore(); ollNextQuestion(); ollFitCamera(); }
+});
+otPadEl.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) ollExecMove(b.dataset.tok); });
+otUndoEl.addEventListener('click', ollExecUndo);
+otReveal2El.addEventListener('click', ollExecReveal);
+otSkipEl.addEventListener('click', ollExecSkip);
+ollBuildPad();
+window.addEventListener('keydown', (e) => {               // trainer keymap
   if (!trainerActive || e.metaKey || e.ctrlKey || e.altKey) return;
   if (e.key === 'Escape') { e.preventDefault(); stopOllTrainer(); return; }
-  if ((e.key === 'Enter' || e.code === 'Space') && ollT.answered && !ollT.autoTimer) { e.preventDefault(); ollNextQuestion(); return; }
-  if (e.key >= '1' && e.key <= '9') { const n = +e.key - 1; if (n < ollT.choices.length) { e.preventDefault(); ollAnswer(ollT.choices[n]); } }
+  if (ollT.drill === 'name') {
+    if ((e.key === 'Enter' || e.code === 'Space') && ollT.answered && !ollT.autoTimer) { e.preventDefault(); ollNextQuestion(); return; }
+    if (e.key >= '1' && e.key <= '9') { const n = +e.key - 1; if (n < ollT.choices.length) { e.preventDefault(); ollAnswer(ollT.choices[n]); } }
+  } else {                                                  // execute drills: type moves (shift = prime), Backspace = undo
+    const fc = { r: 'R', u: 'U', f: 'F', b: 'B' }[e.key.toLowerCase()];
+    if (fc) { e.preventDefault(); ollExecMove(fc + (e.shiftKey ? "'" : '')); return; }
+    if (e.key === 'Backspace') { e.preventDefault(); ollExecUndo(); return; }
+    if ((e.key === 'Enter' || e.code === 'Space') && ollT.execDone && !ollT.autoTimer) { e.preventDefault(); ollNextQuestion(); return; }
+  }
 });
-// reopen in the last-used trainer mode
-try { const tm = localStorage.getItem('cubing-train-mode'); if (tm && TRAIN_MODES[tm]) { ollT.mode = tm; otModeEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.mode === tm)); ollApplyMode(); } } catch (e) {}
+// reopen in the last-used cases + drill
+try { const tm = localStorage.getItem('cubing-train-mode'); if (tm && TRAIN_MODES[tm]) { ollT.mode = tm; otModeEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.mode === tm)); } } catch (e) {}
+try { const td = localStorage.getItem('cubing-train-drill'); if (td && OT_DRILL_TITLE[td]) ollT.drill = td; } catch (e) {}
+ollApplyMode();
 
 animate();
 
