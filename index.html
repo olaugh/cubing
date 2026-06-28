@@ -11031,7 +11031,8 @@ function ollPaintArr(arr, yRot) {
   for (let idx = 0; idx < 24; idx++) paint2x2(idx, COLOR_LIST[arr[idx]]);
   updateNet();
   cubeGroup.rotation.y = yRot;
-  projGroup.visible = trainerActive && ollT.drill === 'name' && ollT.M.halos;   // halos only help the PBL Name read
+  // halos help the PBL Name read AND the FLL face-finding (you must see all 6 faces)
+  projGroup.visible = trainerActive && (ollT.drill === 'fll' || (ollT.drill === 'name' && ollT.M.halos));
 }
 function ollPaintCurrent() {                             // paint ollT.caseI honouring Canonical/Random + mode
   ensureSolver();
@@ -11227,7 +11228,8 @@ function ollFitCamera() {
   const openTop = bar.bottom, openBot = card.top || window.innerHeight;
   const openH = Math.max(120, openBot - openTop), openMid = (openTop + openBot) / 2;
   const H = window.innerHeight;
-  const contentR = (ollT.drill === 'name' && ollT.M.halos) ? 2.85 : 1.8;   // world radius (cube, or cube + halos)
+  const halos = ollT.drill === 'fll' || (ollT.drill === 'name' && ollT.M.halos);
+  const contentR = halos ? 2.85 : 1.8;                                     // world radius (cube, or cube + halos)
   const targetRpx = 0.42 * Math.min(openH, window.innerWidth);
   const dist = contentR * H / (2 * tan * targetRpx);
   camera.position.copy(dir).setLength(dist); controls.target.set(0, 0, 0); controls.update();
