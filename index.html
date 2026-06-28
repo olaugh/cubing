@@ -3164,7 +3164,7 @@ function updateTimerDisplay() {
   if (timerState === 'idle') {
     timerInspEl.textContent = ''; timerInspEl.className = 'hud-insp';
     timerTimeEl.textContent = '—'; timerTimeEl.className = 'hud-time idle';
-    timerSplitsEl.textContent = 'scramble or pick a drill to start';
+    timerSplitsEl.textContent = puzzle.drillLabel ? 'scramble or pick a drill to start' : 'scramble to start';
     return;
   }
   if (timerState === 'inspecting') {
@@ -3967,7 +3967,7 @@ window.addEventListener('keydown', (e) => {
     return;         // never let other Alt combos through to the engine
   }
   const k = e.key.toLowerCase();
-  if (k.length === 1 && k >= '1' && k <= '4') { e.preventDefault(); startDrill(+k); return; }  // 1–4: (re)start FLL drill
+  if (k.length === 1 && k >= '1' && k <= '4' && puzzle.drillLabel) { e.preventDefault(); startDrill(+k); return; }  // 1–4: (re)start drill (puzzles with a drill bar)
   if (km.tipKeys && km.tipKeys[k]) { e.preventDefault(); applyMove(km.tipKeys[k] + (e.shiftKey ? "'" : '')); return; }  // fallback letter-key tips
   if (km.primeKeys && km.primeKeys[k]) { e.preventDefault(); applyMove(km.primeKeys[k] + "'"); return; }
   let face = (km.faceKeys && km.faceKeys[k]) || (km.rotKeys && km.rotKeys[k]);
@@ -6487,8 +6487,8 @@ const puzzle2x2 = {
     if (phase === 'pbl') { const r = recognizePBL(); return r && { label: 'PBL · permute both layers', name: r.name, tokens: r.tokens, display: r.tokens.join(' ') }; }
     return null;
   },
-  drillLabel: 'FLL drill:',
-  makeDrill: (n) => generateDrill(n),
+  drillLabel: '',                               // FLL drill now lives under Train, not the normal-mode HUD bar
+  makeDrill: (n) => generateDrill(n),           // still used by the Train FLL drill
   solverLabel: 'First-layer solver · optimal',
   solverGoals: [{ key: 'any', label: 'Any face' }, { key: 'top', label: 'On top' }, { key: 'white', label: 'White' }],
   solve: (goal) => { const s = solveFLL(goal); return s === null ? null : { tokens: s, display: s.join(' ') }; },
@@ -6501,7 +6501,7 @@ const puzzle2x2 = {
     <div>primes: E I G S K N</div>
     <div>x y z = cube rotations</div>
     <div><kbd>Space</kbd> = pause / hide cube</div>
-    <div>1–4 = (re)start FLL drill</div>
+    <div><b>Train</b> = recognition + FLL drills</div>
     <div>Double-tap = seamless 2</div>
     <div>Drag to orbit · scroll to zoom</div>`,
 };
@@ -10882,6 +10882,9 @@ buildDock();
 buildSolver();
 solveBtnEl.style.display = puzzle.solveFull ? '' : 'none';
 editBtnEl.style.display = puzzle.editable ? '' : 'none';
+drillEl.style.display = puzzle.drillLabel ? '' : 'none';   // default 2×2 has no normal-mode drill bar
+drillLabelEl.textContent = puzzle.drillLabel;
+document.querySelector('.help').innerHTML = puzzle.helpHTML;
 
 function switchPuzzle(id) {
   if (!PUZZLES[id] || puzzle.id === id) return;
