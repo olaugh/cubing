@@ -488,7 +488,8 @@
     /* topbar reflows to two rows: scrollable chooser, then actions */
     .topbar { flex-wrap: wrap; gap: 7px; padding: 9px 9px; }
     .brand, .spacer { display: none; }
-    .puzzle-chooser { margin-left: 0; order: 1; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none; }
+    .puzzle-chooser { margin-left: 0; order: 1; flex: 1 1 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+      -webkit-mask-image: linear-gradient(90deg, #000 90%, transparent); mask-image: linear-gradient(90deg, #000 90%, transparent); }
     .puzzle-chooser::-webkit-scrollbar { display: none; }
     .puzzle-chooser .pz { font-size: 12px; padding: 7px 12px; white-space: nowrap; }
     .top-actions { order: 2; flex: 1 1 100%; justify-content: space-between; }
@@ -500,10 +501,20 @@
     body[data-puz="pyraminx"] .right-dock, body[data-puz="sq1"] .right-dock { display: flex; right: 9px; bottom: 9px; gap: 6px; }
     .dock .mbtn { min-width: 34px; min-height: 34px; font-size: 13px; }
     .palette .sw { width: 26px; height: 26px; }
-    /* OLL trainer becomes a bottom sheet with a 2-column choice grid */
-    .oll-trainer { left: 0; right: 0; bottom: 0; transform: none; width: auto; border-radius: 16px 16px 0 0; }
+    /* OLL trainer becomes a compact bottom sheet — keep the card short so the
+       cube band above it stays large (ollFitCamera grows the cube to fit). */
+    .oll-trainer { left: 0; right: 0; bottom: 0; transform: none; width: auto; border-radius: 16px 16px 0 0;
+      padding: 8px 11px calc(8px + env(safe-area-inset-bottom)); gap: 6px; }
     .ot-choices { grid-template-columns: repeat(2, 1fr); }
-    .ot-controls { gap: 12px; }
+    .ot-controls { gap: 10px 12px; }
+    .ot-title { font-size: 12.5px; }
+    .ot-name { font-size: 18px; }
+    .ot-alg { font-size: 14.5px; min-height: 18px; }
+    .ot-times { font-size: 11px; min-height: 13px; }
+    .ot-exec { gap: 6px; }
+    .ot-pad { gap: 5px; }
+    .ot-pad button { padding: 7px 4px; font-size: 14px; }
+    .ot-exec-btn { padding: 6px 11px; font-size: 12px; }
   }
 </style>
 </head>
