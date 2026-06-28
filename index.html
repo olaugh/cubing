@@ -450,6 +450,8 @@
   .ot-name { text-align: center; font-size: 23px; font-weight: 700; letter-spacing: 0.2px; line-height: 1.1; }
   .ot-times { text-align: center; font-family: var(--mono); font-size: 12px; color: var(--text-dim); min-height: 15px; }
   .ot-times .now { color: var(--accent); font-weight: 600; }
+  .ot-times .acc { color: #4ad07f; font-weight: 600; }
+  .ot-times .err { color: #e06a6a; font-weight: 600; }
   .ot-alg { text-align: center; font-family: var(--mono); font-size: 17px; letter-spacing: 0.5px;
     min-height: 22px; display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 7px; }
   .ot-alg .tok { color: var(--text); transition: color .1s, opacity .1s; }     /* remaining = bright */
@@ -466,12 +468,16 @@
     background: rgba(255,255,255,0.05); color: inherit; cursor: pointer; }
   .ot-exec-btn:hover { background: rgba(255,255,255,0.12); }
   /* per-drill visibility */
-  #ollTrainer[data-drill="repeat"] .ot-exec, #ollTrainer[data-drill="recall"] .ot-exec { display: flex; }
+  #ollTrainer[data-drill="repeat"] .ot-exec, #ollTrainer[data-drill="recall"] .ot-exec,
+  #ollTrainer[data-drill="fll"] .ot-exec { display: flex; }
   #ollTrainer:not([data-drill="name"]) .ot-choices,
   #ollTrainer:not([data-drill="name"]) .ot-ctl--dist,
   #ollTrainer:not([data-drill="name"]) .ot-ctl--orient { display: none; }
   #ollTrainer[data-drill="repeat"] #otUndo, #ollTrainer[data-drill="repeat"] #otReveal2 { display: none; }
-  #ollTrainer[data-drill="recall"]:not(.ot-revealed) .ot-alg { display: none; }
+  #ollTrainer[data-drill="recall"]:not(.ot-revealed) .ot-alg,
+  #ollTrainer[data-drill="fll"]:not(.ot-revealed) .ot-alg { display: none; }   /* alg = the revealed solution */
+  #ollTrainer:not([data-drill="fll"]) .ot-ctl--target { display: none; }       /* Target only for FLL */
+  #ollTrainer[data-drill="fll"] #otMode { display: none; }                     /* FLL is case-set agnostic */
   /* desktop: no keypad — type the moves (typing-tutor); keypad is for touch */
   @media (min-width: 721px) { .ot-pad { display: none; } }
   @media (max-width: 720px) {
@@ -619,6 +625,7 @@
         <button class="ot-seg-btn active" data-drill="name">Name</button>
         <button class="ot-seg-btn" data-drill="repeat">Repeat</button>
         <button class="ot-seg-btn" data-drill="recall">Recall</button>
+        <button class="ot-seg-btn" data-drill="fll">FLL</button>
       </div>
       <div class="ot-ctl ot-ctl--dist">
         <span class="ot-ctl-label">Distractors</span>
@@ -630,6 +637,13 @@
         <span class="ot-ctl-label">Orientation</span>
         <button class="ot-seg-btn active" data-mode="canon">Canonical</button>
         <button class="ot-seg-btn" data-mode="rand">Random</button>
+      </div>
+      <div class="ot-ctl ot-ctl--target" id="otTarget">
+        <span class="ot-ctl-label">Target</span>
+        <button class="ot-seg-btn" data-n="1">1</button>
+        <button class="ot-seg-btn active" data-n="2">2</button>
+        <button class="ot-seg-btn" data-n="3">3</button>
+        <button class="ot-seg-btn" data-n="4">4</button>
       </div>
     </div>
     <div class="ot-choices" id="otChoices"></div>
@@ -10959,6 +10973,7 @@ const otPadEl     = document.getElementById('otPad');
 const otUndoEl    = document.getElementById('otUndo');
 const otReveal2El = document.getElementById('otReveal2');
 const otSkipEl    = document.getElementById('otSkip');
+const otTargetEl  = document.getElementById('otTarget');
 const ollTrainerEl = document.getElementById('ollTrainer');
 const ollBtnEl    = document.getElementById('ollBtn');
 
@@ -10979,9 +10994,18 @@ const ollT = { mode: 'oll', drill: 'name', M: TRAIN_MODES.oll, ncase: OLL_NAMES.
                canonical: true, caseI: -1, choices: [], answered: false, correct: 0, total: 0, streak: 0, best: 0,
                yRot: 0, autoTimer: null, turned: false,
                execArr: null, exp: [], targets: [], stepIdx: 0, hist: [], peeked: false, execDone: false, clean: true,
-               startT: null, times: [] };
+               startT: null, times: [], fllTarget: 2 };
 const arrEq = (a, b) => { for (let i = 0; i < 24; i++) if (a[i] !== b[i]) return false; return true; };
-const OT_DRILL_TITLE = { name: 'name the case', repeat: 'repeat the algorithm', recall: 'recall from memory' };
+// Per-algorithm stats (persisted): for each (cases:drill:case) — accurate-typed count,
+// incorrect-move count, and the time of each accurate completion.
+let ollStats = {};
+try { ollStats = JSON.parse(localStorage.getItem('cubing-train-stats') || '{}'); } catch (e) { ollStats = {}; }
+function ollStatKey() {
+  return ollT.drill === 'fll' ? `fll:${ollT.fllTarget}` : `${ollT.mode}:${ollT.drill}:${ollT.M.names[ollT.caseI]}`;
+}
+function ollStatRec() { const k = ollStatKey(); return (ollStats[k] = ollStats[k] || { acc: 0, err: 0, times: [] }); }
+function ollStatsSave() { try { localStorage.setItem('cubing-train-stats', JSON.stringify(ollStats)); } catch (e) {} }
+const OT_DRILL_TITLE = { name: 'name the case', repeat: 'repeat the algorithm', recall: 'recall from memory', fll: 'first-face drill' };
 
 function ollApplyMode() {                                 // repoint the bundle + per-mode distractors + retitle + sync drill UI
   ollT.M = TRAIN_MODES[ollT.mode];
@@ -10990,7 +11014,9 @@ function ollApplyMode() {                                 // repoint the bundle 
   otDistValEl.textContent = ollT.dist;
   ollTrainerEl.dataset.drill = ollT.drill;
   otDrillEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.drill === ollT.drill));
-  otTitleEl.textContent = `2×2 ${ollT.mode.toUpperCase()} · ${OT_DRILL_TITLE[ollT.drill]}`;
+  otTitleEl.textContent = ollT.drill === 'fll' ? '2×2 · first-face drill'
+    : `2×2 ${ollT.mode.toUpperCase()} · ${OT_DRILL_TITLE[ollT.drill]}`;
+  otTargetEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', +x.dataset.n === ollT.fllTarget));
 }
 function ollShuffle(a) { for (let k = a.length - 1; k > 0; k--) { const j = Math.floor(Math.random() * (k + 1)); [a[k], a[j]] = [a[j], a[k]]; } return a; }
 function ollSample(exclude, n) {                          // n distinct case indices != exclude
@@ -11036,9 +11062,38 @@ function ollNextQuestion() {
     ollT.caseI = Math.floor(Math.random() * ollT.ncase);
     ollPaintCurrent();
     ollBuildChoices();
+  } else if (ollT.drill === 'fll') {
+    ollStartFLL();
   } else {
     ollStartExec();
   }
+}
+function ollStartFLL() {                                  // solve any one face in the optimal move-count
+  const seq = puzzle.makeDrill(ollT.fllTarget) || puzzle.makeDrill(ollT.fllTarget);   // scramble whose optimal first-face = target
+  const arr = seq ? applyToks(SOLVED_ARR, seq) : Uint8Array.from(SOLVED_ARR);
+  ollT.execArr = Uint8Array.from(arr);
+  ollT.exp = seq ? (solveFLLArr(arr, 'any') || []) : [];   // an optimal solution (shown only on Reveal)
+  ollT.stepIdx = 0; ollT.hist = []; ollT.peeked = false; ollT.execDone = false; ollT.clean = true; ollT.yRot = 0; ollT.startT = null;
+  ollPaintArr(arr, 0);
+  ollTrainerEl.classList.remove('ot-revealed');
+  otRevealEl.innerHTML = seq ? '' : '<span class="ot-tip">couldn\'t generate — Skip</span>';
+  otNameEl.textContent = `Find a ${ollT.fllTarget}-move face`;
+  ollExecRenderAlg(); ollExecRenderTimes(null);
+}
+function ollFLLSolved() {
+  ollT.execDone = true; ollT.total++;
+  const moves = compressMoves(ollT.hist).length, optimal = (moves === ollT.fllTarget) && ollT.clean;   // half-turn metric: U U = U2 = 1
+  const elapsed = ollT.startT != null ? performance.now() - ollT.startT : 0;
+  const s = ollStatRec();
+  if (optimal) { ollT.correct++; ollT.streak++; ollT.best = Math.max(ollT.best, ollT.streak); s.acc++; s.times.push(elapsed); if (s.times.length > 30) s.times.splice(0, s.times.length - 30); } else { ollT.streak = 0; s.err++; }
+  ollStatsSave();
+  ollTrainerEl.classList.add('ot-revealed');
+  ollExecRenderAlg(); ollExecRenderTimes(null);
+  otRevealEl.innerHTML = (moves === ollT.fllTarget)
+    ? `<b>✓ ${moves} moves — optimal!</b>`
+    : `${moves} moves · optimal is ${ollT.fllTarget}`;
+  ollRenderScore();
+  ollT.autoTimer = setTimeout(ollNextQuestion, 1400);
 }
 // ----- Execute drills (Repeat = guided, alg shown; Recall = free, alg hidden) -----
 const OT_PAD_FACES = ['R', 'U', 'F', 'B'];
@@ -11060,12 +11115,13 @@ function ollExecRenderAlg() {
   }).join('');
 }
 function ollExecRenderName() { otNameEl.textContent = ollT.M.names[ollT.caseI]; }
-function ollExecRenderTimes(running) {                    // last-5 elapsed per alg (typing-tutor style)
+function ollExecRenderTimes(running) {                    // current algorithm's stats: accurate count, misses, each correct time
   const fmt = ms => (ms / 1000).toFixed(2);
-  const last = ollT.times.slice(-5);
-  let html = last.map(t => fmt(t)).join('  ');
-  if (running != null) html += (html ? '  ' : '') + `<span class="now">${fmt(running)}</span>`;
-  otTimesEl.innerHTML = html ? `last: ${html}` : 'type the moves — timed from your first key';
+  const s = ollStatRec();
+  let html = `<span class="acc">✓ ${s.acc}</span>  <span class="err">✗ ${s.err}</span>`;
+  if (s.times.length) html += '  ·  ' + s.times.slice(-6).map(fmt).join('  ');
+  if (running != null) html += `  <span class="now">${fmt(running)}</span>`;
+  otTimesEl.innerHTML = html;
 }
 function ollStartExec() {
   ollT.caseI = Math.floor(Math.random() * ollT.ncase);
@@ -11087,22 +11143,24 @@ function ollExecMove(tok) {
     const target = ollT.targets[ollT.stepIdx + 1];
     let advance = arrEq(cand, target), ok = advance;
     if (!ok && !/2$/.test(tok) && arrEq(applyPerm(cand, PERM[tok]), target)) ok = true;   // first quarter of a double — no penalty
-    if (!ok) { ollFlashPad(tok, 'flash-bad'); ollT.clean = false; return; }
+    if (!ok) { ollFlashPad(tok, 'flash-bad'); ollT.clean = false; ollStatRec().err++; ollStatsSave(); ollExecRenderTimes(ollT.startT != null ? performance.now() - ollT.startT : null); return; }
     if (advance) ollT.stepIdx++;
   }
   if (ollT.startT == null) ollT.startT = performance.now();
   applyMove(tok, 'solve');                                // animate the turn on the painted cube
   ollT.execArr = cand; ollT.hist.push(tok); ollT.turned = true;
   ollFlashPad(tok, 'flash-ok');
-  ollExecRenderAlg();
-  if (isSolvedArr(ollT.execArr)) ollExecSolved();
+  if (ollT.drill === 'repeat') ollExecRenderAlg();
+  const solved = ollT.drill === 'fll' ? !!solidFaceLetter(ollT.execArr, false) : isSolvedArr(ollT.execArr);
+  if (solved) { ollT.drill === 'fll' ? ollFLLSolved() : ollExecSolved(); }
   else ollExecRenderTimes(performance.now() - ollT.startT);    // running time since first key
 }
 function ollExecUndo() {
-  if (ollT.drill !== 'recall' || !ollT.hist.length || ollT.execDone) return;
+  if (ollT.drill === 'repeat' || ollT.drill === 'name' || !ollT.hist.length || ollT.execDone) return;
   const inv = inv1(ollT.hist.pop());
   applyMove(inv, 'solve');
   ollT.execArr = applyPerm(ollT.execArr, PERM[inv]); ollT.turned = true;
+  if (ollT.drill === 'fll' && ollT.startT != null) ollExecRenderTimes(performance.now() - ollT.startT);
 }
 function ollExecReveal() {
   if (ollT.execDone) return;
@@ -11114,7 +11172,10 @@ function ollExecSkip() { if (ollT.autoTimer) return; ollT.streak = 0; ollNextQue
 function ollExecSolved() {
   ollT.execDone = true; ollT.total++;
   const elapsed = ollT.startT != null ? performance.now() - ollT.startT : 0;
-  if (ollT.clean) { ollT.correct++; ollT.streak++; ollT.best = Math.max(ollT.best, ollT.streak); ollT.times.push(elapsed); } else ollT.streak = 0;
+  const s = ollStatRec();
+  if (ollT.clean) { ollT.correct++; ollT.streak++; ollT.best = Math.max(ollT.best, ollT.streak); s.acc++; s.times.push(elapsed); if (s.times.length > 30) s.times.splice(0, s.times.length - 30); }
+  else { ollT.streak = 0; if (ollT.drill === 'recall') s.err++; }   // repeat wrong taps already counted per-tap
+  ollStatsSave();
   ollTrainerEl.classList.add('ot-revealed');
   ollExecRenderAlg(); ollExecRenderTimes(null);
   otRevealEl.innerHTML = `<b>✓ Solved!</b> &nbsp;<span class="ot-moves">${ollT.M.algs[ollT.caseI].join(' ')}</span>`;
@@ -11125,6 +11186,8 @@ function ollRenderScore() {
   if (ollT.drill === 'name') {
     const pct = ollT.total ? Math.round(100 * ollT.correct / ollT.total) : 0;
     otScoreEl.textContent = `✓ ${ollT.correct}/${ollT.total} · ${pct}% · streak ${ollT.streak} (best ${ollT.best})`;
+  } else if (ollT.drill === 'fll') {
+    otScoreEl.textContent = `✓ ${ollT.correct} optimal · streak ${ollT.streak} (best ${ollT.best})`;
   } else {
     otScoreEl.textContent = `✓ ${ollT.correct} ${ollT.drill === 'repeat' ? 'done' : 'solved'} · streak ${ollT.streak} (best ${ollT.best})`;
   }
@@ -11230,6 +11293,12 @@ otDrillEl.addEventListener('click', (e) => {
   ollApplyMode();
   if (trainerActive) { ollRenderScore(); ollNextQuestion(); ollFitCamera(); }
 });
+otTargetEl.addEventListener('click', (e) => {
+  const b = e.target.closest('.ot-seg-btn'); if (!b) return;
+  ollT.fllTarget = +b.dataset.n;
+  otTargetEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x === b));
+  if (trainerActive && ollT.drill === 'fll') { ollNextQuestion(); ollFitCamera(); }
+});
 otPadEl.addEventListener('click', (e) => { const b = e.target.closest('button'); if (b) ollExecMove(b.dataset.tok); });
 otUndoEl.addEventListener('click', ollExecUndo);
 otReveal2El.addEventListener('click', ollExecReveal);
@@ -11252,7 +11321,6 @@ window.addEventListener('keydown', (e) => {               // trainer keymap
 try { const tm = localStorage.getItem('cubing-train-mode'); if (tm && TRAIN_MODES[tm]) { ollT.mode = tm; otModeEl.querySelectorAll('.ot-seg-btn').forEach(x => x.classList.toggle('active', x.dataset.mode === tm)); } } catch (e) {}
 try { const td = localStorage.getItem('cubing-train-drill'); if (td && OT_DRILL_TITLE[td]) ollT.drill = td; } catch (e) {}
 ollApplyMode();
-
 animate();
 
 
