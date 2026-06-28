@@ -11233,25 +11233,25 @@ function ollAnswer(ci) {
   }
 }
 function ollFitCamera() {
-  // Shrink the cube (+ its halos) to fit, and pan it to the centre of the open
-  // band between the topbar and the bottom card — on desktop and mobile alike.
-  controls.maxDistance = 100;                            // the default cap (22) would clamp the zoom-out + distort the pan
+  // Shrink the cube (+ its halos) to fit, and shift it into the open band between
+  // the topbar and the bottom card. The shift is a camera lens-offset, NOT a pan —
+  // controls.target stays on the cube centre so dragging spins the cube in place
+  // (a target pan would orbit around an off-cube point and make the cube swing).
+  controls.maxDistance = 100;                            // the default cap (22) would clamp the zoom-out
+  camera.clearViewOffset();
   const dir = new THREE.Vector3(4.6, 4.2, 6.5);
   const tan = Math.tan(camera.fov * Math.PI / 360);
   const card = ollTrainerEl.getBoundingClientRect();
   const bar = document.querySelector('.topbar').getBoundingClientRect();
-  const openTop = bar.bottom, openBot = card.top || window.innerHeight;
+  const W = window.innerWidth, H = window.innerHeight;
+  const openTop = bar.bottom, openBot = card.top || H;
   const openH = Math.max(120, openBot - openTop), openMid = (openTop + openBot) / 2;
-  const H = window.innerHeight;
   const halos = ollT.drill === 'fll' || (ollT.drill === 'name' && ollT.M.halos);
   const contentR = halos ? 2.85 : 1.8;                                     // world radius (cube, or cube + halos)
-  const targetRpx = 0.42 * Math.min(openH, window.innerWidth);
+  const targetRpx = 0.42 * Math.min(openH, W);
   const dist = contentR * H / (2 * tan * targetRpx);
   camera.position.copy(dir).setLength(dist); controls.target.set(0, 0, 0); controls.update();
-  camera.updateMatrixWorld();
-  const camUp = new THREE.Vector3().setFromMatrixColumn(camera.matrixWorld, 1).normalize();
-  const v = camUp.multiplyScalar(-(H / 2 - openMid) * (2 * dist * tan / H));   // pan so the cube sits at the open-band centre
-  camera.position.add(v); controls.target.copy(v); controls.update();
+  camera.setViewOffset(W, H, 0, (H / 2 - openMid), W, H);   // +offsetY shifts the rendered scene up into the open band
 }
 function startOllTrainer() {
   if (puzzle.id !== '2x2' || trainerActive) return;
@@ -11276,6 +11276,7 @@ function stopOllTrainer() {
   document.body.classList.remove('oll-train');
   ollBtnEl.classList.remove('active');
   cubeGroup.rotation.y = 0;
+  camera.clearViewOffset();                               // remove the trainer lens-offset
   projGroup.visible = (puzzle.id === '2x2');              // restore the hidden-face halos
   controls.maxDistance = 22;                              // restore the normal zoom cap
   if (ollT.camSaved) { camera.position.copy(ollT.camSaved); controls.target.set(0, 0, 0); controls.update(); ollT.camSaved = null; }
