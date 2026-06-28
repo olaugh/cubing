@@ -10997,7 +10997,7 @@ const ollT = { mode: 'oll', drill: 'name', M: TRAIN_MODES.oll, ncase: OLL_NAMES.
                canonical: true, caseI: -1, choices: [], answered: false, correct: 0, total: 0, streak: 0, best: 0,
                yRot: 0, autoTimer: null, turned: false,
                execArr: null, exp: [], targets: [], stepIdx: 0, hist: [], peeked: false, execDone: false, clean: true,
-               startT: null, times: [], fllTarget: 2 };
+               startT: null, times: [], fllTarget: 2, tick: null };
 const arrEq = (a, b) => { for (let i = 0; i < 24; i++) if (a[i] !== b[i]) return false; return true; };
 // Per-algorithm stats (persisted): for each (cases:drill:case) — accurate-typed count,
 // incorrect-move count, and the time of each accurate completion.
@@ -11061,6 +11061,7 @@ function ollBuildChoices() {                             // (re)roll the option 
 }
 function ollNextQuestion() {
   if (ollT.autoTimer) { clearTimeout(ollT.autoTimer); ollT.autoTimer = null; }
+  clearInterval(ollT.tick);
   if (ollT.turned) { queue.length = 0; current = null; puzzle.build(); puzzle.updateNet(); ollT.turned = false; }   // exec turned the cube → home + fresh tile map
   if (ollT.drill === 'name') {
     ollT.caseI = Math.floor(Math.random() * ollT.ncase);
@@ -11077,15 +11078,18 @@ function ollStartFLL() {                                  // solve any one face 
   const arr = seq ? applyToks(SOLVED_ARR, seq) : Uint8Array.from(SOLVED_ARR);
   ollT.execArr = Uint8Array.from(arr);
   ollT.exp = seq ? (solveFLLArr(arr, 'any') || []) : [];   // an optimal solution (shown only on Reveal)
-  ollT.stepIdx = 0; ollT.hist = []; ollT.peeked = false; ollT.execDone = false; ollT.clean = true; ollT.yRot = 0; ollT.startT = null;
+  ollT.stepIdx = 0; ollT.hist = []; ollT.peeked = false; ollT.execDone = false; ollT.clean = true; ollT.yRot = 0;
+  ollT.startT = performance.now();                        // FLL is timed from presentation (includes inspection)
   ollPaintArr(arr, 0);
   ollTrainerEl.classList.remove('ot-revealed');
   otRevealEl.innerHTML = seq ? '' : '<span class="ot-tip">couldn\'t generate — Skip</span>';
   otNameEl.textContent = `Find a ${ollT.fllTarget}-move face`;
-  ollExecRenderAlg(); ollExecRenderTimes(null);
+  ollExecRenderAlg(); ollExecRenderTimes(0);
+  clearInterval(ollT.tick);                               // live-tick the inspection clock
+  ollT.tick = setInterval(() => { if (ollT.drill === 'fll' && !ollT.execDone && ollT.startT != null) ollExecRenderTimes(performance.now() - ollT.startT); }, 100);
 }
 function ollFLLSolved() {
-  ollT.execDone = true; ollT.total++;
+  ollT.execDone = true; ollT.total++; clearInterval(ollT.tick);
   const moves = compressMoves(ollT.hist).length, optimal = (moves === ollT.fllTarget) && ollT.clean;   // half-turn metric: U U = U2 = 1
   const elapsed = ollT.startT != null ? performance.now() - ollT.startT : 0;
   const s = ollStatRec();
@@ -11256,6 +11260,7 @@ function startOllTrainer() {
 function stopOllTrainer() {
   if (!trainerActive) return;
   if (ollT.autoTimer) { clearTimeout(ollT.autoTimer); ollT.autoTimer = null; }
+  clearInterval(ollT.tick);
   trainerActive = false;
   document.body.classList.remove('oll-train');
   ollBtnEl.classList.remove('active');
